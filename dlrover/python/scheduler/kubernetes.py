@@ -601,6 +601,16 @@ class K8sJobArgs(JobArgs):
         if policy:
             self._save_startup_elastic_policy(k8s_client, job, policy)
             self.runtime_elastic_dimension = policy["elastic_dimension"]
+
+            if self.optimize_mode != policy["optimize_mode"]:
+                logger.info(
+                    "Automatic vertical elasticity overrides optimize_mode "
+                    "from %s to %s",
+                    self.optimize_mode,
+                    policy["optimize_mode"],
+                )
+            self.optimize_mode = policy["optimize_mode"]
+            
             for key in (
                 "elastic_dimension",
                 "resource_monitor_switch",

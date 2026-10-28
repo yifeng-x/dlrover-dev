@@ -6,6 +6,7 @@ from dlrover.python.common.constants import (
     DistributionStrategy,
     ElasticDimension,
     NodeType,
+    OptimizeMode,
     WorkerResourceScaleAction,
 )
 from dlrover.python.common.log import default_logger as logger
@@ -163,10 +164,6 @@ def resolve_policy(
             "CAPACITY_EXCEEDED: total GPUs exceed resourceLimits.gpu"
         )
     vertical = count == 1
-    if vertical and spec.get("optimizeMode", "single-job") != "cluster":
-        raise ValueError(
-            "EXPLICIT_CONFIG_CONFLICT: automatic vertical elasticity requires optimizeMode=cluster"
-        )
     monitor = "on" if vertical else "off"
     if resource_monitor not in (None, monitor) or manual_scale not in (
         None,
@@ -192,7 +189,11 @@ def resolve_policy(
             if quota is not None
             else None
         ),
-        "optimize_mode": spec.get("optimizeMode", "single-job"),
+        "optimize_mode": (
+            OptimizeMode.CLUSTER
+            if vertical
+            else spec.get("optimizeMode", OptimizeMode.SINGLE_JOB)
+        ),
         "elastic_dimension": (
             ElasticDimension.VERTICAL
             if vertical

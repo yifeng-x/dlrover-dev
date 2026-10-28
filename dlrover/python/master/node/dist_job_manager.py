@@ -63,6 +63,7 @@ from dlrover.python.master.node.job_resource_scaler import (
     new_job_resource_scaler,
 )
 from dlrover.python.master.monitor.vertical_metrics import VerticalExecutionMetrics
+from dlrover.python.master.monitor.vertical_events import VerticalElasticEvents
 from dlrover.python.master.node.job_context import get_job_context
 from dlrover.python.master.node.job_manager import JobManager
 from dlrover.python.master.node.ps import ParameterServerManager
@@ -141,6 +142,10 @@ class DistributedJobManager(JobManager):
             external_config=external_config,
         )
         self.vertical_metrics = VerticalExecutionMetrics()
+        self.vertical_metrics.events = VerticalElasticEvents(job={
+            "job_uid": job_args.job_uuid, "job_name": job_args.job_name,
+            "namespace": job_args.namespace, "cluster": job_args.cluster,
+        })
         self.training_generation_provider = lambda: ""
         self._remove_exited_node = job_args.remove_exited_node
         node_restart_count: Dict[str, int] = {}
@@ -753,6 +758,7 @@ class DistributedJobManager(JobManager):
                 "cluster": self._job_args.cluster,
             },
         )
+        self._job_resource_scaler.events.job["job_name"] = self._job_args.job_name
         logger.info(
             "Create job resource scaler: %s", self._job_resource_scaler.__class__
         )
@@ -1805,7 +1811,7 @@ class DistributedJobManager(JobManager):
         
         self._job_autoscaler.start_auto_scaling()
 
-    def start_resource_scaling(self, scale_action: WorkerResourceScaleAction.NOT_ADJUST):
+    def start_resource_scaling(self, scale_action: WorkerResourceScaleAction.NOT_ADJUST, trigger_source="unknown"):
         """Start resource scaling nodes to improve the training throughput."""
         if (
             self._job_args.runtime_elastic_dimension != ElasticDimension.VERTICAL
@@ -1816,12 +1822,13 @@ class DistributedJobManager(JobManager):
                 "job_stopping" if self._workspace_training_state.releasing
                 else "manager_unavailable"
             )
-            self.vertical_metrics.request(scale_action, "rejected", reason)
+            self.vertical_metrics.request(scale_action, "rejected", reason, trigger_source=trigger_source)
             logger.warning(
                 "Reject vertical scaling: controller unavailable for this job"
             )
             return False
-        self._job_resource_scaler.start_resource_scaling(scale_action)
+        return self._job_resource_scaler.start_resource_scaling(scale_action, trigger_source=trigger_source)
+
 
     def _set_ps_addrs_in_plan(self, plan: ScalePlan):
         ps_addrs = self._ps_manager.get_ps_addrs()

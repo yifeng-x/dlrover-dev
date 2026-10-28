@@ -162,7 +162,7 @@ class JobManager(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def start_resource_scaling(self, scale_action):
+    def start_resource_scaling(self, scale_action, trigger_source="unknown"):
         pass
 
     @abstractmethod

@@ -1,6 +1,6 @@
 # 启动时自动选择弹性维度
 
-Master、Worker 均使用包含本次改动的镜像。该功能使用 Python PodScaler，Master 必须指定 `--platform pyk8s --elastic_dimension auto`。默认仍是 horizontal；不要同时填写与自动结果冲突的两个开关。
+Master、Worker 均使用包含本次改动的镜像。该功能使用 Python PodScaler，Master 使用 `--platform pyk8s`，弹性维度默认 auto，可省略 `--elastic_dimension auto`。需要显式模式时指定 `--elastic_dimension horizontal` 或 `vertical`；不要同时填写与自动结果冲突的两个开关。非 pyk8s 平台需显式指定维度。
 
 本目录两个 YAML 是配置片段，需合并到提交前的完整 ElasticJob，保留现有镜像、训练命令、挂载、服务账号和 Master 其他参数。不要向正在训练的作业热更新这些片段。
 
@@ -9,7 +9,7 @@ Master、Worker 均使用包含本次改动的镜像。该功能使用 Python Po
 | `single-worker.yaml` | 1×4 GPU | vertical/off/on | `dlrover-run --nnodes=1 --nproc_per_node=4 ...`；支持 checkpoint 保存、恢复及卡数变化 |
 | `multi-worker.yaml` | 2×4 GPU | horizontal/off/off | `dlrover-run --nnodes=1:2 --nproc_per_node=4 ...`；支持成员变化 |
 
-自动垂直必须设置 `spec.optimizeMode: cluster` 并连接可用的 Brain。共享 checkpoint 存储和训练侧状态恢复需沿用已验证的配置。本功能不会给任意训练脚本自动添加 checkpoint 能力。
+自动垂直会将运行时 `optimize_mode` 自动设为 `cluster`，无需手动设置 `spec.optimizeMode`；即使 YAML 显式配置了 `single-job` 也会覆盖并记录日志，但不回写 YAML。自动水平及显式维度保留原有优化模式。自动垂直仍需连接可用的 Brain。共享 checkpoint 存储和训练侧状态恢复需沿用已验证的配置。本功能不会给任意训练脚本自动添加 checkpoint 能力。
 
 每实例只接受 1～8 卡。支持 `nvidia.com/gpu`（Master `--xpu_type nvidia`）和已适配的 `huawei.com/Ascend910B3`（`--xpu_type ascend`）；不适用于共享 GPU/MIG、PS、Ray 或 Workspace。多副本即使总卡数不超过 8，也选择水平模式。
 

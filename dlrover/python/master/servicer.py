@@ -442,7 +442,7 @@ class MasterServicer(ABC):
         res.group = group
         res.round = rdzv_round
         res.generation = generation
-        
+
         for rank, meta in nodes.items():
             res.world[rank] = meta.process_num
         if nodes and request.rdzv_name == RendezvousName.TRAINING:
@@ -1040,7 +1040,7 @@ class MasterServicer(ABC):
                     if message.scale_action not in VERTICAL_ACTIONS
                     else "dimension_mismatch"
                 )
-                metrics.request(message.scale_action, "rejected", reason)
+                metrics.request(message.scale_action, "rejected", reason, trigger_source="rpc")
             
             logger.warning(
                 "DIMENSION_MISMATCH: reject incompatible elastic request"
@@ -1056,14 +1056,14 @@ class MasterServicer(ABC):
             value = getattr(message, field)
             if value and value != expected:
                 if metrics is not None:
-                    metrics.request(message.scale_action, "rejected", "job_mismatch")
+                    metrics.request(message.scale_action, "rejected", "job_mismatch", trigger_source="rpc")
                 logger.warning(
                     "Reject elastic request: %s does not match job", field
                 )
                 return False
         
         return bool(
-            self._job_manager.start_resource_scaling(message.scale_action)
+            self._job_manager.start_resource_scaling(message.scale_action, trigger_source="rpc")
         )
 
 
