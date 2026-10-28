@@ -1,0 +1,818 @@
+# Copyright 2022 The DLRover Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import copy
+import threading
+import time
+import os
+from abc import ABCMeta, abstractmethod
+from typing import Dict, List, Optional
+
+from dlrover.python.brain.client import GlobalBrainClient
+
+from dlrover.python.common.constants import (
+    ElasticDimension,
+    JobOptStage,
+    NodeResourceLimit,
+    NodeType,
+    OptimizeMode,
+    OptimizeWorkerPhase,
+    OptimizerType,
+    WorkerResourceScaleAction,
+)
+from dlrover.python.common.global_context import Context
+from dlrover.python.common.log import default_logger as logger
+from dlrover.python.common.node import Node, NodeGroupResource, NodeResource
+from dlrover.python.common.serialize import JsonSerializable
+from dlrover.python.master.resource.brain_optimizer import (
+    BrainResoureOptimizer,
+)
+
+from dlrover.brain.python.common.job import (
+    OptimizeConfig,
+)
+from dlrover.python.master.resource.local_optimizer import PSLocalOptimizer
+from dlrover.python.master.resource.optimizer import (
+    ResourcePlan,
+    SimpleOptimizer,
+)
+from dlrover.python.scheduler.job import ResourceLimits
+
+_WORKER_OPTIMIZE_PHASE = "optimizer.worker.optimize-phase"
+
+_dlrover_context = Context.singleton_instance()
+
+WORKER_SCALE_GPU_ACTIONS = {
+    WorkerResourceScaleAction.ADD_GPUS,
+    WorkerResourceScaleAction.REDUCE_GPUS
+}
+
+def new_ps_resource_optimizer(
+    optimize_mode: str, job_uuid, resource_limits: ResourceLimits, job_name, namespace
+):
+    logger.info(
+        "New %s resource optimizer for job %s", optimize_mode, job_uuid
+    )
+    if optimize_mode == OptimizeMode.CLUSTER:
+        if GlobalBrainClient.BRAIN_CLIENT.available():
+            return BrainResoureOptimizer(job_uuid, job_name, "prod-cluster", namespace, resource_limits)
+        else:
+            logger.warning(
+                "Brain service is not available, use a local optimizer"
+            )
+            return PSLocalOptimizer(job_uuid, resource_limits)
+    elif optimize_mode == OptimizeMode.SINGLE_JOB:
+        return PSLocalOptimizer(job_uuid, resource_limits)
+    else:
+        logger.warning(
+            "Not support optimization mode %s, use a simple optimizer",
+            optimize_mode,
+        )
+        return SimpleOptimizer(job_uuid, resource_limits)
+
+def new_allreduce_resource_optimizer(
+    optimize_mode: str, job_uuid, resource_limits: ResourceLimits, job_name, namespace
+):
+    """
+     In the allreduce scenario, create a suitable resource optimizer instance based on the optimization mode.
+
+    """
+    logger.info("New %s allreduce resource optimizer for job %s(%s)", optimize_mode, job_name, job_uuid)
+
+    if optimize_mode == OptimizeMode.CLUSTER:
+        if GlobalBrainClient.BRAIN_CLIENT.available():
+            return BrainResoureOptimizer(job_uuid, job_name, "prod-cluster", namespace, resource_limits)
+        else:
+            logger.warning(
+                "Brain service is not available, use a local optimizer"
+            )
+            return SimpleOptimizer(job_uuid, resource_limits)
+    elif optimize_mode == OptimizeMode.SINGLE_JOB:
+        return SimpleOptimizer(job_uuid, resource_limits)
+    else:
+        logger.warning(
+            "Not support optimization mode %s, use a simple optimizer",
+            optimize_mode,
+        )
+        return SimpleOptimizer(job_uuid, resource_limits)
+
+def resolve_group_id(
+    group_affinity: Optional[Dict[int, int]],
+    node_type: str,
+    rank_index: int,
+) -> Optional[int]:
+    """Resolve the node group id for a node by its rank index.
+
+    Only WORKER nodes are partitioned into node groups. The groups are
+    laid out in ascending group-id order, each occupying a contiguous
+    ``[start, end)`` rank range sized by ``group_affinity[group_id]``.
+    Returns ``None`` when group affinity is not configured or the rank
+    falls outside the declared worker range.
+    """
+    if node_type != NodeType.WORKER or not group_affinity:
+        return None
+    ordered_groups: List[int] = sorted(group_affinity.keys())
+    start = 0
+    for group_id in ordered_groups:
+        size = group_affinity[group_id]
+        if start <= rank_index < start + size:
+            return group_id
+        start += size
+    return None
+
+
+class JobResource(JsonSerializable):
+    def __init__(self):
+        self.node_group_resources: Dict[str, NodeGroupResource] = {}
+        self.group_affinity: Optional[Dict[int, int]] = None
+
+    def get_node_group_resource(self, node_type):
+        return self.node_group_resources.get(node_type, None)
+
+    def _get_group_node_num(self, node_type):
+        if node_type in self.node_group_resources:
+            return self.node_group_resources[node_type].count
+        return 0
+
+    def get_node_types(self):
+        return list(self.node_group_resources.keys())
+
+    def update_node_group_resource(self, node_type, num, cpu, memory, gpu_type, gpu_num):
+        self.node_group_resources.setdefault(
+            node_type,
+            NodeGroupResource(
+                count=0,
+                node_resource=NodeResource(0, 0),
+            ),
+        )
+        resource = self.node_group_resources[node_type]
+        resource.count = num or resource.count
+        resource.node_resource.cpu = cpu or resource.node_resource.cpu
+        resource.node_resource.memory = memory or resource.node_resource.memory
+        resource.node_resource.gpu_type = gpu_type or resource.node_resource.gpu_type
+        resource.node_resource.gpu_num = gpu_num or resource.node_resource.gpu_num
+
+    @property
+    def worker_num(self):
+        return self._get_group_node_num(NodeType.WORKER)
+
+    @property
+    def ps_num(self):
+        return self._get_group_node_num(NodeType.PS)
+
+    @property
+    def evaluator_num(self):
+        return self._get_group_node_num(NodeType.EVALUATOR)
+
+    @property
+    def chief_num(self):
+        return self._get_group_node_num(NodeType.CHIEF)
+
+    def init_job_node_meta(
+        self,
+        relaunch_on_worker_failure,
+        service_create_fn,
+        new_node_name_fn,
+    ):
+        """
+        relaunch_on_worker_failure: int, the number of relaunches.
+        service_create_fn: a callable function to create the name for a sevice.
+        new_node_name_fn: a callable function to create the name for a node.
+        return: a dict with pod_type as key, and another dict as value.
+                The other dict uses pod id as key, and PodInfo as value.
+        """
+        job_nodes: Dict[str, Dict[int, Node]] = {}
+        for node_type in self.get_node_types():
+            group_resource = self.get_node_group_resource(node_type)
+            config_resource = group_resource.node_resource
+            group_nodes: Dict[int, Node] = {}
+            group_size = self._group_count()
+            for i in range(group_resource.count):
+                group_id = self._resolve_group_id(node_type, i)
+                group_nodes[i] = Node(
+                    node_type=node_type,
+                    node_id=i,
+                    rank_index=i,
+                    name=new_node_name_fn(node_type, i),
+                    config_resource=copy.deepcopy(config_resource),
+                    max_relaunch_count=relaunch_on_worker_failure,
+                    service_addr=service_create_fn(node_type, i),
+                    node_group=group_id,
+                    node_group_size=group_size
+                    if group_id is not None
+                    else None,
+                    node_group_id=group_id,
+                )
+            job_nodes[node_type] = group_nodes
+        logger.info(
+            "after initializing job node meta job_nodes are %s" % job_nodes
+        )
+        return job_nodes
+
+    def _group_count(self) -> Optional[int]:
+        """Return the total number of node groups, or None if group
+        affinity is not configured."""
+        if not self.group_affinity:
+            return None
+        return len(self.group_affinity)
+
+    def _resolve_group_id(
+        self, node_type: str, rank_index: int
+    ) -> Optional[int]:
+        """Resolve the node group id for a node by its rank index.
+
+        Only WORKER nodes are partitioned into node groups. The groups are
+        laid out in ascending group-id order, each occupying a contiguous
+        [start, end) rank range sized by ``group_affinity[group_id]``.
+        Returns None when group affinity is not configured.
+        """
+        return resolve_group_id(self.group_affinity, node_type, rank_index)
+
+    def adjust_worker_for_estimator(self):
+        if (
+            NodeType.CHIEF in self.node_group_resources
+            and self.node_group_resources[NodeType.CHIEF].count > 0
+        ) or (NodeType.WORKER not in self.node_group_resources):
+            return
+
+        worker = self.node_group_resources[NodeType.WORKER]
+        if worker.count <= 0:
+            return
+
+        chief = self.node_group_resources.get(
+            NodeType.CHIEF, NodeGroupResource.new_empty()
+        )
+        chief.count = 1
+        chief.node_resource.cpu = worker.node_resource.cpu
+        chief.node_resource.memory = worker.node_resource.memory
+        self.node_group_resources[NodeType.CHIEF] = chief
+        worker.count -= 1
+        logger.info("self = %s", self.to_json())
+
+
+class JobResourceOptimizer(metaclass=ABCMeta):
+    @abstractmethod
+    def update_job_uuid(self, job_uuid):
+        pass
+
+    @abstractmethod
+    def init_job_resource(self, job_resource: JobResource):
+        """Initialize resource configuration for a job."""
+        pass
+
+    @abstractmethod
+    def get_job_resource_plan(self, scale_action: str) -> ResourcePlan:
+        """Get resource plan for a job."""
+        pass
+
+    @abstractmethod
+    def adjust_oom_resource(self, node: Node):
+        """Adjust the resource configuration for OOM nodes"""
+        pass
+
+    @abstractmethod
+    def get_config_resource(self) -> JobResource:
+        pass
+
+    @abstractmethod
+    def get_brain_resource_plan_opt_gpus(self):
+        """Get resource plan for a job."""
+        pass
+
+
+class PSJobResourceOptimizer(JobResourceOptimizer):
+    """It generates resource configuration for a PS job."""
+
+    def __init__(
+        self,
+        worker_resource: NodeGroupResource,
+        ps_resource: NodeGroupResource,
+        optimize_mode: str,
+        job_uuid="",
+        resource_limits=ResourceLimits(),
+        job_name = "",
+        namespace = "",
+    ):
+        self._worker_resource = worker_resource
+        self._ps_resource = ps_resource
+        self._original_worker_resource = copy.deepcopy(self._worker_resource)
+        self._original_ps_resource = copy.deepcopy(self._ps_resource)
+        self._resource_optimizer = new_ps_resource_optimizer(
+            optimize_mode, job_uuid, resource_limits, job_name, namespace
+        )
+        self._lock = threading.Lock()
+        self.optimized_ps_mem = False
+        self.optimize_worker_sampled = False
+        self._job_stage = JobOptStage.CREATE
+        self._last_ps_change_time = 0.0
+
+    def set_job_stage(self, stage):
+        self._job_stage = stage
+
+    def get_job_stage(self):
+        return self._job_stage
+
+    def get_config_resource(self):
+        job_config = JobResource()
+        worker_config = self._original_worker_resource
+        job_config.node_group_resources[NodeType.WORKER] = worker_config
+        ps_config = self._original_worker_resource
+        job_config.node_group_resources[NodeType.PS] = ps_config
+        return job_config
+
+    def update_job_uuid(self, job_uuid):
+        self._resource_optimizer.update_job_uuid(job_uuid)
+
+    def _init_job_resource_by_optimizer(self):
+        plan = self._resource_optimizer.generate_opt_plan(self._job_stage)
+        if not plan or plan.empty():
+            logger.info("Use the default plan to start the job")
+            plan = self._gen_default_resource_plan()
+        self._job_stage = JobOptStage.WORKER_INITIAL
+
+        if (
+            _dlrover_context.auto_worker_enabled
+            and NodeType.WORKER in plan.node_group_resources
+        ):
+            worker_resource = self._check_ignore_original_worker_resource(
+                plan.node_group_resources[NodeType.WORKER]
+            )
+            self._worker_resource.update(
+                worker_resource.count,
+                worker_resource.node_resource.cpu,
+                worker_resource.node_resource.memory,
+            )
+        if (
+            _dlrover_context.auto_ps_enabled
+            and NodeType.PS in plan.node_group_resources
+        ):
+            ps_resource = self._check_ignore_original_ps_resource(
+                plan.node_group_resources[NodeType.PS]
+            )
+            self._ps_resource.update(
+                ps_resource.count,
+                ps_resource.node_resource.cpu,
+                ps_resource.node_resource.memory,
+            )
+
+    def _gen_default_resource_plan(self):
+        plan = ResourcePlan.new_default_plan()
+        return plan
+
+    def init_job_resource(self, job_resource: JobResource):
+        """Adjust the initial resource of typed pods by EasyDL.
+        Args:
+            job_resource: node resource configuration of a job.
+        """
+        self._init_job_resource_by_optimizer()
+        job_resource.update_node_group_resource(
+            NodeType.WORKER,
+            self._worker_resource.count,
+            self._worker_resource.node_resource.cpu,
+            self._worker_resource.node_resource.memory,
+            self._worker_resource.node_resource.gpu_type,
+            self._worker_resource.node_resource.gpu_num,
+        )
+
+        job_resource.update_node_group_resource(
+            NodeType.PS,
+            self._ps_resource.count,
+            self._ps_resource.node_resource.cpu,
+            self._ps_resource.node_resource.memory,
+            "",
+            0,
+        )
+
+        evaluator_group = job_resource.get_node_group_resource(
+            NodeType.EVALUATOR
+        )
+        if evaluator_group:
+            resource = evaluator_group.node_resource
+            if resource.cpu < NodeResourceLimit.MIN_VALID_CPU:
+                resource.cpu = self._worker_resource.node_resource.cpu
+            min_memory = NodeResourceLimit.MIN_VALID_MEMORY
+            if resource.memory < min_memory:
+                resource.memory = self._worker_resource.node_resource.memory
+
+        logger.info("Job resource = %s", job_resource.to_json())
+        return job_resource
+
+    def adjust_oom_resource(self, node):
+        if node.type == NodeType.PS:
+            self._adjust_oom_ps_resource(node)
+        else:
+            self._adjust_oom_worker_resource(node)
+
+    def _adjust_oom_worker_resource(self, node: Node):
+        """Increment the memory to launch worker. The new memory
+        is max(1.5 * memory, the memory set by users).
+
+        Args:
+            node: Node object.
+        """
+        cur_mem = node.config_resource.memory
+        if (
+            _dlrover_context.auto_worker_enabled
+            and self._job_stage == JobOptStage.WORKER_INITIAL
+        ):
+            plan = self._resource_optimizer.generate_oom_recovery_plan(
+                [node], JobOptStage.CREATE
+            )
+            if plan and not plan.empty():
+                new_resource = plan.node_group_resources[NodeType.WORKER]
+                self._worker_resource.node_resource.memory = max(
+                    self._worker_resource.node_resource.memory,
+                    new_resource.node_resource.memory,
+                )
+        else:
+            plan = self._get_worker_resource_at_init_phase()
+            if NodeType.WORKER in plan.node_group_resources:
+                new_resource = self._check_ignore_original_worker_resource(
+                    plan.node_group_resources[NodeType.WORKER]
+                )
+                self._worker_resource.node_resource.memory = max(
+                    self._worker_resource.node_resource.memory,
+                    new_resource.node_resource.memory,
+                )
+        cur_mem *= NodeResourceLimit.INCREMENTAL_MEMORY_FACTOR
+        cur_mem = min(cur_mem, NodeResourceLimit.MAX_MEMORY)
+        opt_memory = int(
+            max(
+                self._worker_resource.node_resource.memory,
+                cur_mem,
+                self._original_worker_resource.node_resource.memory,
+            )
+        )
+        incre_memory = opt_memory - node.config_resource.memory
+        incre_memory = min(
+            incre_memory, NodeResourceLimit.MAX_INCREMENTAL_MEMORY
+        )
+        node.config_resource.memory += incre_memory
+        logger.info(
+            "Increment the memory of %s to %s",
+            node.name,
+            node.config_resource.memory,
+        )
+
+    def _adjust_oom_ps_resource(self, node: Node):
+        """Adjust PS resource if there is a OOM PS"""
+        plan = self._resource_optimizer.generate_oom_recovery_plan(
+            [node], JobOptStage.PS_INITIAL
+        )
+        if plan and not plan.empty() and node.name in plan.node_resources:
+            resource = plan.node_resources[node.name]
+            self._ps_resource.node_resource.memory = max(
+                self._ps_resource.node_resource.memory,
+                resource.memory,
+            )
+        cur_mem = node.config_resource.memory
+        cur_mem *= NodeResourceLimit.INCREMENTAL_MEMORY_FACTOR
+        opt_memory = int(
+            max(
+                self._ps_resource.node_resource.memory,
+                cur_mem,
+                self._original_ps_resource.node_resource.memory,
+            )
+        )
+        incre_memory = opt_memory - node.config_resource.memory
+        incre_memory = min(
+            incre_memory, NodeResourceLimit.MAX_INCREMENTAL_MEMORY
+        )
+        node.config_resource.memory += incre_memory
+        logger.info(
+            "Increment the memory of %s to %s",
+            node.name,
+            node.config_resource.memory,
+        )
+        self._last_ps_change_time = time.time()
+
+    def get_job_resource_plan(self, scale_action: str):
+        plan = None
+        if self._job_stage == JobOptStage.WORKER_INITIAL:
+            plan = self._get_worker_resource_at_init_phase()
+            self._job_stage = JobOptStage.PS_INITIAL
+        elif self._job_stage == JobOptStage.PS_INITIAL:
+            plan = self._get_ps_resource_plan()
+            self._job_stage = JobOptStage.PS_RUNNING
+        elif self._job_stage == JobOptStage.PS_RUNNING:
+            plan = self._get_ps_resource_plan()
+            if plan.empty():
+                plan = self._get_worker_resource_at_running()
+        if not plan or plan.empty():
+            return None
+
+        if NodeType.WORKER in plan.node_group_resources:
+            self._verify_optimized_group_resource(plan, NodeType.WORKER)
+
+        if plan and NodeType.PS in plan.node_group_resources:
+            self._verify_optimized_group_resource(plan, NodeType.PS)
+
+        plan.adjust_plan_by_context()
+        return plan
+    
+    def get_brain_resource_plan_opt_gpus(self):
+        pass
+
+    def _get_worker_resource_at_running(self):
+        if not self.optimize_worker_sampled:
+            plan = self._get_worker_resource_at_sample_phase()
+            self.optimize_worker_sampled = True
+        else:
+            plan = self._get_worker_resource_at_stable_phase()
+        return plan
+
+    def _get_worker_resource_at_init_phase(self, optimizer_config={}):
+        optimizer_config[_WORKER_OPTIMIZE_PHASE] = OptimizeWorkerPhase.INITIAL
+        plan = self._resource_optimizer.generate_opt_plan(
+            JobOptStage.WORKER_INITIAL, optimizer_config
+        )
+        if plan.empty():
+            logger.info("No any plan to initialize the number of worker")
+        return plan
+
+    def _get_worker_resource_at_sample_phase(self, optimizer_config={}):
+        optimizer_config[_WORKER_OPTIMIZE_PHASE] = OptimizeWorkerPhase.SAMPLE
+        plan = self._resource_optimizer.generate_opt_plan(
+            JobOptStage.WORKER_INITIAL, optimizer_config
+        )
+        if not plan or plan.empty():
+            return
+        return plan
+
+    def _get_worker_resource_at_stable_phase(self, optimizer_config={}):
+        optimizer_config[_WORKER_OPTIMIZE_PHASE] = OptimizeWorkerPhase.STABLE
+        plan = self._resource_optimizer.generate_opt_plan(
+            JobOptStage.WORKER_RUNNING, optimizer_config
+        )
+        if not plan:
+            return
+        return plan
+
+    def _get_ps_resource_plan(self, optimizer_config={}):
+        # The interval of changing PS should be long enough.
+        interval = _dlrover_context.seconds_interval_to_change_ps
+        if time.time() - self._last_ps_change_time > interval:
+            plan = self._resource_optimizer.generate_opt_plan(
+                self._job_stage, optimizer_config
+            )
+        else:
+            logger.info(
+                "Skip optimizing PS, because the intervalto change ps is too short."
+            )
+            return ResourcePlan()
+        if not plan.empty():
+            self._last_ps_change_time = time.time()
+        return plan
+
+    def _verify_optimized_group_resource(self, plan: ResourcePlan, node_type):
+        group = plan.node_group_resources[node_type]
+        if node_type == NodeType.WORKER:
+            group = self._check_ignore_original_worker_resource(group)
+            node_resource = group.node_resource
+            self._worker_resource.count = group.count
+            self._worker_resource.node_resource.cpu = node_resource.cpu
+            self._worker_resource.node_resource.memory = node_resource.memory
+        elif node_type == NodeType.PS:
+            group = self._check_ignore_original_ps_resource(group)
+            node_resource = group.node_resource
+            self._ps_resource.count = min(
+                group.count, NodeResourceLimit.MAX_PS_NUM
+            )
+            self._ps_resource.node_resource.cpu = node_resource.cpu
+            self._ps_resource.node_resource.memory = node_resource.memory
+        return group
+
+    def _check_ignore_original_worker_resource(
+        self, resource: NodeGroupResource
+    ):
+        """Abandon the optimization result if users have set the resource."""
+        #  Users may worry about that the increasing number of worker hurts the
+        #  accuracy, so the max number of worker is the configuration.
+        original_resource = self._original_worker_resource.node_resource
+        if self._original_worker_resource.count > 0:
+            resource.count = self._original_worker_resource.count
+        if resource.node_resource.cpu == 0:
+            resource.node_resource.cpu = original_resource.cpu
+        if resource.node_resource.memory == 0:
+            resource.node_resource.memory = original_resource.memory
+        return resource
+
+    def _check_ignore_original_ps_resource(self, resource: NodeGroupResource):
+        """Abandon the optimization result if users have set the resource."""
+        original_resource = self._original_ps_resource.node_resource
+        if self._original_ps_resource.count > 0:
+            resource.count = self._original_ps_resource.count
+        if original_resource.memory >= NodeResourceLimit.MIN_VALID_MEMORY:
+            resource.node_resource.memory = original_resource.memory
+        if original_resource.cpu >= NodeResourceLimit.MIN_VALID_CPU:
+            resource.node_resource.cpu = original_resource.cpu
+        return resource
+
+
+class AllreduceJobResourceOptimizer(JobResourceOptimizer):
+    """It generates resource configuration for a job."""
+
+    def __init__(
+        self,
+        worker_resource: NodeGroupResource,
+        optimize_mode: str,
+        job_uuid = "",
+        resource_limits = ResourceLimits(),
+        job_name = "",
+        namespace = "",
+    ):
+        self._worker_resource = worker_resource
+        self._original_worker_resource = copy.deepcopy(self._worker_resource)
+        self._current_worker_resource = copy.deepcopy(self._worker_resource)
+        self._resource_limits = resource_limits
+        
+        if _dlrover_context.runtime_elastic_dimension == ElasticDimension.VERTICAL:
+            self._resource_optimizer = new_allreduce_resource_optimizer(
+                optimize_mode, job_uuid, resource_limits, job_name, namespace
+            )
+        
+        self._job_uuid = job_uuid
+        self._lock = threading.Lock()
+        self._node_unit = 1
+        self._alive_node_num = 0
+        self._opt_gpu_nums = 0
+
+    def update_job_uuid(self, job_uuid):
+        pass
+
+    def init_job_resource(self, job_resource: JobResource):
+        pass
+
+    def get_current_worker_resource(self):
+        with self._lock:
+            return copy.deepcopy(self._current_worker_resource)
+
+    def update_current_worker_resource(
+        self, worker_resource: NodeGroupResource
+    ):
+        if not worker_resource:
+            return
+        with self._lock:
+            self._current_worker_resource = copy.deepcopy(worker_resource)
+            self._worker_resource = copy.deepcopy(worker_resource)
+    
+    def get_job_resource_plan(self, scale_action: str) -> ResourcePlan:
+        if WorkerResourceScaleAction.NOT_ADJUST == scale_action:
+            return self._get_job_resource_plan_by_original()
+        
+        if _dlrover_context.runtime_elastic_dimension != ElasticDimension.VERTICAL:
+            raise ValueError(
+                "DIMENSION_MISMATCH: GPU optimization requires vertical mode"
+            )
+        
+        if scale_action in WORKER_SCALE_GPU_ACTIONS:
+            current_worker_resource = self.get_current_worker_resource()
+            customized_config = {
+                "scale_action": scale_action,
+                "original_worker_replicas": str(current_worker_resource.count),
+                "original_worker_resource": current_worker_resource.node_resource.to_json()
+            }
+            optimize_config = self._gen_optimize_config(
+                OptimizerType.GPU_BOTTLENECK_OPTIMIZER, 
+                customized_config=customized_config
+            )
+        elif scale_action == WorkerResourceScaleAction.MANUAL:
+            optimize_config = self._gen_optimize_config(OptimizerType.MANUAL_OPTIMIZER)
+        else:
+            optimize_config = self._gen_optimize_config(OptimizerType.BASE_OPTIMIZER)
+
+        plan = self._resource_optimizer.generate_resource_plan_with_optimizer(optimize_config)
+
+        if not plan or plan.empty():
+            logger.warning("Brain resource plan is empty, Use the original plan to start the job")
+            _dlrover_context.enable_elastic_resource = False
+            return self._get_job_resource_plan_by_original()
+        
+        worker_resources = plan.node_group_resources.get(NodeType.WORKER)
+        if not worker_resources:
+            logger.error("Generated plan does not contain WORKER node group. Falling back to original plan.")
+            _dlrover_context.enable_elastic_resource = False
+            return self._get_job_resource_plan_by_original()
+
+        from dlrover.python.master.elasticity_policy import (
+            validate_resource_plan,
+        )
+
+        if (
+            _dlrover_context.auto_elasticity
+            and worker_resources.count != self._original_worker_resource.count
+        ):
+            raise ValueError(
+                f"DIMENSION_MISMATCH: vertical optimizer changed replicas. "
+                f"Original worker replicas is {self._original_worker_resource.count}, "
+                f"Optimized worker replicas is {worker_resources.count}"
+            )
+        
+        self._verify_worker_optimized_group_resource(plan)
+
+        if _dlrover_context.auto_elasticity:
+            validate_resource_plan(
+                plan,
+                self.get_current_worker_resource(),
+                ElasticDimension.VERTICAL,
+            )
+            gpu_limit = self._resource_limits.gpu_num
+            if (
+                gpu_limit > 0
+                and worker_resources.count
+                * worker_resources.node_resource.gpu_num
+                > gpu_limit
+            ):
+                raise ValueError(
+                    "CAPACITY_EXCEEDED: vertical plan exceeds job GPU limit"
+                )
+        self._opt_gpu_nums = worker_resources.node_resource.gpu_num
+        
+        return plan
+
+    def get_worker_resource_config(self):
+        pass
+
+    def get_brain_resource_plan_opt_gpus(self):
+        return self._opt_gpu_nums
+
+    def _verify_worker_optimized_group_resource(self, plan: ResourcePlan):
+        group = plan.node_group_resources[NodeType.WORKER]
+        group = self._check_ignore_original_worker_resource(group)
+        # node_resource = group.node_resource
+        # self._worker_resource.count = group.count
+        # self._worker_resource.node_resource.cpu = node_resource.cpu
+        # self._worker_resource.node_resource.memory = node_resource.memory
+        return group
+
+    def _check_ignore_original_worker_resource(
+        self, resource: NodeGroupResource
+    ):
+        """Abandon the optimization result if users have set the resource."""
+        #  Users may worry about that the increasing number of worker hurts the
+        #  accuracy, so the max number of worker is the configuration.
+        original_resource = self._original_worker_resource.node_resource
+        current_resource = self.get_current_worker_resource().node_resource
+        if self._original_worker_resource.count > 0:
+            resource.count = self._original_worker_resource.count
+        if resource.node_resource.cpu == 0:
+            resource.node_resource.cpu = current_resource.cpu
+        if resource.node_resource.memory == 0:
+            resource.node_resource.memory = current_resource.memory
+        if resource.node_resource.gpu_num == 0:
+            resource.node_resource.gpu_num = current_resource.gpu_num
+        if resource.node_resource.gpu_type is None:
+            resource.node_resource.gpu_type = current_resource.gpu_type
+        if not resource.node_resource.gpu_type:
+            resource.node_resource.gpu_type = original_resource.gpu_type
+        return resource
+    
+    def _gen_optimize_config(self, optimizer="", customized_config={}):
+        optimize_config: OptimizeConfig = OptimizeConfig()
+        optimize_config.optimizer_name = optimizer
+        optimize_config.customized_config = customized_config
+        return optimize_config
+
+    def _get_job_resource_plan_by_original(self):
+        """Check whether there are free nodes in the cluster."""
+        plan = ResourcePlan()
+        worker_config = copy.deepcopy(self._original_worker_resource)
+        max_node_num = self._original_worker_resource.count
+        request_num = max_node_num - self._alive_node_num
+        free_num = self._get_free_gpu_node()
+        free_num = (free_num // self._node_unit) * self._node_unit
+        new_num = min(free_num, request_num)
+        worker_config.count = self._alive_node_num + new_num
+        plan.node_group_resources[NodeType.WORKER] = worker_config
+        return plan
+
+    # TODO: implement the function to query the number free GPU nodes.
+    def _get_free_gpu_node(self):
+        return 0
+
+    def adjust_oom_resource(self, node: Node):
+        """Adjust the resource configuration for OOM nodes"""
+        # no adjustment for now(for allreduce type)
+        pass
+
+    def get_config_resource(self):
+        job_config = JobResource()
+        worker_config = self._original_worker_resource
+        job_config.node_group_resources[NodeType.WORKER] = worker_config
+        return job_config
+
+    def set_node_unit(self, node_unit):
+        self._node_unit = node_unit
+
+    def set_alive_node_num(self, node_num):
+        self._alive_node_num = node_num

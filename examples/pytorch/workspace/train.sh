@@ -1,0 +1,31 @@
+dlrover-workspace launch --cli-log on --cmd \
+  "dlrover-run --nnodes=1 --nproc_per_node=1 --max_restarts=1 \
+      swift sft --model /nas/train-data/model/Qwen2.5-0.5B-Instruct \
+      --dataset /nas/train-data/dataset/alpaca_data_zh_51k.json \
+      --output_dir /nas/train-data/output/jupyter-elastic \
+      --model_type qwen2 \
+      --torch_dtype bfloat16 \
+      --tuner_type lora \
+      --num_train_epochs 3 \
+      --warmup_ratio 0.1 \
+      --per_device_train_batch_size 1 \
+      --per_device_eval_batch_size 1 \
+      --learning_rate 1e-4 \
+      --gradient_accumulation_steps 1 \
+      --max_length 1024 \
+      --weight_decay 0.0001 \
+      --lr_scheduler_type cosine \
+      --logging_steps 1 \
+      --save_steps 50 \
+      --save_total_limit 2 \
+      --lora_rank 8 \
+      --lora_dropout 0.05 \
+      --response_prefix '\n' \
+      --dataloader_num_workers 2 \
+      --lora_alpha 32 \
+      --target_modules all-linear \
+      --dataset_num_proc 1 \
+      --model_name 'jupyter-elastic' \
+      --use_flash_ckpt true \
+      --deepspeed /nas/train-data/deepspeed/zero.json \
+      --callbacks deepspeed_elastic graceful_exit"

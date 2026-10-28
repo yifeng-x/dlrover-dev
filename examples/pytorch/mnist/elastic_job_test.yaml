@@ -1,0 +1,119 @@
+---
+apiVersion: elastic.iml.github.io/v1alpha1
+kind: ElasticJob
+metadata:
+  name: mnist-test01
+  namespace: dlrover
+  annotations:
+    training_elastic_mode: "ucp"
+
+spec:
+  distributionStrategy: AllreduceStrategy
+  optimizeMode: single-job
+  # optimizeMode: cluster
+  replicaSpecs:
+    dlrover-master:
+      template:
+        spec:
+          restartPolicy: Always
+          # nodeSelector:
+          #   allow-elasticjob-schedule: "true"
+          serviceAccount: dlrover-controller-manager
+          serviceAccountName: dlrover-controller-manager
+          volumes:
+            - name: pvc-nas # 持久化存储
+              persistentVolumeClaim:
+                claimName: elastic-train-pvc-dlrover
+          containers:
+            - command:
+              - /bin/bash
+              - -c
+              - "cd /nas/code/dev/my-repository/test/dlrover-test && \
+                 pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+                 pip uninstall dlrover -y && \
+                 pip install --no-cache-dir -e . && \
+                 python -m dlrover.python.master.main --platform pyk8s \
+                  --namespace dlrover \
+                  --job_name mnist-test01 \
+                  --port 50001"
+              env:
+              - name: POD_IP
+                valueFrom:
+                  fieldRef:
+                    apiVersion: v1
+                    fieldPath: status.podIP
+              - name: TZ
+                value: Asia/Shanghai
+              #- name: DLROVER_LOG_LEVEL
+                #value: "DEBUG"
+              image: docker.io/library/dlrover-master-amd64:resource-elastic
+              imagePullPolicy: IfNotPresent
+              name: main
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 1Gi
+                requests:
+                  cpu: "1"
+                  memory: 1Gi
+              volumeMounts:
+                - name: pvc-nas
+                  mountPath: /nas
+    worker:
+      replicas: 4
+      template:
+        spec:
+          restartPolicy: Always
+          volumes:
+            - name: volume-shm # 临时存储
+              emptyDir:
+                medium: Memory
+                sizeLimit: 20Gi
+            - name: pvc-nas # 持久化存储
+              persistentVolumeClaim:
+                claimName: elastic-train-pvc-dlrover
+            # - name: host-cuda # 宿主机 CUDA toolkit
+            #   hostPath:
+            #     path: /usr/local/cuda-12.8
+            #     type: Directory
+          containers:
+            - name: main
+              image: registry.cn-hangzhou.aliyuncs.com/intell-ai/dlrover:pytorch-example
+              imagePullPolicy: IfNotPresent
+              # env:
+              #   - name: CUDA_HOME
+              #     value: /usr/local/cuda-12.8
+              #   - name: PATH
+              #     value: /usr/local/cuda-12.8/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              #   - name: LD_LIBRARY_PATH
+              #     value: /usr/local/cuda-12.8/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+              volumeMounts:
+                - name: volume-shm # 挂载临时存储
+                  mountPath: /dev/shm
+                - name: pvc-nas
+                  mountPath: /nas
+                # - name: host-cuda
+                #   mountPath: /usr/local/cuda-12.8
+                #   readOnly: true
+              command:
+                - /bin/bash
+                - -lc
+                - "cd /nas/code/dev/my-repository/test/dlrover-test && \
+                  pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+                  pip uninstall dlrover -y && \
+                  pip install --no-cache-dir -e . && \
+                  pip install --no-cache-dir kubernetes && \
+                  dlrover-run --network-check --nnodes=3:$NODE_NUM \
+                  --nproc_per_node=2 --max_restarts=3  \
+                  /nas/code/dev/my-repository/test/dlrover-test/examples/pytorch/mnist/cnn_train.py --num_epochs 5 \
+                  --training_data /nas/train-data/dataset/mnist_png/training/ \
+                  --validation_data /nas/train-data/dataset/mnist_png/testing/"
+              resources:
+                limits:
+                  cpu: "2"
+                  memory: 2Gi
+                  # nvidia.com/gpu: 1
+                requests:
+                  cpu: "2"
+                  memory: 2Gi
+                  # nvidia.com/gpu: 1

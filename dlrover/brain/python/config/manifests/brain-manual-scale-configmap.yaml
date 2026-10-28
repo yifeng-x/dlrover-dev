@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: brain-manual-scale-config
+  namespace: dlrover
+data:
+  # 键值对形式存储配置信息，可以是文本、JSON、YAML 或其他格式
+  config.json: |
+    {
+      "customize_worker_resource": {
+        "cpu": 16,
+        "memory": 64,
+        "gpus": 2,
+        "gpu_type": "huawei.com/Ascend910B3"
+      },
+      "job_names": "gpu-elastic-manual,test2"
+    }

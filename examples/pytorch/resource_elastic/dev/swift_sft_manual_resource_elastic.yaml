@@ -1,0 +1,124 @@
+---
+apiVersion: elastic.iml.github.io/v1alpha1
+kind: ElasticJob
+metadata:
+  name: gpu-elastic-manual
+  namespace: dlrover
+spec:
+  distributionStrategy: AllreduceStrategy
+  #optimizeMode: single-job
+  optimizeMode: cluster
+  replicaSpecs:
+    dlrover-master:
+      template:
+        spec:
+          restartPolicy: Never
+          # nodeSelector:
+          #   allow-elasticjob-schedule: "true"
+          serviceAccount: dlrover-controller-manager
+          serviceAccountName: dlrover-controller-manager
+          volumes:
+            - name: pvc-nas # 持久化存储
+              persistentVolumeClaim:
+                claimName: elastic-train-pvc-dlrover
+          containers:
+            - command:
+              - /bin/bash
+              - -c
+              - "cd /nas/code/resource-elastic/dev/brain/resource-bottleneck/LM05.20_DLRover && \
+                 pip install pydantic -i http://central.jaf.cmbchina.cn/artifactory/api/pypi/group-pypi/simple --trusted-host central.jaf.cmbchina.cn && \
+                 pip install -e . && \
+                 python -m dlrover.python.master.main --elastic_dimension vertical --configmap_manual_scale_switch on --platform pyk8s --xpu_type ascend --namespace dlrover \
+                 --job_name gpu-elastic-manual --port 50001"
+              env:
+              - name: POD_IP
+                valueFrom:
+                  fieldRef:
+                    apiVersion: v1
+                    fieldPath: status.podIP
+              - name: TZ
+                value: Asia/Shanghai
+              #- name: DLROVER_LOG_LEVEL
+                #value: "DEBUG"
+              image: registry.cic.cmbchina.cn/cic/talar/dlrover-release-master-py310-arm64:v1.0.0
+              imagePullPolicy: IfNotPresent
+              name: main
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 2Gi
+                requests:
+                  cpu: "1"
+                  memory: 2Gi
+              volumeMounts:
+                - name: pvc-nas
+                  mountPath: /nas
+    worker:
+      replicas: 1
+      template:
+        spec:
+          restartPolicy: Never
+          volumes:
+            - name: dshm # 临时存储
+              emptyDir:
+                medium: Memory
+                sizeLimit: 4Gi
+            - name: pvc-nas # 持久化存储
+              persistentVolumeClaim:
+                claimName: elastic-train-pvc-dlrover
+          containers:
+            - name: main
+              #image: registry.cic.cmbchina.cn/cic/cmb-neotrain-dlrover-arm64:v0.7.0-hw
+              image: registry.cic.cmbchina.cn/cic-arm/cmb-neotrain-dlrover-train:master-v0.7.0-vertical-elastic-hw-20260212
+              imagePullPolicy: IfNotPresent
+              volumeMounts:
+                - name: dshm # 挂载临时存储
+                  mountPath: /dev/shm
+                - name: pvc-nas
+                  mountPath: /nas
+              command:
+                - /bin/bash
+                - -c
+                - "pip install --user -U /nas/code/resource-elastic/dev/brain/resource-bottleneck/LM05.20_DLRover/dist/dlrover-0.7.0.dev0-py3-none-any.whl \
+                  -i http://central.jaf.cmbchina.cn/artifactory/api/pypi/group-pypi/simple --trusted-host central.jaf.cmbchina.cn \
+                  && dlrover-run --nnodes=1 \
+                  --nproc_per_node=1 --max_restarts=1 \
+                  swift sft --model /nas/model/Qwen2.5-3B-Instruct \
+                  --dataset /nas/dataset/话术质检_版本2_alpaca_data.json \
+                  --output_dir /nas/output/Qwen2.5-3B-Instruct-hszj \
+                  --model_type qwen2 \
+                  --torch_dtype bfloat16 \
+                  --train_type lora \
+                  --num_train_epochs 3 \
+                  --warmup_ratio 0.1 \
+                  --per_device_train_batch_size 2 \
+                  --per_device_eval_batch_size 1 \
+                  --learning_rate 1e-4 \
+                  --gradient_accumulation_steps 1 \
+                  --max_length 1024 \
+                  --weight_decay 0.0001 \
+                  --lr_scheduler_type cosine \
+                  --logging_steps 1 \
+                  --save_steps 50 \
+                  --lora_rank 8 \
+                  --lora_dropout 0.05 \
+                  --response_prefix '<think>\n' \
+                  --save_total_limit 10 \
+                  --dataloader_num_workers 4 \
+                  --lora_alpha 32 \
+                  --target_modules all-linear \
+                  --dataset_num_proc 1 \
+                  --model_name 'Qwen2.5-3B-Instruct-hszj' \
+                  --use_flash_ckpt true"
+              resources:
+                limits:
+                  cpu: "12"
+                  memory: 48Gi
+                  huawei.com/Ascend910B3: 1 # optional
+                requests:
+                  cpu: "12"
+                  memory: 48Gi
+                  huawei.com/Ascend910B3: 1 # optional
+              #env:
+              #- name: DLROVER_LOG_LEVEL
+                #value: "DEBUG"

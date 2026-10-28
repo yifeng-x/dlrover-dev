@@ -1,0 +1,72 @@
+---
+apiVersion: elastic.iml.github.io/v1alpha1
+kind: ElasticJob
+metadata:
+  name: verl-grpo-16g
+  namespace: dlrover
+  annotations:
+    training_elastic_mode: "ucp"
+spec:
+  distributionStrategy: AllreduceStrategy
+  optimizeMode: single-job
+  replicaSpecs:
+    worker:
+      replicas: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: main
+              image: docker.io/library/dlrover-pytorch-train-verl-amd64:resource-elastic-jupyter
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - -lc
+                - |
+                  set -euo pipefail
+                  cd /workspace/dlrover
+                  python examples/unified/rl/verl/low_vram/prepare_tiny_gsm8k.py \
+                    --output-dir /data/gsm8k
+                  bash examples/unified/rl/verl/low_vram/run_grpo_16g.sh
+              env:
+                - name: MODEL_PATH
+                  value: Qwen/Qwen2.5-0.5B-Instruct
+                - name: DATA_DIR
+                  value: /data/gsm8k
+                - name: TOTAL_TRAINING_STEPS
+                  value: "5"
+                - name: ROLLOUT_GPU_MEMORY_UTILIZATION
+                  value: "0.28"
+                - name: HF_HOME
+                  value: /cache/huggingface
+                - name: TRANSFORMERS_CACHE
+                  value: /cache/huggingface
+                - name: CUDA_VISIBLE_DEVICES
+                  value: "0"
+              resources:
+                limits:
+                  cpu: "6"
+                  memory: 24Gi
+                  nvidia.com/gpu: 1
+                requests:
+                  cpu: "4"
+                  memory: 16Gi
+                  nvidia.com/gpu: 1
+              volumeMounts:
+                - name: workdir
+                  mountPath: /workspace/dlrover
+                - name: data
+                  mountPath: /data
+                - name: hf-cache
+                  mountPath: /cache/huggingface
+          volumes:
+            - name: workdir
+              hostPath:
+                path: /home/xzx/workerspace/code/dev/my-repository/test/dlrover-test
+                type: Directory
+            - name: data
+              emptyDir: {}
+            - name: hf-cache
+              hostPath:
+                path: /tmp/dlrover-verl-hf-cache
+                type: DirectoryOrCreate

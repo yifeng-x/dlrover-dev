@@ -1,0 +1,43 @@
+# Customize values for dlrover.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+registry: "registry.cn-hangzhou.aliyuncs.com"
+    
+topoMapper:
+  topology_config: |
+
+controller:
+  image:
+    name: "elasticjob-controller"
+    tag: "v0.7.0"
+  metrics:
+    serviceMonitor:
+      enabled: true
+      interval: 30s
+      scrapeTimeout: 10s
+      # Change this value when the Prometheus Helm release has another name.
+      labels:
+        release: kube-prometheus-stack
+      tlsConfig:
+        insecureSkipVerify: true
+    masterServiceMonitor:
+      enabled: true
+      interval: 30s
+      scrapeTimeout: 5s
+      # Change this value when the Prometheus Helm release has another name.
+      labels:
+        release: kube-prometheus-stack
+      # Discover Master Services from ElasticJobs in all namespaces.
+      namespaceSelector:
+        any: true
+
+rbacProxy:
+  image:
+    name: "docker.io/kubebuilder/kube-rbac-proxy"
+    tag: "v0.13.1"
+
+dlroverMaster:
+  image:
+    name: "dlrover-master"
+    tag: "v0.7.0"

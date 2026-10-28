@@ -1,0 +1,26 @@
+---
+{{- if .Values.controller.metrics.masterServiceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dlrover-master-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    control-plane: controller-manager
+    {{- with .Values.controller.metrics.masterServiceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with .Values.controller.metrics.masterServiceMonitor.namespaceSelector }}
+  namespaceSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      elasticjob.dlrover/replica-type: dlrover-master
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.controller.metrics.masterServiceMonitor.interval }}
+      scrapeTimeout: {{ .Values.controller.metrics.masterServiceMonitor.scrapeTimeout }}
+{{- end }}

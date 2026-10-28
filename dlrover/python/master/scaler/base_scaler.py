@@ -1,0 +1,100 @@
+# Copyright 2022 The DLRover Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import threading
+from abc import ABCMeta, abstractmethod
+from typing import Dict, List
+
+from dlrover.python.common.node import Node, NodeGroupResource
+from dlrover.python.common.serialize import JsonSerializable
+
+
+class ScalePlan(JsonSerializable):
+    """The plan to scaler to adjust nodes.
+    Attributes:
+        node_group_resources: the resource configuration of a group node.
+        launch_nodes: a scaler to launch nodes.
+        remove_nodes: a scaler to remove nodes.
+        ps_addrs: all add addresses of PS nodes.
+    """
+
+    def __init__(self):
+        self.node_group_resources: Dict[str, NodeGroupResource] = {}
+        self.launch_nodes: List[Node] = []
+        self.remove_nodes: List[Node] = []
+        self.ps_addrs: List[str] = []
+
+    def empty(self):
+        return (
+            not self.node_group_resources
+            and not self.launch_nodes
+            and not self.remove_nodes
+        )
+
+    def merge(self, plan):
+        self.node_group_resources.update(plan.node_group_resources)
+        self.launch_nodes.extend(plan.launch_nodes)
+        self.remove_nodes.extend(plan.remove_nodes)
+
+
+class Scaler(metaclass=ABCMeta):
+    """Scaler is to call cluster scheduler to scale up/down nodes of a job.
+    Attributes:
+        job_name: string, the name of job.
+    """
+
+    def __init__(self, job_name):
+        self._job_name = job_name
+        self._job = None
+        self._job_uid = ""
+        # Host IPs of nodes that failed node check. Pods created afterward
+        # can be scheduled away from these nodes via node affinity by scalers
+        # that support it (e.g. the sigma PodScaler in dlrover-addon).
+        self._failed_node_ips = set()
+        self._failed_node_lock = threading.Lock()
+
+    @abstractmethod
+    def start(self):
+        """Start the scaler."""
+        pass
+
+    @abstractmethod
+    def scale(self, plan: ScalePlan, **kwargs):
+        """Scale the job with the plan."""
+        pass
+
+    def add_failed_node_ip(self, host_ip: str):
+        """Record the host IP of a nodecheck-failed node.
+
+        Subsequent pod creations should avoid being scheduled onto this
+        node. The affinity injection is scaler-specific and implemented by
+        subclasses; the base scaler only keeps the accumulated list.
+        """
+        if not host_ip:
+            return
+        with self._failed_node_lock:
+            self._failed_node_ips.add(host_ip)
+
+    def get_failed_node_ips(self):
+        """Return the sorted list of failed node host IPs."""
+        with self._failed_node_lock:
+            return sorted(self._failed_node_ips)
+
+    def set_group_affinity(self, group_affinity):
+        """Set the node group affinity mapping for the scaler.
+
+        Scalers that schedule pods onto node groups (e.g. PodScaler) can
+        override this to label created pods with their group. The default
+        no-op keeps the base scaler agnostic of group affinity.
+        """
+        pass

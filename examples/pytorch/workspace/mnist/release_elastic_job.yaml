@@ -1,0 +1,103 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dlrover
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dlrover-workspace
+  namespace: dlrover
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dlrover-workspace
+  namespace: dlrover
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dlrover-workspace
+  namespace: dlrover
+subjects:
+  - kind: ServiceAccount
+    name: dlrover-workspace
+    namespace: dlrover
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dlrover-workspace
+---
+apiVersion: elastic.iml.github.io/v1alpha1
+kind: ElasticJob
+metadata:
+  name: workspace-mnist-release
+  namespace: dlrover
+  annotations:
+    # run-mode 只表示启用 DLRover Workspace。
+    dlrover.io/run-mode: workspace
+    # release 模式不允许启用 Jupyter。
+    dlrover.io/jupyter-enabled: "false"
+    # 成功后删除全部 worker；失败后保留 Failed Pod 并删除其余 worker。
+    dlrover.io/workspace-exit-policy: release
+    # release 模式下，完整 launch 命令只会在 rank 0 执行一次。
+    dlrover.io/init-command: >-
+      dlrover-workspace launch
+      --network-mode all
+      --framework-cmd "python examples/pytorch/mnist/cnn_train.py
+      --num_epochs 5
+      --training_data /data/mnist_png/training/
+      --validation_data /data/mnist_png/testing/"
+spec:
+  distributionStrategy: AllreduceStrategy
+  optimizeMode: single-job
+  replicaSpecs:
+    worker:
+      replicas: 4
+      # release 是一次性全量训练，禁止训练期间新增未参与本轮 launch 的 worker。
+      autoScale: false
+      restartCount: 0
+      template:
+        spec:
+          # rank 0 需要 list/get worker Pod，并对所有 worker 执行 pods/exec。
+          serviceAccountName: dlrover-workspace
+          # release Pod 不应因 init-command 失败而重复自动 launch。
+          restartPolicy: Never
+          containers:
+            - name: main
+              # 镜像必须包含本次实现对应版本的 dlrover、
+              # dlrover-workspace、kubernetes Python client 及 MNIST 示例代码。
+              image: registry.cn-hangzhou.aliyuncs.com/intell-ai/dlrover:pytorch-example
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: TZ
+                  value: Asia/Shanghai
+              resources:
+                limits:
+                  cpu: "2"
+                  memory: 3Gi
+                  # 使用 GPU 时取消下一行注释，并同步 requests。
+                  # nvidia.com/gpu: "1"
+                requests:
+                  cpu: "2"
+                  memory: 3Gi
+                  # nvidia.com/gpu: "1"
+              volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 2Gi

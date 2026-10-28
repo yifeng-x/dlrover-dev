@@ -1,0 +1,159 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dlrover-brain
+  namespace: elastic-training
+  labels:
+    app: dlrover-brain
+spec:
+  type: NodePort
+  ports:
+    - name: business
+      port: 50002
+      protocol: TCP
+      targetPort: 50002
+      nodePort: 31000
+    - name: metrics
+      port: 9091
+      protocol: TCP
+      targetPort: 9091
+  selector:
+    app: dlrover-brain
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dlrover-brain
+  namespace: elastic-training
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: dlrover-brain
+  endpoints:
+    - port: metrics  # <--- 匹配 containerPort 的 name
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 5s
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: dlrover-brain
+  name: dlrover-brain
+  namespace: elastic-training
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dlrover-brain
+  template:
+    metadata:
+      labels:
+        app: dlrover-brain
+      name: dlrover-brain
+      namespace: elastic-training
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: dlrover-controller-manager
+      volumes:
+        - name: elastic-pvc
+          persistentVolumeClaim:
+            claimName: elastic-train-pvc-dlrover
+      #nodeSelector:
+        #kubernetes.io/role: worker
+      containers:
+        - command:
+            - /bin/bash
+            - -c
+            - (cd /data-disk/resource-bottleneck/20260729-modify-proto/LM05.20_DLRover && pip install sqlalchemy pymysql redis -i http://central.jaf.cmbchina.cn/artifactory/api/pypi/group-pypi/simple --trusted-host central.jaf.cmbchina.cn \
+              && pip install -e . -i http://central.jaf.cmbchina.cn/artifactory/api/pypi/group-pypi/simple --trusted-host central.jaf.cmbchina.cn \
+              && python -m dlrover.brain.python.server.server -alsologtostderr \
+              --namespace elastic-training --port 50002 --metrics-port 9091 2>&1) |
+              tee /data-disk/logs/brain-logs/brain.log; exit ${PIPESTATUS[0]}
+          env:
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: status.podIP
+          - name: TZ
+            value: Asia/Shanghai
+          - name: PYTHONPATH
+            value: $PYTHONPATH:$(pwd)
+          - name: DLROVER_BRAIN_REDIS_CLUSTER_NODES
+            value: "55.158.166.253:6379,55.158.166.162:6379,55.158.166.174:6379,55.158.166.169:6379,55.158.104.206:6379,55.158.104.196:6379,55.158.166.201:6379,55.158.104.219:6379,55.158.104.224:6379"
+          - name: DLROVER_BRAIN_REDIS_PW
+            value: "wkB32thvDep@eusWY6M944YF"
+          - name: DLROVER_BRAIN_REDIS_MODE
+            value: "cluster"
+          - name: DB_HOST
+            value: "mysql.elastic-training.svc.cluster.local"
+          - name: DB_USERNAME
+            value: "root"
+          - name: DB_PWD
+            value: "root"
+          - name: DLROVER_BRAIN_MULTI_INSTANCE
+            value: "true"
+          - name: DLROVER_BRAIN_JOB_OWNER_TTL_SECONDS
+            value: "30"
+          - name: DLROVER_BRAIN_JOB_OWNER_RENEW_INTERVAL_SECONDS
+            value: "10"
+          - name: DLROVER_BRAIN_INSTANCE_TTL_SECONDS
+            value: "30"
+          - name: DLROVER_BRAIN_JOB_IDLE_TIMEOUT_SECONDS
+            value: "180"
+          - name: DLROVER_BRAIN_JOB_CLEANUP_TTL_SECONDS
+            value: "60"
+          - name: DLROVER_BRAIN_REPORT_DEDUP_TTL_SECONDS
+            value: "300"
+          - name: DLROVER_BRAIN_FORWARD_TIMEOUT_SECONDS
+            value: "3"
+          - name: DLROVER_BRAIN_FORWARD_FAILURE_THRESHOLD
+            value: "3"
+          - name: DLROVER_BRAIN_FORWARD_FAILURE_WINDOW_SECONDS
+            value: "30"
+          - name: DLROVER_BRAIN_FORWARD_QUARANTINE_SECONDS
+            value: "30"
+          image: registry.cic.cmbchina.cn/cic/cmb-neotrain-dlrover-brain:master-v0.7.0-hw-20260422
+          imagePullPolicy: IfNotPresent
+          name: dlrover-brain
+          ports:
+            - containerPort: 50002
+              protocol: TCP
+            - containerPort: 9091
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 50002
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 50002
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: elastic-pvc
+              mountPath: /data-disk
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: "1"
+              memory: 1Gi

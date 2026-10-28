@@ -1,0 +1,134 @@
+---
+apiVersion: elastic.iml.github.io/v1alpha1
+kind: ElasticJob
+metadata:
+  name: verl-sft-16g
+  namespace: dlrover
+  annotations:
+    training_elastic_mode: "ucp"
+spec:
+  distributionStrategy: AllreduceStrategy
+  optimizeMode: single-job
+  replicaSpecs:
+    dlrover-master:
+      template:
+        spec:
+          restartPolicy: Always
+          # nodeSelector:
+          #   allow-elasticjob-schedule: "true"
+          serviceAccountName: dlrover-controller-manager
+          volumes:
+            - name: pvc-nas # 持久化存储
+              persistentVolumeClaim:
+                claimName: elastic-train-pvc-dlrover
+          containers:
+            - command:
+              - /bin/bash
+              - -c
+              - "cd /nas/code/dev/my-repository/test/dlrover-test && \
+                 pip uninstall dlrover -y && \
+                 pip install --no-cache-dir -e . -i https://pypi.tuna.tsinghua.edu.cn/simple && \
+                 python -m dlrover.python.master.main --training_elastic_mode ucp \
+                  --configmap_manual_scale_switch off \
+                  --resource_monitor_switch on \
+                  --platform pyk8s \
+                  --namespace dlrover \
+                  --job_name verl-sft-16g \
+                  --port 50001"
+              env:
+              - name: POD_IP
+                valueFrom:
+                  fieldRef:
+                    apiVersion: v1
+                    fieldPath: status.podIP
+              - name: TZ
+                value: Asia/Shanghai
+              #- name: DLROVER_LOG_LEVEL
+                #value: "DEBUG"
+              image: docker.io/library/dlrover-master-amd64:resource-elastic
+              imagePullPolicy: IfNotPresent
+              name: main
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 1Gi
+                requests:
+                  cpu: "1"
+                  memory: 1Gi
+              volumeMounts:
+                - name: pvc-nas
+                  mountPath: /nas
+    worker:
+      replicas: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: main
+              image: docker.io/library/dlrover-pytorch-train-verl-amd64:resource-elastic-jupyter
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - -lc
+                - |
+                  set -euo pipefail
+                  cd /workspace/dlrover
+                  python examples/unified/rl/verl/sft_low_vram/prepare_tiny_sft.py \
+                    --output-dir /nas/train-data/tiny_sft
+                  bash examples/unified/rl/verl/sft_low_vram/run_sft_16g.sh
+              env:
+                - name: MODEL_PATH
+                  value: /nas/train-data/model/Qwen2.5-0.5B-Instruct
+                - name: DATA_DIR
+                  value: /nas/train-data/tiny_sft
+                - name: OUTPUT_DIR
+                  value: /nas/train-data/output/verl_sft_16g
+                - name: TOTAL_EPOCHS
+                  value: "1"
+                - name: HF_HOME
+                  value: /nas/train-data/cache/huggingface
+                - name: TRANSFORMERS_CACHE
+                  value: /nas/train-data/cache/huggingface
+                - name: CUDA_VISIBLE_DEVICES
+                  value: "0"
+                - name: CUDA_HOME
+                  value: /usr/local/cuda-12.8
+                - name: PATH
+                  value: /usr/local/cuda-12.8/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                - name: LD_LIBRARY_PATH
+                  value: /usr/local/cuda-12.8/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+              resources:
+                limits:
+                  cpu: "6"
+                  memory: 24Gi
+                  nvidia.com/gpu: 1
+                requests:
+                  cpu: "4"
+                  memory: 16Gi
+                  nvidia.com/gpu: 1
+              volumeMounts:
+                - name: workdir
+                  mountPath: /workspace/dlrover
+                - name: volume-shm # 挂载临时存储
+                  mountPath: /dev/shm
+                - name: pvc-nas
+                  mountPath: /nas
+                - name: host-cuda
+                  mountPath: /usr/local/cuda-12.8
+                  readOnly: true
+          volumes:
+            - name: workdir
+              hostPath:
+                path: /home/xzx/workerspace/code/dev/my-repository/test/dlrover-test
+                type: Directory
+            - name: volume-shm # 临时存储
+              emptyDir:
+                medium: Memory
+                sizeLimit: 20Gi
+            - name: pvc-nas # 持久化存储
+              persistentVolumeClaim:
+                claimName: elastic-train-pvc-dlrover
+            - name: host-cuda # 宿主机 CUDA toolkit
+              hostPath:
+                path: /usr/local/cuda-12.8
+                type: Directory

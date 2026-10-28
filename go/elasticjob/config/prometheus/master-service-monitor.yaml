@@ -1,0 +1,19 @@
+# Scrapes every per-job Master Service. Requires Prometheus Operator.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dlrover-master-metrics
+  namespace: system
+  labels:
+    control-plane: controller-manager
+spec:
+  namespaceSelector:
+    any: true
+  selector:
+    matchLabels:
+      elasticjob.dlrover/replica-type: dlrover-master
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 5s

@@ -1,0 +1,124 @@
+---
+apiVersion: elastic.iml.github.io/v1alpha1
+kind: ElasticJob
+metadata:
+  name: gpu-elastic-deepspeed-test01
+  namespace: dlrover
+  annotations:
+    training_elastic_mode: "ucp"
+spec:
+  distributionStrategy: AllreduceStrategy
+  #optimizeMode: single-job
+  optimizeMode: cluster
+  replicaSpecs:
+    dlrover-master:
+      template:
+        spec:
+          restartPolicy: Never
+          # nodeSelector:
+          #   allow-elasticjob-schedule: "true"
+          serviceAccount: dlrover-controller-manager
+          serviceAccountName: dlrover-controller-manager
+          volumes:
+            - name: pvc-nas # 持久化存储
+              persistentVolumeClaim:
+                claimName: elastic-train-pvc-dlrover
+          containers:
+            - command:
+              - /bin/bash
+              - -c
+              - "cd /nas/code/dev/hangnei/gpu_elastic/DLRover/LM05.20_DLRover && \
+                 pip install pydantic -i https://pypi.tuna.tsinghua.edu.cn/simple && \
+                 pip install -e . && \
+                 python -m dlrover.python.master.main --training_elastic_mode ucp --elastic_dimension vertical --configmap_manual_scale_switch off --resource_monitor_switch on --platform pyk8s --xpu_type ascend --namespace dlrover \
+                 --job_name gpu-elastic-deepspeed-test01 --port 50001"
+              env:
+              - name: POD_IP
+                valueFrom:
+                  fieldRef:
+                    apiVersion: v1
+                    fieldPath: status.podIP
+              - name: TZ
+                value: Asia/Shanghai
+              #- name: DLROVER_LOG_LEVEL
+                #value: "DEBUG"
+              image: docker.io/library/dlrover-master-amd64:resource-elastic
+              imagePullPolicy: IfNotPresent
+              name: main
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 2Gi
+                requests:
+                  cpu: "1"
+                  memory: 2Gi
+              volumeMounts:
+                - name: pvc-nas
+                  mountPath: /nas
+    worker:
+      replicas: 1
+      template:
+        spec:
+          restartPolicy: Never
+          volumes:
+            - name: volume-shm # 临时存储
+              emptyDir:
+                medium: Memory
+                sizeLimit: 20Gi
+            - name: pvc-nas # 持久化存储
+              persistentVolumeClaim:
+                claimName: elastic-train-pvc-dlrover
+          containers:
+            - name: main
+              image: docker.io/library/dlrover-pytorch-train-amd64:resource-elastic-jupyter
+              imagePullPolicy: IfNotPresent
+              volumeMounts:
+                - name: volume-shm # 挂载临时存储
+                  mountPath: /dev/shm
+                - name: pvc-nas
+                  mountPath: /nas
+              command:
+                - /bin/bash
+                - -c
+                - "pip install --user -U /nas/code/dev/hangnei/gpu_elastic/DLRover/LM05.20_DLRover/dist/dlrover-0.7.0.dev0-py3-none-any.whl deepspeed \
+                  -i https://pypi.tuna.tsinghua.edu.cn/simple \
+                  && dlrover-run --nnodes=1 \
+                  --nproc_per_node=1 --max_restarts=1 \
+                  swift sft --model /nas/train-data/model/Qwen2.5-0.5B-Instruct \
+                  --dataset /nas/train-data/dataset/alpaca_data_zh_51k.json \
+                  --output_dir /nas/train-data/output/jupyter-elastic \
+                  --model_type qwen2 \
+                  --torch_dtype bfloat16 \
+                  --train_type lora \
+                  --num_train_epochs 3 \
+                  --warmup_ratio 0.1 \
+                  --per_device_train_batch_size 2 \
+                  --per_device_eval_batch_size 1 \
+                  --learning_rate 1e-4 \
+                  --gradient_accumulation_steps 1 \
+                  --max_length 1024 \
+                  --weight_decay 0.0001 \
+                  --lr_scheduler_type cosine \
+                  --logging_steps 1 \
+                  --save_steps 50 \
+                  --lora_rank 8 \
+                  --lora_dropout 0.05 \
+                  --response_prefix '<think>\n' \
+                  --save_total_limit 10 \
+                  --dataloader_num_workers 4 \
+                  --lora_alpha 32 \
+                  --target_modules all-linear \
+                  --dataset_num_proc 1 \
+                  --model_name 'jupyter-elastic' \
+                  --use_flash_ckpt true \
+                  --deepspeed /nas/code/resource-elastic/dev/brain/resource-bottleneck/deepspeed/zero4.json \
+                  --callbacks deepspeed_elastic graceful_exit"
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 2Gi
+                  nvidia.com/gpu: 1
+                requests:
+                  cpu: "1"
+                  memory: 2Gi
+                  nvidia.com/gpu: 1

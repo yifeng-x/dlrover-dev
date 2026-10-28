@@ -1,0 +1,92 @@
+# Optional baseline alerts. Apply only in clusters with Prometheus Operator.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: dlrover-baseline-alerts
+  namespace: system
+  labels:
+    control-plane: controller-manager
+spec:
+  groups:
+    - name: dlrover.baseline
+      rules:
+        - alert: DLRoverTrainingNoProgress
+          expr: |
+            dlrover_job_state{state="running"} == 1
+            and on (cluster, namespace, job_uid, strategy)
+            time() - dlrover_job_last_progress_timestamp_seconds > 600
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DLRover training job has not made progress"
+            description: "Job {{ $labels.namespace }}/{{ $labels.job_uid }} has not advanced its global step for over ten minutes."
+        - alert: DLRoverBrainReportQueueHigh
+          expr: |
+            dlrover_brain_report_queue_size
+            / clamp_min(dlrover_brain_report_queue_capacity, 1) > 0.8
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DLRover Brain runtime report queue is near capacity"
+            description: "Brain replica {{ $labels.pod }} runtime-report queue usage has exceeded 80%."
+        - alert: DLRoverBrainRuntimeProcessorDown
+          expr: dlrover_brain_runtime_processor_ready == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "DLRover Brain runtime processor is down"
+            description: "Brain replica {{ $labels.pod }} is serving metrics but its runtime-report processor is not running."
+        - alert: DLRoverBrainRedisUnavailable
+          expr: |
+            dlrover_brain_redis_available == 0
+            and time() - dlrover_brain_redis_last_check_timestamp_seconds < 60
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "DLRover Brain cannot access Redis"
+            description: "Brain replica {{ $labels.pod }} has continuously failed Redis health checks."
+        - alert: DLRoverBrainRedisProbeStale
+          expr: time() - dlrover_brain_redis_last_check_timestamp_seconds > 60
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DLRover Brain Redis probe is stale"
+            description: "Brain replica {{ $labels.pod }} has not updated its Redis health status for over one minute."
+        - alert: DLRoverBrainFallbackLeaderMissing
+          expr: |
+            max by (namespace) (dlrover_brain_leader_election_enabled) == 1
+            and on (namespace)
+            max by (namespace) (dlrover_component_leader{component="brain"}) == 0
+          for: 30s
+          labels:
+            severity: critical
+          annotations:
+            summary: "DLRover Brain fallback leader is missing"
+            description: "No Brain replica in namespace {{ $labels.namespace }} owns the fallback leader lease."
+        - alert: DLRoverBrainDistributedLockErrors
+          expr: |
+            sum by (namespace) (
+              rate(dlrover_brain_distributed_lock_total{result=~"error|unavailable|lost"}[5m])
+            ) > 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DLRover Brain distributed lock is unhealthy"
+            description: "Brain distributed-lock errors were observed in namespace {{ $labels.namespace }}."
+        - alert: DLRoverBrainInstanceQuarantined
+          expr: |
+            max by (namespace) (
+              dlrover_brain_owner_allocator_quarantined_instances
+            ) > 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DLRover Brain instance is quarantined"
+            description: "At least one Brain instance in namespace {{ $labels.namespace }} is temporarily excluded from new-job allocation after consecutive forwarding failures."
