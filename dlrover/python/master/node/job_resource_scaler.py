@@ -35,6 +35,7 @@ from dlrover.python.master.elasticity_policy import (
 from dlrover.python.common.log import default_logger as logger
 from dlrover.python.common.node import NodeResource, NodeGroupResource
 from dlrover.python.master.monitor.perf_monitor import PerfMonitor
+from dlrover.python.master.monitor.vertical_metrics import VerticalExecutionMetrics
 from dlrover.python.master.node.job_context import get_job_context
 from dlrover.python.master.node.ps import ParameterServerManager
 from dlrover.python.master.node.worker import WorkerManager
@@ -60,6 +61,7 @@ def new_job_resource_scaler(
     perf_monitor: PerfMonitor,
     worker_manager: WorkerManager,
     node_scaler: Scaler,
+    vertical_metrics=None,
 ):
     if job_strategy == DistributionStrategy.ALLREDUCE:
         return AllreduceTrainingResourceScaler(
@@ -68,6 +70,7 @@ def new_job_resource_scaler(
             perf_monitor,
             worker_manager,
             node_scaler,
+            vertical_metrics=vertical_metrics,
         )
     else:
         raise ValueError("No job auto scaler for %s", job_strategy)
@@ -147,6 +150,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         perf_monitor: PerfMonitor,
         worker_manager: WorkerManager,
         node_scaler: Scaler,
+        vertical_metrics=None,
     ) -> None:
         super().__init__(
             job_resource,
@@ -175,6 +179,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         self._target_tunning_nodes = set()
         self._adjust_gpu_nums = 0
         self._scaling_lock = threading.Lock()
+        self.vertical_metrics = vertical_metrics or VerticalExecutionMetrics()
 
     def get_job_nodes(self, node_type=""):
         if node_type == "":
@@ -187,10 +192,19 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             _dlrover_context.runtime_elastic_dimension != ElasticDimension.VERTICAL
             or scale_action not in VERTICAL_ACTIONS
         ):
+            reason = (
+                "invalid_action" if scale_action not in VERTICAL_ACTIONS
+                else "dimension_mismatch"
+            )
+            self.vertical_metrics.request(scale_action, "rejected", reason)
             return False
+        
         if not self._scaling_lock.acquire(blocking=False):
+            self.vertical_metrics.request(scale_action, "rejected", "busy")
             logger.info("Vertical scaling is already in progress")
             return False
+
+        self.vertical_metrics.inflight.set(1)
         previous_enabled = _dlrover_context.enable_elastic_resource
         try:
             self.scale_action = scale_action
@@ -202,8 +216,11 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             ).start()
         except Exception:
             _dlrover_context.enable_elastic_resource = previous_enabled
+            self.vertical_metrics.inflight.set(0)
+            self.vertical_metrics.request(scale_action, "error", "internal_error")
             self._scaling_lock.release()
             raise
+        self.vertical_metrics.request(scale_action, "accepted")
         return True
         
     def _run_resource_scaling(self):
@@ -221,6 +238,8 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
                         "No executable resource change"
                     )
             finally:
+                self.vertical_metrics.finish("failed", "internal_error")
+                self.vertical_metrics.inflight.set(0)
                 _dlrover_context.enable_elastic_resource = False
                 self._scaling_lock.release()
 
@@ -248,6 +267,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             self.vertical_elastic_phase_manager.create(
                 plan_id = plan_id,
             )
+            self.vertical_metrics.start(self.scale_action)
             logger.info(f"Create vertical elastic phase: {plan_id},"
              f"current phase is set to {VerticalElasticPhaseType.PREPARING},"
              f"expected next phase is set to {VerticalElasticPhaseType.SAVE_CHECKPOINT}")
@@ -264,6 +284,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             )
             
             if self.valid_opt_num > max_opt_num:
+                self.vertical_metrics.finish("skipped", "max_attempts")
                 logger.warning(f"Reached max optimization attempts ({max_opt_num}). Skip scaling.")
                 return
 
@@ -273,6 +294,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
                 if manual_scale_switch == "on":
                     logger.warning(f"Continue manual scaling.")
                 else:
+                    self.vertical_metrics.finish("skipped", "cooldown")
                     logger.warning(f"Skip scaling.")
                     return
             
@@ -299,7 +321,10 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             logger.error(
                 f"Failed to worker resource scale for AllReduce Training: {e}"
             )
-            self.vertical_elastic_phase_manager.fail("Failed to worker resource scale for AllReduce Training.")
+            self._fail_vertical_plan(
+                "internal_error",
+                "Failed to worker resource scale for AllReduce Training.",
+            )
     
     def _try_execute_optimization(self, ckpt_wait_time, ckpt_check_sec, log_step):
         """具体的优化执行逻辑：获取计划 -> 等待 CKPT -> 执行计划。返回是否成功执行。"""
@@ -312,28 +337,37 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         
         plan = self._job_optimizer.get_job_resource_plan(self.scale_action)
         if not plan or plan.empty():
+            self.vertical_metrics.finish("skipped", "empty_plan")
             logger.warning("No valid resource plan generated.")
             return False
 
         self.last_plan_time = time.time()
 
         if not getattr(_dlrover_context, 'enable_elastic_resource', False):
+            self.vertical_metrics.finish("cancelled", "disabled")
             return False
         
         if _dlrover_context.auto_elasticity:
-            validate_resource_plan(
-                plan,
-                self._job_resource.get_node_group_resource(NodeType.WORKER),
-                ElasticDimension.VERTICAL,
-            )
+            try:
+                validate_resource_plan(
+                    plan,
+                    self._job_resource.get_node_group_resource(NodeType.WORKER),
+                    ElasticDimension.VERTICAL,
+                )
+            except ValueError as error:
+                self._fail_vertical_plan("invalid_plan", str(error))
+                raise
         
         self._adjust_gpu_nums = plan.node_group_resources[NodeType.WORKER].node_resource.gpu_num
         if self._adjust_gpu_nums <= 0:
-            self.vertical_elastic_phase_manager.fail("Invalid target gpu number.")
+            self._fail_vertical_plan("invalid_plan", "Invalid target gpu number.")
             return False
         
         current_gpu_nums = self._get_current_worker_gpu_num()
+        self.vertical_metrics.gpus.labels("before").set(current_gpu_nums)
+        self.vertical_metrics.gpus.labels("target").set(self._adjust_gpu_nums)
         if current_gpu_nums == self._adjust_gpu_nums:
+            self.vertical_metrics.finish("skipped", "same_resource")
             logger.warning(
                 "Target gpu number %s is equal to current worker gpu number, "
                 "skip vertical scaling.",
@@ -354,7 +388,9 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
 
         # B. 等待 Checkpoint 完成
         if not self._wait_for_ckpt_ready(ckpt_wait_time, ckpt_check_sec, log_step):
-            self.vertical_elastic_phase_manager.fail("Save checkpoint not ready or timeout.")
+            self._fail_vertical_plan(
+                "checkpoint_timeout", "Save checkpoint not ready or timeout."
+            )
             return False
 
         # C. 执行计划
@@ -371,7 +407,9 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             if not self._wait_for_param_tunning_ready(
                 ckpt_wait_time, ckpt_check_sec, log_step
             ):
-                self.vertical_elastic_phase_manager.fail("Param tunning not ready or timeout.")
+                self._fail_vertical_plan(
+                    "param_timeout", "Param tunning not ready or timeout."
+                )
                 return False
             
             self.update_vertical_elastic_phase(
@@ -380,10 +418,14 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
                 VerticalElasticPhaseType.COMPLETED,
             )
             self.vertical_elastic_phase_manager.complete(success=True)
+            self.vertical_metrics.finish("completed")
+            self.vertical_metrics.await_recovery(
+                self._target_tunning_nodes, self._save_ckpt_step, ckpt_wait_time
+            )
             return True
         except Exception as e:
             logger.error(f"Failed to execute plan: {e}", exc_info=True)
-            self.vertical_elastic_phase_manager.fail("Execute plan failed.")
+            self._fail_vertical_plan("scale_failed", "Execute plan failed.")
             return False
 
     def _wait_for_replacement_exits(self):
@@ -418,19 +460,24 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         count = 0
         
         while not self._save_ckpt_status:
-            if not _dlrover_context.enable_elastic_resource:
-                logger.warning(f"Enable elastic resource is {_dlrover_context.enable_elastic_resource}, Resource Scaling stopped while waiting for CKPT.")
-                return False
-                
-            if (time.time() - start_time) > max_wait:
-                logger.warning("Waiting for CKPT save timed out.")
-                return False
-
             if (
                 self.get_phase_info().get("phase")
                 == VerticalElasticPhaseType.FAILED
             ):
+                self.vertical_metrics.finish("skip check ckpt ready", "Vertical elastic phase failed.")
                 return False
+            
+            if not _dlrover_context.enable_elastic_resource:
+                self.vertical_metrics.finish("skip check ckpt ready", "enable_elastic_resource switch disabled")
+                logger.warning(f"Enable elastic resource is {_dlrover_context.enable_elastic_resource}, Resource Scaling stopped while waiting for CKPT.")
+                return False
+                
+            if (time.time() - start_time) > max_wait:
+                reason = f"Waiting for ckpt save timed out, max wait is {max_wait}s."
+                self.vertical_metrics.finish("skip check ckpt ready", reason)
+                logger.warning(reason)
+                return False
+
             task = self._ucp_task_manager.get_task_by_id(
                 self._checkpoint_task_id
             )
@@ -441,7 +488,9 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
                     "Vertical UCP task %s failed: %s",
                     task.task_id, task.error_message,
                 )
+                self.vertical_metrics.finish("skip check ckpt ready", f"UCP task {task.task_id} failed: {task.error_message}")
                 return False
+            
             if task and task.status == UcpTaskStatus.SUCCEEDED:
                 logger.info("UCP CKPT task %s succeeded.", task.task_id)
                 self._save_ckpt_status = self._ucp_task_manager.select_resume_checkpoint(
@@ -454,16 +503,12 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             
             time.sleep(check_interval)
         
-        if (
-            self.get_phase_info().get("phase")
-            == VerticalElasticPhaseType.FAILED
-        ):
-            return False
         logger.info("CKPT save succeeded. Proceeding with optimization.")
         return True
 
     def _wait_for_param_tunning_ready(self, max_wait, check_interval, log_step):
         if not self._target_tunning_nodes:
+            self.vertical_metrics.finish("skip param tunning", "no target workers for param tunning.")
             logger.warning("No target workers for param tunning.")
             return False
         start_time = time.time()
@@ -472,17 +517,21 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             self._param_tunning_ready_nodes
         ):
             if not _dlrover_context.enable_elastic_resource:
+                self.vertical_metrics.finish("skip param tunning", "enable_elastic_resource switch disabled")
                 logger.warning(
                     "Resource scaling stopped while waiting for param tunning."
                 )
                 return False
+            
             if (time.time() - start_time) > max_wait:
+                self.vertical_metrics.finish("skip param tunning", f"Waiting for param tunning timed out, max wait is {max_wait}s.")
                 logger.warning(
                     "Waiting for param tunning timed out, ready=%s, target=%s.",
                     sorted(self._param_tunning_ready_nodes),
                     sorted(self._target_tunning_nodes),
                 )
                 return False
+            
             count += 1
             if count % log_step == 0:
                 logger.info(
@@ -491,6 +540,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
                     f"target={sorted(self._target_tunning_nodes)}."
                 )
             time.sleep(check_interval)
+
         logger.info("Param tunning completed on all replacement workers.")
         return True
 
@@ -566,6 +616,14 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         worker_group = self._job_resource.get_node_group_resource(NodeType.WORKER)
         self._sync_optimizer_current_worker_resource(worker_group)
         return scale_plan
+
+    def _fail_vertical_plan(self, reason, message):
+        self.vertical_metrics.finish("failed", reason)
+        if (
+            self.vertical_elastic_phase_manager.get_phase()
+            != VerticalElasticPhaseType.FAILED
+        ):
+            self.vertical_elastic_phase_manager.fail(message)
     
     def get_phase_info(self):
         return self.vertical_elastic_phase_manager.get()
@@ -581,22 +639,29 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
     ):
         phase_info = self.vertical_elastic_phase_manager.get()
         if not plan_id or plan_id != phase_info.get("plan_id"):
+            self.vertical_metrics.reports.labels("checkpoint", "stale_plan").inc()
             logger.warning(
                 "Ignore checkpoint status from stale plan %s, current plan %s.",
                 plan_id,
                 phase_info.get("plan_id"),
             )
             return
+        
         if phase_info.get("phase") != VerticalElasticPhaseType.SAVE_CHECKPOINT:
+            self.vertical_metrics.reports.labels(
+                "checkpoint", "phase_mismatch"
+            ).inc()
             logger.warning(
                 "Ignore checkpoint status in phase %s.",
                 phase_info.get("phase"),
             )
             return
+        
         if not save_ckpt_ready:
             logger.warning(reason)
-            self.vertical_elastic_phase_manager.fail(
-                reason or "Save checkpoint failed."
+            self.vertical_metrics.reports.labels("checkpoint", "failed").inc()
+            self._fail_vertical_plan(
+                "checkpoint_failed", reason or "Save checkpoint failed."
             )
             return
             
@@ -605,22 +670,28 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
                 step, checkpoint_path
             )
             if not task:
-                self.vertical_elastic_phase_manager.fail(
-                    "Checkpoint has no UCP task"
+                self.vertical_metrics.reports.labels("checkpoint", "no_ucp_task").inc()
+                self._fail_vertical_plan(
+                    "checkpoint_failed", "Checkpoint has no UCP task"
                 )
                 return
+            
             if (
                 self._checkpoint_task_id
                 and self._checkpoint_task_id != task.task_id
             ):
-                self.vertical_elastic_phase_manager.fail(
-                    "Conflicting checkpoint for plan"
+                self.vertical_metrics.reports.labels("checkpoint", "conflicting").inc()
+                self._fail_vertical_plan(
+                    "checkpoint_failed", "Conflicting checkpoint for plan"
                 )
                 return
+            
             self._save_ckpt_step = step
             self._save_ckpt_path = checkpoint_path
             self._checkpoint_task_id = task.task_id
         else:
+            result = "duplicate" if self._save_ckpt_status else "accepted"
+            self.vertical_metrics.reports.labels("checkpoint", result).inc()
             self._save_ckpt_status = True
 
     def set_param_tunning_ready(
@@ -632,26 +703,44 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
     ):
         phase_info = self.vertical_elastic_phase_manager.get()
         if not plan_id or plan_id != phase_info.get("plan_id"):
+            self.vertical_metrics.reports.labels("param_tunning", "stale_plan").inc()
             logger.warning(
                 "Ignore param tunning status from stale plan %s, current %s.",
                 plan_id,
                 phase_info.get("plan_id"),
             )
             return
+        
         if phase_info.get("phase") not in [
             VerticalElasticPhaseType.REPLACING_WORKERS,
             VerticalElasticPhaseType.TUNE_PARAM,
             VerticalElasticPhaseType.RENDEZVOUS_READY,
         ]:
+            self.vertical_metrics.reports.labels("param_tunning", "phase_mismatch").inc()
             logger.warning(
                 "Ignore param tunning status in phase %s.",
                 phase_info.get("phase"),
             )
             return
+
+        if node_id not in self._target_tunning_nodes:
+            self.vertical_metrics.reports.labels("param", "non_target").inc()
+        else:
+            duplicate = param_tunning_ready == (
+                node_id in self._param_tunning_ready_nodes
+            )
+            self.vertical_metrics.reports.labels(
+                "param", "duplicate" if duplicate else "accepted"
+            ).inc()
+        
         if param_tunning_ready:
             self._param_tunning_ready_nodes.add(node_id)
         else:
             self._param_tunning_ready_nodes.discard(node_id)
+
+        self.vertical_metrics.set_workers(
+            self._target_tunning_nodes, self._param_tunning_ready_nodes
+        )
         logger.info(
             "Param tunning ready nodes: %s/%s, rank=%s.",
             sorted(self._param_tunning_ready_nodes),
@@ -680,6 +769,11 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         self._target_tunning_nodes = {
             node.id for node in worker_plan.launch_nodes
         }
+
+        self.vertical_metrics.track_replacement_workers(self._target_tunning_nodes)
+        self.vertical_metrics.set_workers(
+            self._target_tunning_nodes, self._param_tunning_ready_nodes
+        )
 
         logger.info("[AllReduce] after adjust worker, worker plan is: %s", worker_plan.to_json())
         return worker_plan
@@ -728,6 +822,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             expected_next_phase=expected_next_phase,
         )
         self.vertical_elastic_phase_manager.update(update_data)
+        self.vertical_metrics.transition(current_phase)
         logger.info(f"Update vertical elastic phase,"
              f"current phase is set to {current_phase},"
              f"expected next phase is set to {expected_next_phase}")

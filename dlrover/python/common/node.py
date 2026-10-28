@@ -224,6 +224,7 @@ class Node(object):
         self.relaunchable = relaunchable
         self.service_addr = service_addr
         self.create_time = None
+        self.scheduled_time = None
         self.finish_time = None
         self.is_recovered_oom = False
         self.is_released = False
@@ -307,6 +308,7 @@ class Node(object):
         new_node.host_ip = None
         new_node.start_time = None
         new_node.create_time = None
+        new_node.scheduled_time = None
         new_node.finish_time = None
         new_node.heartbeat_time = 0
         new_node.start_hang_time = 0

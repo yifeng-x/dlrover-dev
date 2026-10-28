@@ -62,6 +62,7 @@ from dlrover.python.master.node.job_resource_scaler import (
     JobResourceScaler,
     new_job_resource_scaler,
 )
+from dlrover.python.master.monitor.vertical_metrics import VerticalExecutionMetrics
 from dlrover.python.master.node.job_context import get_job_context
 from dlrover.python.master.node.job_manager import JobManager
 from dlrover.python.master.node.ps import ParameterServerManager
@@ -139,6 +140,7 @@ class DistributedJobManager(JobManager):
             perf_monitor=perf_monitor,
             external_config=external_config,
         )
+        self.vertical_metrics = VerticalExecutionMetrics()
         self._remove_exited_node = job_args.remove_exited_node
         node_restart_count: Dict[str, int] = {}
         for type, node_args in job_args.node_args.items():
@@ -731,6 +733,7 @@ class DistributedJobManager(JobManager):
             self._perf_monitor,
             self._worker_manager,
             self._scaler,
+            vertical_metrics=self.vertical_metrics,
         )
         logger.info(
             "Create job resource scaler: %s", self._job_resource_scaler.__class__
@@ -753,6 +756,7 @@ class DistributedJobManager(JobManager):
             time.sleep(5)
 
     def _monitor_node_heart_beat(self):
+        self.vertical_metrics.check_recovery()
         with self._lock:
             try:
                 events = self._get_dead_node_event()
@@ -991,6 +995,7 @@ class DistributedJobManager(JobManager):
                             self._process_event_safely(event)
 
     def close_job(self):
+        self.vertical_metrics.stop_recovery()
         plan = ScalePlan()
         ps_resource = NodeGroupResource.new_empty()
         worker_resource = NodeGroupResource.new_empty()
@@ -1154,6 +1159,7 @@ class DistributedJobManager(JobManager):
                 "",
                 {},
             )
+        self.vertical_metrics.worker_event(event.node)
         new_status = event.node.status
         with self._lock:
             old_status = cur_node.status
@@ -1589,6 +1595,7 @@ class DistributedJobManager(JobManager):
             logger.info("Skip an empty scaleplan")
 
     def stop(self):
+        self.vertical_metrics.stop_recovery()
         if not self._stopped:
             self._enable_relaunch_node = False
             job_nodes = self.get_job_nodes()
@@ -1772,6 +1779,11 @@ class DistributedJobManager(JobManager):
             or not getattr(self, "_job_resource_scaler", None)
             or self._workspace_training_state.releasing
         ):
+            reason = (
+                "job_stopping" if self._workspace_training_state.releasing
+                else "manager_unavailable"
+            )
+            self.vertical_metrics.request(scale_action, "rejected", reason)
             logger.warning(
                 "Reject vertical scaling: controller unavailable for this job"
             )

@@ -63,14 +63,16 @@ SUSPEND_TO_ZERO_ANNOTATION = "dlrover/suspend-to-zero"
 JSON_KEY = "config.json"
 MANUAL_AVAILABLE = "MANUAL_AVAILABLE"
 
-def _get_start_timestamp(pod_status_obj):
-    """Get the start timestamp of a Pod"""
-    if (
-        pod_status_obj.container_statuses
-        and pod_status_obj.container_statuses[0].state
-        and pod_status_obj.container_statuses[0].state.running
-    ):
-        return pod_status_obj.container_statuses[0].state.running.started_at
+def _get_start_timestamp(pod_status_obj, container_name=None):
+    """Get the training container start time (first container for legacy Pods)."""
+    statuses = pod_status_obj.container_statuses or []
+    if container_name is None:
+        statuses = statuses[:1]
+    for status in statuses:
+        if container_name is not None and status.name != container_name:
+            continue
+        if status.state and status.state.running:
+            return status.state.running.started_at
     return None
 
 
@@ -189,7 +191,7 @@ def _convert_pod_yaml_to_node(pod):
     else:
         status = pod.status.phase
 
-    start_time = _get_start_timestamp(pod.status)
+    start_time = _get_start_timestamp(pod.status, main.name if main else None)
     restart_training = _verify_restarting_training(pod)
 
     node = Node(
@@ -211,6 +213,10 @@ def _convert_pod_yaml_to_node(pod):
     )
 
     node.create_time = metadata.creation_timestamp
+    for condition in pod.status.conditions or []:
+        if condition.type == "PodScheduled" and condition.status == "True":
+            node.scheduled_time = condition.last_transition_time
+            break
     if NodeStatus.is_terminal_status(status):
         node.set_exit_reason(_get_pod_exit_reason(pod))
 

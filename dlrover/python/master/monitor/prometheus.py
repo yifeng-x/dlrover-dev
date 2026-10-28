@@ -31,6 +31,9 @@ class MasterMetricsCollector:
 
     def collect(self) -> Iterable[MetricSample]:
         labels = self._labels()
+        vertical_metrics = getattr(self._job_manager, "vertical_metrics", None)
+        if vertical_metrics is not None:
+            yield from vertical_metrics.collect(labels)
         if self._brain_heartbeat is not None:
             state, failures, last_success = self._brain_heartbeat.snapshot
             for value in ("disabled", "healthy", "backoff", "failed", "stopped"):

@@ -38,7 +38,11 @@ def _family_name(sample: MetricSample) -> str:
 
 def _build_metric_families(samples: Iterable[MetricSample]):
     families = {}
+    native_families = []
     for sample in samples:
+        if isinstance(sample, Metric):
+            native_families.append(sample)
+            continue
         family_name = _family_name(sample)
         existing = families.get(sample.name)
         if existing is None:
@@ -60,7 +64,7 @@ def _build_metric_families(samples: Iterable[MetricSample]):
             {str(key): str(value) for key, value in sample.labels.items()},
             float(sample.value),
         )
-    return [metric for _, metric in families.values()]
+    return [metric for _, metric in families.values()] + native_families
 
 
 class _SnapshotCollector:

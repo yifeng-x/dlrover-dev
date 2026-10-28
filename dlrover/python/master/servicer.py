@@ -511,6 +511,11 @@ class MasterServicer(ABC):
             success = self._collect_model_info(message)
         elif isinstance(message, comm.GlobalStep):
             success = self._collect_global_step(message)
+            vertical_metrics = getattr(self._job_manager, "vertical_metrics", None)
+            if vertical_metrics is not None:
+                vertical_metrics.training_progress(
+                    node_type, node_id, message.step, message.timestamp
+                )
         elif isinstance(message, comm.ShardCheckpoint):
             success = self._restore_shard_checkpoint(message)
         elif isinstance(message, comm.TaskResult):
@@ -1017,6 +1022,7 @@ class MasterServicer(ABC):
             f"job_uuid:{message.job_uuid},"
             f"namespace:{message.namespace}"
         )
+        metrics = getattr(self._job_manager, "vertical_metrics", None)
         _dlrover_context.enable_elastic_resource = True
         if (
             not self._job_manager
@@ -1024,6 +1030,14 @@ class MasterServicer(ABC):
             or message.elastic_dimension not in ("", ElasticDimension.VERTICAL)
             or message.scale_action not in VERTICAL_ACTIONS
         ):
+            if metrics is not None:
+                reason = (
+                    "invalid_action"
+                    if message.scale_action not in VERTICAL_ACTIONS
+                    else "dimension_mismatch"
+                )
+                metrics.request(message.scale_action, "rejected", reason)
+            
             logger.warning(
                 "DIMENSION_MISMATCH: reject incompatible elastic request"
             )
@@ -1037,6 +1051,8 @@ class MasterServicer(ABC):
         ):
             value = getattr(message, field)
             if value and value != expected:
+                if metrics is not None:
+                    metrics.request(message.scale_action, "rejected", "job_mismatch")
                 logger.warning(
                     "Reject elastic request: %s does not match job", field
                 )
