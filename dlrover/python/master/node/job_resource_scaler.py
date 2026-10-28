@@ -36,6 +36,8 @@ from dlrover.python.common.log import default_logger as logger
 from dlrover.python.common.node import NodeResource, NodeGroupResource
 from dlrover.python.master.monitor.perf_monitor import PerfMonitor
 from dlrover.python.master.monitor.vertical_metrics import VerticalExecutionMetrics
+from dlrover.python.master.resource.benefit import BenefitGuard
+from dlrover.python.master.resource.exploration import Exploration, unpack
 from dlrover.python.master.node.job_context import get_job_context
 from dlrover.python.master.node.ps import ParameterServerManager
 from dlrover.python.master.node.worker import WorkerManager
@@ -62,6 +64,8 @@ def new_job_resource_scaler(
     worker_manager: WorkerManager,
     node_scaler: Scaler,
     vertical_metrics=None,
+    benefit_job=None,
+    benefit_generation_provider=None,
 ):
     if job_strategy == DistributionStrategy.ALLREDUCE:
         return AllreduceTrainingResourceScaler(
@@ -71,6 +75,9 @@ def new_job_resource_scaler(
             worker_manager,
             node_scaler,
             vertical_metrics=vertical_metrics,
+            benefit_guard=BenefitGuard(
+                job=benefit_job, generation_provider=benefit_generation_provider
+            ),
         )
     else:
         raise ValueError("No job auto scaler for %s", job_strategy)
@@ -151,6 +158,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         worker_manager: WorkerManager,
         node_scaler: Scaler,
         vertical_metrics=None,
+        benefit_guard=None,
     ) -> None:
         super().__init__(
             job_resource,
@@ -180,6 +188,9 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         self._adjust_gpu_nums = 0
         self._scaling_lock = threading.Lock()
         self.vertical_metrics = vertical_metrics or VerticalExecutionMetrics()
+        self.benefit_guard = benefit_guard or BenefitGuard()
+        self.exploration = Exploration(self.benefit_guard)
+        self._benefit_stop = threading.Event()
 
     def get_job_nodes(self, node_type=""):
         if node_type == "":
@@ -204,6 +215,12 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             logger.info("Vertical scaling is already in progress")
             return False
 
+        if not self.exploration.enter():
+            self.exploration.leave()
+            self._scaling_lock.release()
+            self.vertical_metrics.request(scale_action, "rejected", "exploration_fenced")
+            return False
+
         self.vertical_metrics.inflight.set(1)
         previous_enabled = _dlrover_context.enable_elastic_resource
         try:
@@ -218,8 +235,10 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             _dlrover_context.enable_elastic_resource = previous_enabled
             self.vertical_metrics.inflight.set(0)
             self.vertical_metrics.request(scale_action, "error", "internal_error")
+            self.exploration.leave()
             self._scaling_lock.release()
             raise
+
         self.vertical_metrics.request(scale_action, "accepted")
         return True
         
@@ -241,7 +260,12 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
                 self.vertical_metrics.finish("failed", "internal_error")
                 self.vertical_metrics.inflight.set(0)
                 _dlrover_context.enable_elastic_resource = False
-                self._scaling_lock.release()
+                try:
+                    if self.exploration.active and not self._benefit_stop.is_set():
+                        self.exploration.finish("FAILED", "interrupted_execution")
+                finally:
+                    self.exploration.leave()
+                    self._scaling_lock.release()
 
     def _adjust_running_worker_resource(self):
         """Adjust the resource of worker."""
@@ -264,6 +288,10 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             self._target_tunning_nodes = set()
 
             plan_id = self._plan_id_generator.generate_id()
+            if self.exploration.enabled:
+                import uuid
+                plan_id += "-" + uuid.uuid4().hex
+
             self.vertical_elastic_phase_manager.create(
                 plan_id = plan_id,
             )
@@ -379,6 +407,30 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         if not self._old_worker_ids:
             raise RuntimeError("No workers available for vertical replacement")
 
+        if not self._check_resource_benefit(plan, alive_num):
+            return False
+
+        if not self._execute_resource_plan(plan, ckpt_wait_time, ckpt_check_sec, log_step):
+            if self.exploration.active:
+                self.exploration.finish("FAILED", "switch_failed")
+            return False
+        
+        if self.exploration.active:
+            return self._observe_exploration()
+        return True
+
+    def _execute_resource_plan(self, plan, ckpt_wait_time, ckpt_check_sec, log_step,
+                               rollback=False):
+        # Reuse the existing checkpoint/replacement protocol in both directions.
+        self._adjust_gpu_nums = plan.node_group_resources[NodeType.WORKER].node_resource.gpu_num
+        self._save_ckpt_status = False
+        self._save_ckpt_step = 0
+        self._save_ckpt_path = ""
+        self._param_tunning_ready_nodes = set()
+        self._target_tunning_nodes = set()
+        if self.exploration.active:
+            ckpt_wait_time = min(ckpt_wait_time, max(0, self.exploration.state["expires_at"] - self.exploration.clock()))
+
         # B. 设置垂直弹性阶段标识
         self.update_vertical_elastic_phase(
             self._adjust_gpu_nums, 
@@ -395,6 +447,16 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
 
         # C. 执行计划
         try:
+            if self.exploration.active:
+                if self._benefit_stop.is_set() or self.exploration.clock() >= self.exploration.state["expires_at"]:
+                    return False
+                self.exploration.switching(self._save_ckpt_step, self._save_ckpt_path, rollback)
+                if (not self.exploration.authorize_mutation(rollback)
+                        or self._benefit_stop.is_set()
+                        or self.exploration.clock() >= self.exploration.state["expires_at"]):
+                    self._fail_vertical_plan("reservation_lost", "Exploration reservation not confirmed")
+                    return False
+            
             self.update_vertical_elastic_phase(
                 self._adjust_gpu_nums, 
                 VerticalElasticPhaseType.REPLACING_WORKERS, 
@@ -403,6 +465,9 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
 
             self._wait_for_replacement_exits()
             self.execute_job_optimization_plan(plan)
+
+            if self.exploration.active:
+                ckpt_wait_time = min(ckpt_wait_time, max(0, self.exploration.state["expires_at"] - self.exploration.clock()))
 
             if not self._wait_for_param_tunning_ready(
                 ckpt_wait_time, ckpt_check_sec, log_step
@@ -422,11 +487,115 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             self.vertical_metrics.await_recovery(
                 self._target_tunning_nodes, self._save_ckpt_step, ckpt_wait_time
             )
+            if self.exploration.active:
+                self.exploration.observing(rollback)
             return True
         except Exception as e:
             logger.error(f"Failed to execute plan: {e}", exc_info=True)
             self._fail_vertical_plan("scale_failed", "Execute plan failed.")
             return False
+
+    def _observe_exploration(self):
+        trial = self.exploration
+        while not self._benefit_stop.is_set():
+            action = trial.inspect()
+            if self._benefit_stop.is_set():
+                return False
+            if action == "rollback":
+                self.vertical_metrics.stop_recovery()
+                self.vertical_elastic_phase_manager.create(trial.state["rollback_plan_id"])
+                self.vertical_metrics.start("reduce_gpus" if trial.state["original"]["gpu_num"] < trial.state["target"]["gpu_num"] else "add_gpus")
+                plan = ResourcePlan()
+                plan.node_group_resources[NodeType.WORKER] = unpack(trial.state["original"])
+                # Fresh checkpoint of the CURRENT training state, never the old trial checkpoint.
+                if not self._execute_resource_plan(
+                    plan, trial.state["rollback_seconds"],
+                    getattr(_dlrover_context, "ckpt_save_status_check_interval", 1),
+                    getattr(_dlrover_context, "log_interval_check_nums", 5), rollback=True,
+                ):
+                    trial.finish("FAILED", "rollback_failed")
+                    return False
+            elif action != "wait":
+                self.vertical_metrics.explorations.labels(action.lower()).inc()
+                if action in ("ACCEPTED", "RETAINED", "ROLLED_BACK"):
+                    current = unpack(trial.state["original"] if action == "ROLLED_BACK" else trial.state["target"])
+                    self._job_resource.node_group_resources[NodeType.WORKER] = current
+                    self._sync_optimizer_current_worker_resource(current)
+                    trial.release_reservation()
+                    return True
+                return False
+            remaining = max(0, trial.state["expires_at"] - trial.clock())
+            self._benefit_stop.wait(min(trial.poll, remaining))
+        # Keep durable observation state for another Master; no further mutation.
+        return False
+
+    def resume_exploration(self):
+        """Resume observation only. Interrupted Kubernetes mutations stay fenced."""
+        if self.exploration.store is None or not self._scaling_lock.acquire(False):
+            return
+        if not self.exploration.enter(recovering=True):
+            self.exploration.leave()
+            self._scaling_lock.release()
+            return
+        self.vertical_metrics.inflight.set(1)
+        _dlrover_context.enable_elastic_resource = True
+        def observe():
+            try:
+                self._observe_exploration()
+            except Exception:
+                logger.exception("Exploration recovery failed; journal remains fenced")
+            finally:
+                self.vertical_metrics.inflight.set(0)
+                _dlrover_context.enable_elastic_resource = False
+                self.exploration.leave()
+                self._scaling_lock.release()
+        try:
+            threading.Thread(target=observe, name="vertical-exploration-recovery", daemon=True).start()
+        except Exception:
+            self.vertical_metrics.inflight.set(0)
+            _dlrover_context.enable_elastic_resource = False
+            self.exploration.leave()
+            self._scaling_lock.release()
+            raise
+
+    def stop(self):
+        self._benefit_stop.set()
+
+    def _check_resource_benefit(self, plan, alive_num):
+        guard = self.benefit_guard
+        if guard.mode == "off":
+            return True
+        allowed = guard.check(
+            self._get_current_worker_group_resource(alive_num),
+            plan.node_group_resources[NodeType.WORKER],
+            self.vertical_elastic_phase_manager.get_plan_id(),
+        )
+        current = self._get_current_worker_group_resource(alive_num)
+        workers = self._get_replaceable_workers() if self.exploration.enabled else []
+        healthy = current is not None and len(workers) == current.count and all(
+            worker.status == NodeStatus.RUNNING and not worker.is_released
+            and worker.config_resource.gpu_num == current.node_resource.gpu_num
+            for worker in workers
+        )
+        if not allowed and healthy:
+            allowed = self.exploration.prepare(
+                current,
+                plan.node_group_resources[NodeType.WORKER],
+                self.vertical_elastic_phase_manager.get_plan_id(),
+            )
+        result = guard.last_result
+        self.vertical_metrics.benefit_evaluations.labels(
+            guard.mode if guard.valid else "invalid", result.status, result.reason
+        ).inc()
+        logger.info("Vertical benefit plan=%s mode=%s result=%s",
+                    self.vertical_elastic_phase_manager.get_plan_id(),
+                    guard.mode, result.to_dict())
+        if not allowed:
+            self.vertical_metrics.finish("skipped", "benefit_" + result.status)
+            self.vertical_elastic_phase_manager.fail(
+                "Benefit gate: " + result.reason
+            )
+        return allowed
 
     def _wait_for_replacement_exits(self):
         """Let old agents finish before Pod deletion; checkpoint is already safe."""
@@ -460,6 +629,9 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         count = 0
         
         while not self._save_ckpt_status:
+            if self._benefit_stop.is_set():
+                return False
+            
             if (
                 self.get_phase_info().get("phase")
                 == VerticalElasticPhaseType.FAILED
@@ -516,6 +688,9 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         while not self._target_tunning_nodes.issubset(
             self._param_tunning_ready_nodes
         ):
+            if self._benefit_stop.is_set():
+                return False
+            
             if not _dlrover_context.enable_elastic_resource:
                 self.vertical_metrics.finish("skip param tunning", "enable_elastic_resource switch disabled")
                 logger.warning(
@@ -638,7 +813,8 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         checkpoint_path: str = "",
     ):
         phase_info = self.vertical_elastic_phase_manager.get()
-        if not plan_id or plan_id != phase_info.get("plan_id"):
+        if ((self.exploration.active and plan_id != phase_info.get("plan_id"))
+                or (plan_id and plan_id != phase_info.get("plan_id"))):
             self.vertical_metrics.reports.labels("checkpoint", "stale_plan").inc()
             logger.warning(
                 "Ignore checkpoint status from stale plan %s, current plan %s.",
@@ -702,7 +878,8 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         rank: int = -1,
     ):
         phase_info = self.vertical_elastic_phase_manager.get()
-        if not plan_id or plan_id != phase_info.get("plan_id"):
+        if ((self.exploration.active and plan_id != phase_info.get("plan_id"))
+                or (plan_id and plan_id != phase_info.get("plan_id"))):
             self.vertical_metrics.reports.labels("param_tunning", "stale_plan").inc()
             logger.warning(
                 "Ignore param tunning status from stale plan %s, current %s.",

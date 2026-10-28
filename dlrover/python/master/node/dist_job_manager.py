@@ -141,6 +141,7 @@ class DistributedJobManager(JobManager):
             external_config=external_config,
         )
         self.vertical_metrics = VerticalExecutionMetrics()
+        self.training_generation_provider = lambda: ""
         self._remove_exited_node = job_args.remove_exited_node
         node_restart_count: Dict[str, int] = {}
         for type, node_args in job_args.node_args.items():
@@ -285,8 +286,16 @@ class DistributedJobManager(JobManager):
         if self._job_args.runtime_elastic_dimension == ElasticDimension.VERTICAL:
             self._init_job_resource_scaler()
 
+        resource_scaler = getattr(self, "_job_resource_scaler", None)
+        block_launch, reconcile = (False, False)
+        if resource_scaler is not None:
+            block_launch, reconcile = resource_scaler.exploration.startup_fence()
+        if reconcile:
+            self._enable_relaunch_node = False
+            logger.error("Interrupted exploration requires resource reconciliation; automatic relaunch disabled")
+
         plan = self._create_initial_scale_plan()
-        if not self._has_running_workers():
+        if not self._has_running_workers() and not block_launch:
             # The job relaunches the evicted master, there are alive
             # worker nodes and the master does not need to launch workers.
             logger.info(
@@ -313,6 +322,9 @@ class DistributedJobManager(JobManager):
             name="node_heartbeat_monitor",
             daemon=True,
         ).start()
+
+        if resource_scaler is not None:
+            resource_scaler.resume_exploration()
 
 
     def _has_running_workers(self):
@@ -734,6 +746,12 @@ class DistributedJobManager(JobManager):
             self._worker_manager,
             self._scaler,
             vertical_metrics=self.vertical_metrics,
+            benefit_generation_provider=self.training_generation_provider,
+            benefit_job={
+                "job_uid": self._job_args.job_uuid,
+                "namespace": self._job_args.namespace,
+                "cluster": self._job_args.cluster,
+            },
         )
         logger.info(
             "Create job resource scaler: %s", self._job_resource_scaler.__class__
@@ -1308,6 +1326,17 @@ class DistributedJobManager(JobManager):
             )
             return False
 
+        if (
+            node.get_reported_status()
+            == NodeEventType.VERTICAL_ELASTIC_EXITED
+        ):
+            node.relaunchable = False
+            logger.info(
+                "Disable relaunch for node %s after vertical elastic exit.",
+                node.name,
+            )
+            return False
+
         should_relaunch = (
             status_change_flow.should_relaunch
             and self._enable_relaunch_node
@@ -1595,6 +1624,10 @@ class DistributedJobManager(JobManager):
             logger.info("Skip an empty scaleplan")
 
     def stop(self):
+        scaler = getattr(self, "_job_resource_scaler", None)
+        if scaler is not None:
+            scaler.stop()
+        
         self.vertical_metrics.stop_recovery()
         if not self._stopped:
             self._enable_relaunch_node = False

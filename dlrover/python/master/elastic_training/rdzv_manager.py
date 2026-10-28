@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import math
+import secrets
 import os
 import time
 from abc import ABCMeta, abstractmethod
@@ -139,6 +140,7 @@ class RendezvousManager(metaclass=ABCMeta):
         self._lastcall_time = 0
         self._rdzv_params = RendezvousParameters(0, 0)
         self._rdzv_round = 0
+        self._training_generation = ""
         self._workspace_rdzv_state = WorkspaceRendezvousState()
         self._node_unit = 1
         self._name = ""
@@ -165,6 +167,17 @@ class RendezvousManager(metaclass=ABCMeta):
 
     def get_waiting_timeout(self):
         return self._rdzv_params.waiting_timeout
+
+    def get_training_generation(self):
+        with self._lock:
+            return self._training_generation if self._rdzv_nodes else ""
+
+    def get_comm_world_with_generation(self, node_rank):
+        # Bind world and generation atomically, including during re-rendezvous.
+        with self._lock:
+            round_id, group, nodes = self.get_comm_world(node_rank)
+            generation = self.get_training_generation()
+            return round_id, group, nodes, generation
 
     def get_rdzv_round(self):
         return self._rdzv_round
@@ -645,6 +658,10 @@ class ElasticTrainingRendezvousManager(RendezvousManager):
                 if rdzv_completed:
                     finished_rdzv_round = self._rdzv_round
                     self._rdzv_round += 1
+
+                    # Exactly representable by scalar float64 transports.
+                    self._training_generation = str(secrets.randbelow(2**53 - 1) + 1)
+
                     self._rdzv_nodes = self._topology_sorter.sort(
                         self._rdzv_nodes
                     )

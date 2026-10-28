@@ -76,12 +76,6 @@ def _create_elastic_ps_service_if_needed(params: JobArgs):
         return ElasticPsService()
     return None
 
-def _create_vertical_elastic_service_if_needed(params: JobArgs):
-    if params.distribution_strategy == DistributionStrategy.ALLREDUCE and params.elastic_dimension == ElasticDimension.VERTICAL:
-        return VerticalElasticService()
-    return None
-
-
 def _create_master_service_on_k8s(namespace, job_name, job_uuid, target_port):
     from dlrover.python.scheduler.kubernetes import (
         NODE_SERVICE_PORTS,
@@ -312,6 +306,10 @@ class DistributedJobMaster(JobMaster):
             RendezvousName.TRAINING: create_training_rdzv_manager(),
             RendezvousName.NETWORK_CHECK: NetworkCheckRendezvousManager(),
         }
+        if self.job_manager is not None:
+            self.job_manager.training_generation_provider = self.rdzv_managers[
+                RendezvousName.TRAINING
+            ].get_training_generation
         self.diagnosis_manager = DiagnosisMaster(args)
         self._event_reporter = get_event_reporter()
         self.job_metric_collector = self._create_metric_collector_if_needed(

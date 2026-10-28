@@ -458,6 +458,7 @@ class RendezvousState(Message):
     waiting_num: int = 0
     round: int = 0
     group: int = 0
+    generation: str = ""
 
 @dataclass
 class BrainOptGpus(Message):

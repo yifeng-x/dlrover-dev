@@ -435,10 +435,14 @@ class MasterServicer(ABC):
 
     def _get_comm_world(self, request: comm.CommWorldRequest):
         rdzv_manager = self._rdzv_managers[request.rdzv_name]
-        rdzv_round, group, nodes = rdzv_manager.get_comm_world(request.node_id)
+        rdzv_round, group, nodes, generation = (
+            rdzv_manager.get_comm_world_with_generation(request.node_id)
+        )
         res = comm.RendezvousState(world={})
         res.group = group
         res.round = rdzv_round
+        res.generation = generation
+        
         for rank, meta in nodes.items():
             res.world[rank] = meta.process_num
         if nodes and request.rdzv_name == RendezvousName.TRAINING:

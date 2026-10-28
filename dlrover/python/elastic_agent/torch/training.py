@@ -579,8 +579,8 @@ class MasterRendezvousHandler(RendezvousHandler):
         start_pending = 0
         while True:
             self._check_network_rdzv()
-            round, group, world = self._client.get_comm_world(
-                self._name, self._node_rank
+            round, group, world, generation = self._client.get_comm_world(
+                self._name, self._node_rank, include_generation=True
             )
             if world:
                 if self._node_rank in world:
@@ -627,6 +627,15 @@ class MasterRendezvousHandler(RendezvousHandler):
                 _rdzv_evt.fail(error=err_msg)
                 raise RendezvousTimeoutError(err_msg)
             time.sleep(JobConstant.RENDEZVOUS_DEFAULT_INTERVAL)
+
+        if self._name == RendezvousName.TRAINING:
+            # Spawned trainers inherit this environment on every restart.
+            # An older Master must not leave a previous generation in place.
+            if generation:
+                os.environ[NodeEnv.TRAIN_GENERATION] = generation
+            else:
+                os.environ.pop(NodeEnv.TRAIN_GENERATION, None)
+
         rank = list(world.keys()).index(self._node_rank)
         world_size = len(world)
         logger.info(
@@ -1421,6 +1430,17 @@ class ElasticTrainingAgent(LocalElasticAgent):
                     logger.info(
                         "Workspace stop requested; exit without diagnosing "
                         "or restarting the worker group."
+                    )
+                    self._worker_group.state = WorkerState.SUCCEEDED
+                    return RunResult(
+                        state=WorkerState.SUCCEEDED,
+                        return_values=run_result.return_values,
+                    )
+
+                if self._vertical_elastic_exit_reported:
+                    logger.info(
+                        "Skip reporting training failure after vertical "
+                        "elastic exit."
                     )
                     self._worker_group.state = WorkerState.SUCCEEDED
                     return RunResult(

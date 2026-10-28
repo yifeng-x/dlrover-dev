@@ -472,10 +472,13 @@ class MasterClient(Singleton, ABC):
         response = self._report(message)
         return response.success
 
-    def get_comm_world(self, rdzv_name, node_rank):
+    def get_comm_world(self, rdzv_name, node_rank, include_generation=False):
         request = comm.CommWorldRequest(node_id=node_rank, rdzv_name=rdzv_name)
         result: comm.RendezvousState = self._get(request)
-        return result.round, result.group, result.world
+        world = (result.round, result.group, result.world)
+        if include_generation:
+            return (*world, getattr(result, "generation", ""))
+        return world
 
     def check_fault_node(self, timeout=300):
         request = comm.NetworkReadyRequest()

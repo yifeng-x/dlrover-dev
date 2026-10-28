@@ -2120,7 +2120,7 @@ class MasterRendezvousHandlerTest(unittest.TestCase):
         )
         rdzv_handler._join_rendezvous = mock.MagicMock(return_value=0)
         rdzv_handler._client.get_comm_world = mock.MagicMock(
-            return_value=(0, 0, {1: 8})
+            return_value=(0, 0, {1: 8}, "")
         )
         with self.assertRaises(RendezvousTimeoutError):
             rdzv_handler.next_rendezvous()
