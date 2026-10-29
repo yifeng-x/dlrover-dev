@@ -502,6 +502,11 @@ class K8sJobArgs(JobArgs):
         k8s_client = k8sClient.singleton_instance(self.namespace)
         job = self._retry_to_get_job(k8s_client)
         self.raw_job = job
+        metadata = job.get("metadata", {}) or {}
+        task_id = (metadata.get("labels") or {}).get("low_code_platform_task_id")
+        self.low_code_platform_task_id = (
+            task_id.strip() if isinstance(task_id, str) else ""
+        )
         self.ucp_service = _get_ucp_service_config(job)
         self.job_uuid = self._get_job_uuid(job)
 

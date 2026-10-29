@@ -33,7 +33,9 @@ def scalar(value):
 class SwanLabTrainingMetrics:
     def __init__(self, env, post=None):
         self.url = env.get("DLROVER_SWANLAB_HTTP_URL", "")
-        self.task_id = env.get("DLROVER_SWANLAB_TASK_ID", "")
+        self.task_id = env.get("LOW_CODE_PLATFORM_TASK_ID", "")
+        self.mock = env.get("DLROVER_SWANLAB_MOCK", "false").strip().lower() == "true"
+        self.mock_file = env.get("DLROVER_SWANLAB_MOCK_FILE", "")
         self.token = env.get("DLROVER_SWANLAB_HTTP_TOKEN", "")
         self.post = post or requests.post
         self.keys = dict(TRAINING_METRIC_KEYS)
@@ -55,10 +57,16 @@ class SwanLabTrainingMetrics:
             offset = datetime.fromisoformat("2000-01-01T00:00:00" + self.utc_offset)
             if offset.tzinfo is None:
                 raise ValueError("missing_timezone")
-            parsed = urlparse(self.url)
-            if (parsed.scheme not in ("http", "https") or not parsed.hostname
-                    or parsed.username or parsed.password or not self.task_id):
-                raise ValueError("invalid_swanlab_configuration")
+            if not self.task_id:
+                raise ValueError("missing_task_id")
+            if self.mock:
+                if not self.mock_file:
+                    raise ValueError("missing_mock_file")
+            else:
+                parsed = urlparse(self.url)
+                if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                        or parsed.username or parsed.password):
+                    raise ValueError("invalid_swanlab_configuration")
         except (ValueError, TypeError):
             self.valid = False
 
@@ -67,6 +75,7 @@ class SwanLabTrainingMetrics:
         started = time.monotonic()
         context = dict(task_id=self.task_id, generation=generation,
                        plan_id=plan_id, request_id=request_id)
+        context["data_source"] = "mock" if self.mock else "http"
         stage, status = "configuration", None
         self._log.emit("fetch_started", level="debug",
                        timeout_seconds=timeout, max_age_seconds=max_age,
@@ -74,23 +83,32 @@ class SwanLabTrainingMetrics:
         try:
             if not self.valid or not generation:
                 raise TrainingMetricsUnavailable("swanlab_not_configured_or_no_generation")
-            headers = {"Accept": "application/json"}
-            if self.token:
-                headers["Authorization"] = "Bearer " + self.token
-            body = {"taskId": self.task_id, "taskScalarList": [
-                {"key": key} for key in self.keys.values()
-            ]}
-            stage = "http"
-            try:
-                with self.post(self.url, json=body, headers=headers,
-                               timeout=timeout, allow_redirects=False) as response:
-                    status = response.status_code
-                    if status != 200:
-                        raise TrainingMetricsUnavailable("swanlab_http_error")
-                    stage = "decode"
-                    rows = response.json()
-            except (requests.RequestException, ValueError) as error:
-                raise TrainingMetricsUnavailable("swanlab_http_or_payload_error") from error
+            if self.mock:
+                stage = "mock_file"
+                try:
+                    # Reload each poll to allow controlled generation/window changes.
+                    with open(self.mock_file, encoding="utf-8") as stream:
+                        rows = json.load(stream)
+                except (OSError, ValueError) as error:
+                    raise TrainingMetricsUnavailable("swanlab_mock_file_error") from error
+            else:
+                headers = {"Accept": "application/json"}
+                if self.token:
+                    headers["Authorization"] = "Bearer " + self.token
+                body = {"taskId": self.task_id, "taskScalarList": [
+                    {"key": key} for key in self.keys.values()
+                ]}
+                stage = "http"
+                try:
+                    with self.post(self.url, json=body, headers=headers,
+                                   timeout=timeout, allow_redirects=False) as response:
+                        status = response.status_code
+                        if status != 200:
+                            raise TrainingMetricsUnavailable("swanlab_http_error")
+                        stage = "decode"
+                        rows = response.json()
+                except (requests.RequestException, ValueError) as error:
+                    raise TrainingMetricsUnavailable("swanlab_http_or_payload_error") from error
             stage = "window"
             window = self.window(rows, generation, clock(), max_age, min_window, after)
         except TrainingMetricsUnavailable as error:
@@ -120,6 +138,8 @@ class SwanLabTrainingMetrics:
             global_batch_size=window["global_batch_size"],
             duration_ms=round((time.monotonic() - started) * 1000, 3), **context,
         )
+        if self.mock:
+            window["data_source"] = "mock"
         return window
 
     def window(self, rows, generation, now, max_age, min_window, after=0):

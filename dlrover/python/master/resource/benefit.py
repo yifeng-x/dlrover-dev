@@ -197,8 +197,11 @@ class BenefitGuard:
     """Opt-in HTTP gate: off preserves behavior; shadow observes; enforce gates."""
 
     def __init__(self, job=None, environ=None, clock=time.time, post=None,
-                 generation_provider=None):
-        env = os.environ if environ is None else environ
+                 generation_provider=None, platform_task_id=None):
+        env = dict(os.environ if environ is None else environ)
+        label_task_id = isinstance(platform_task_id, str) and bool(platform_task_id.strip())
+        # Only the task label supplies identity; never reuse a process env ID.
+        env["LOW_CODE_PLATFORM_TASK_ID"] = platform_task_id.strip() if label_task_id else ""
         self._log = BenefitLogger("guard")
         self.job = dict(job or {})
         self.clock = clock
@@ -206,7 +209,17 @@ class BenefitGuard:
         self.generation_provider = generation_provider
         self.training_metrics = (
             SwanLabTrainingMetrics(env, post=self.post)
-            if env.get("DLROVER_SWANLAB_HTTP_URL") else None
+            if (env.get("DLROVER_SWANLAB_HTTP_URL")
+                or env.get("DLROVER_SWANLAB_MOCK", "false").strip().lower() == "true") else None
+        )
+        if self.training_metrics is not None:
+            self._log.emit(
+                "training_metrics_configured",
+                job_uid=self.job.get("job_uid"),
+                task_id=self.training_metrics.task_id,
+                task_id_source="job_label" if label_task_id else "missing_job_label",
+                valid=self.training_metrics.valid,
+                data_source="mock" if self.training_metrics.mock else "http"
         )
         self.mode = env.get("DLROVER_BENEFIT_MODE", "off").lower()
         self.url = env.get("DLROVER_BENEFIT_HTTP_URL", "")

@@ -112,6 +112,7 @@ class JobArgs(JsonSerializable):
 
         self.ucp_service = {}
         self.raw_job = {}
+        self.low_code_platform_task_id = ""
         self.group_affinity: Optional[Dict[int, int]] = None
 
         self.runtime_elastic_dimension = ElasticDimension.HORIZONTAL

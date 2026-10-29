@@ -39,7 +39,7 @@ def test_swanlab_logs_window_and_correlation_without_secrets(logs):
     event = next(record for record in logs if record["event"] == "window_selected")
     assert event["plan_id"] == "plan"
     assert event["request_id"] == "request"
-    assert event["task_id"] == ENV["DLROVER_SWANLAB_TASK_ID"]
+    assert event["task_id"] == ENV["LOW_CODE_PLATFORM_TASK_ID"]
     assert event["throughput"] == 2
     assert event["window_start"] == 940
     assert event["window_end"] == 1000

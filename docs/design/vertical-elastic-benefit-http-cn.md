@@ -147,10 +147,31 @@ Content-Type: application/json
 
 ### Master 配置
 
+本地联调可通过默认关闭的 `DLROVER_SWANLAB_MOCK` 开关读取 scalar JSON 文件；
+配置与生成数据步骤见 [SwanLab mock 模式验证](vertical-elastic-benefit-mock-cn.md)。
+
+SwanLab 的 `taskId` 仅从提交任务的顶层 `metadata.labels.low_code_platform_task_id` 读取：
+
+```yaml
+metadata:
+  name: workspace-test
+  namespace: elastic-training
+  labels:
+    low_code_platform_task_id: "xxxxxxx"
+```
+
+Master 将解析结果传入当前任务的收益客户端环境配置 `LOW_CODE_PLATFORM_TASK_ID`，
+不修改进程全局环境。label 是唯一来源；缺失、为空或不是字符串时，SwanLab 客户端不可用，
+即使环境变量中存在任务 ID 也不会使用。
+该 ID 在扩缩容、worker 替换及 training generation 变化期间保持不变。
+不读取 annotations 或任何环境变量中的任务 ID。
+未提供 ID 时，已启用的 SwanLab 客户端不可用，不会以 job name 或 job UID 猜测 taskId。
+请求体的 `taskId`、响应身份校验和事件中的 `swanlab_task_id` 使用同一个值。
+该值在客户端初始化时读取；`BenefitFlow.training_metrics_configured` 记录 task ID、来源和配置有效性。
+
 | 环境变量 | 默认值 | 含义 |
 | --- | --- | --- |
 | DLROVER_SWANLAB_HTTP_URL | 空 | 完整 scalar 接口 URL；非空开启独立训练数据获取 |
-| DLROVER_SWANLAB_TASK_ID | 空 | 必填，训练任务的实际 taskId，不默认使用 job_uid |
 | DLROVER_SWANLAB_HTTP_TOKEN | 空 | 可选 Bearer token，与收益证据服务 token 分离 |
 | DLROVER_SWANLAB_UTC_OFFSET | +08:00 | createTime 无时区时使用的 UTC 偏移 |
 | DLROVER_SWANLAB_KEYS | {} | JSON 对象，将内部字段映射到实际训练 key |
@@ -165,8 +186,6 @@ env:
     value: "http://benefit-service/benefit/snapshot"
   - name: DLROVER_SWANLAB_HTTP_URL
     value: "http://metrics-service/metrics/scalar/by-task-name"
-  - name: DLROVER_SWANLAB_TASK_ID
-    value: "实际任务 ID"
   - name: DLROVER_SWANLAB_KEYS
     value: '{"work":"train/global_step","target_work":"train/total_steps","global_batch_size":"train/global_batch_size","generation":"train/generation","steady":"train/steady"}'
 ```

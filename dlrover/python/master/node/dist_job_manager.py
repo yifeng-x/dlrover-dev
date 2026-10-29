@@ -752,6 +752,7 @@ class DistributedJobManager(JobManager):
             self._scaler,
             vertical_metrics=self.vertical_metrics,
             benefit_generation_provider=self.training_generation_provider,
+            benefit_task_id=getattr(self._job_args, "low_code_platform_task_id", ""),
             benefit_job={
                 "job_uid": self._job_args.job_uuid,
                 "namespace": self._job_args.namespace,

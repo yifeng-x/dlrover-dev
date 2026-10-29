@@ -69,6 +69,7 @@ def new_job_resource_scaler(
     vertical_metrics=None,
     benefit_job=None,
     benefit_generation_provider=None,
+    benefit_task_id=None,
 ):
     if job_strategy == DistributionStrategy.ALLREDUCE:
         return AllreduceTrainingResourceScaler(
@@ -79,7 +80,8 @@ def new_job_resource_scaler(
             node_scaler,
             vertical_metrics=vertical_metrics,
             benefit_guard=BenefitGuard(
-                job=benefit_job, generation_provider=benefit_generation_provider
+                job=benefit_job, generation_provider=benefit_generation_provider,
+                platform_task_id=benefit_task_id,
             ),
         )
     else:

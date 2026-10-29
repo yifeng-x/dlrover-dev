@@ -15,7 +15,7 @@ from dlrover.python.master.resource.swanlab import (
 
 ENV = {
     "DLROVER_SWANLAB_HTTP_URL": "https://metrics.example/metrics/scalar/by-task-name",
-    "DLROVER_SWANLAB_TASK_ID": "test-task",
+    "LOW_CODE_PLATFORM_TASK_ID": "test-task",
     "DLROVER_SWANLAB_HTTP_TOKEN": "test-token",
 }
 

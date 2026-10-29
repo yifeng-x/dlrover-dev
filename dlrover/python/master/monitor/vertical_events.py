@@ -108,7 +108,7 @@ class VerticalElasticEvents:
         snapshot = snapshot if isinstance(snapshot, dict) else {}
         # Do not emit credentials, arbitrary provider fields or entire histories.
         fields = {
-            "training": ("unit", "target_work", "comparable", "steady", "global_batch_size"),
+            "training": ("unit", "target_work", "comparable", "steady", "global_batch_size", "data_source"),
             "transition": ("lost_seconds_upper", "replay_work_upper", "gpu_seconds_upper"),
             "limits": ("max_delay_seconds", "deadline_at"),
             "candidate": ("status", "throughput_lower", "evidence", "evidence_id"),
