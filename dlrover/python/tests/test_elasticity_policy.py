@@ -291,8 +291,9 @@ def test_horizontal_thread_does_not_start_in_vertical_mode():
 
 def test_launch_configuration_matches_allocation():
     config = SimpleNamespace(min_nodes=1, max_nodes=1, nproc_per_node=1)
-    validate_worker_launch(config, "vertical", "4", "1")
-    assert config.nproc_per_node == 4
+    assert validate_worker_launch(config, "vertical", "4", "1") == 4
+    assert config.nproc_per_node == 1
+    config.nproc_per_node = 4
     with pytest.raises(ValueError, match="nnodes"):
         validate_worker_launch(config, "horizontal", "4", "2")
     config.max_nodes = 2
@@ -408,6 +409,78 @@ def test_watcher_preserves_allocated_gpu_on_recovery():
     resource = _parse_container_resource(container)
     assert (resource.cpu, resource.memory) == (4, 16384)
     assert (resource.gpu_type, resource.gpu_num) == ("nvidia.com/gpu", 8)
+
+
+@pytest.mark.parametrize("policy", ["auto", "explicit"])
+@pytest.mark.parametrize("state", ["missing", "not_ready", "completed", "tuning"])
+def test_launch_process_count_and_plan_acknowledgement(monkeypatch, policy, state):
+    from dlrover.python.common.constants import NodeEnv, VerticalElasticPhaseType as Phase
+    from dlrover.python.elastic_agent.torch.training import _configure_worker_launch
+
+    monkeypatch.setenv("DLROVER_ELASTIC_POLICY", policy)
+    monkeypatch.setenv("DLROVER_WORKER_GPU_NUM", "8")
+    monkeypatch.setenv(NodeEnv.NODE_NUM, "1")
+    master = MagicMock()
+    master.get_vertical_elastic_phase.return_value = (
+        None if state == "missing" else SimpleNamespace(
+            ready=state != "not_ready",
+            phase=Phase.COMPLETED if state == "completed" else Phase.TUNE_PARAM,
+            adjust_gpus=8, plan_id="plan-8",
+        )
+    )
+    config = SimpleNamespace(min_nodes=1, max_nodes=1, nproc_per_node=4)
+    with patch(
+        "dlrover.python.elastic_agent.torch.training.MasterClient.singleton_instance",
+        return_value=master,
+    ):
+        _configure_worker_launch(config, [], "vertical")
+    assert config.nproc_per_node == (8 if policy == "auto" or state == "tuning" else 4)
+    if state == "tuning":
+        master.set_param_tunning_ready.assert_called_once()
+        assert master.set_param_tunning_ready.call_args.kwargs["plan_id"] == "plan-8"
+    else:
+        master.set_param_tunning_ready.assert_not_called()
+
+
+@pytest.mark.parametrize("target", [4, 16, 0, -1, 1.5, True])
+def test_auto_launch_rejects_invalid_plan_before_mutation(monkeypatch, target):
+    from dlrover.python.common.constants import NodeEnv, VerticalElasticPhaseType as Phase
+    from dlrover.python.elastic_agent.torch.training import _configure_worker_launch
+
+    monkeypatch.setenv("DLROVER_ELASTIC_POLICY", "auto")
+    monkeypatch.setenv("DLROVER_WORKER_GPU_NUM", "8")
+    monkeypatch.setenv(NodeEnv.NODE_NUM, "1")
+    master = MagicMock()
+    master.get_vertical_elastic_phase.return_value = SimpleNamespace(
+        ready=True, phase=Phase.TUNE_PARAM, adjust_gpus=target, plan_id="bad-plan",
+    )
+    config = SimpleNamespace(min_nodes=1, max_nodes=1, nproc_per_node=2)
+    with patch(
+        "dlrover.python.elastic_agent.torch.training.MasterClient.singleton_instance",
+        return_value=master,
+    ), pytest.raises(ValueError):
+        _configure_worker_launch(config, [], "vertical")
+    assert config.nproc_per_node == 2
+    master.set_param_tunning_ready.assert_not_called()
+
+
+def test_auto_horizontal_launch_only_validates_allocation(monkeypatch):
+    from dlrover.python.common.constants import NodeEnv
+    from dlrover.python.elastic_agent.torch.training import _configure_worker_launch
+
+    monkeypatch.setenv("DLROVER_ELASTIC_POLICY", "auto")
+    monkeypatch.setenv("DLROVER_WORKER_GPU_NUM", "4")
+    monkeypatch.setenv(NodeEnv.NODE_NUM, "2")
+    config = SimpleNamespace(min_nodes=1, max_nodes=2, nproc_per_node=4)
+    with patch(
+        "dlrover.python.elastic_agent.torch.training.MasterClient.singleton_instance",
+    ) as client:
+        _configure_worker_launch(config, [], "horizontal")
+        assert config.nproc_per_node == 4
+        config.nproc_per_node = 2
+        with pytest.raises(ValueError, match="nproc_per_node"):
+            _configure_worker_launch(config, [], "horizontal")
+    client.assert_not_called()
 
 
 def test_tuning_acknowledges_already_matched_gpu_count():

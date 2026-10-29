@@ -2250,19 +2250,7 @@ def launch_agent(
     if runtime_elastic_dimension == ElasticDimension.VERTICAL:
         logger.info(f"Before elastic, original nproc_per_node: {config.nproc_per_node}")
 
-    if os.getenv("DLROVER_ELASTIC_POLICY") == "auto":
-        from dlrover.python.master.elasticity_policy import (
-            validate_worker_launch,
-        )
-
-        validate_worker_launch(
-            config,
-            runtime_elastic_dimension,
-            os.environ.get("DLROVER_WORKER_GPU_NUM"),
-            os.environ.get(NodeEnv.NODE_NUM),
-        )
-    if runtime_elastic_dimension == ElasticDimension.VERTICAL:
-        _auto_param_tuning_by_vertical_elastic(config, args)
+    _configure_worker_launch(config, args, runtime_elastic_dimension)
     
     logger.info(
         f"After auto tuning train config, Launching agent entrypoint: {entrypoint}, \n"
@@ -2405,39 +2393,62 @@ def launch_agent(
         _run_training_finalizer(agent.stop_executor)
         _run_training_finalizer(monitor.stop)
 
-def _auto_param_tuning_by_vertical_elastic(config: ElasticLaunchConfig, args: List[Any]):
-    # Get resource plan from brain and Auto-tuning train params, eg: nproc_per_node .
-    _master_client = MasterClient.singleton_instance()
-    phase_info: PhaseInfo = _master_client.get_vertical_elastic_phase()
-    if phase_info is None:
-        logger.warning("vertical elastic phase is None, skip param tunning.")
-        return
+def _configure_worker_launch(config, args, dimension):
+    """Resolve local process count before constructing workers or rendezvous."""
+    allocated_gpus = None
+    if os.getenv("DLROVER_ELASTIC_POLICY") == "auto":
+        from dlrover.python.master.elasticity_policy import validate_worker_launch
 
-    if not phase_info.ready:
-        logger.warning("vertical elastic is not ready, skip param tunning.")
-        return
-
-    if phase_info.phase != VerticalElasticPhaseType.TUNE_PARAM:
-        logger.warning(
-            f"vertical elastic phase = {phase_info.phase}, skip param tunning."
+        allocated_gpus = validate_worker_launch(
+            config,
+            dimension,
+            os.environ.get("DLROVER_WORKER_GPU_NUM"),
+            os.environ.get(NodeEnv.NODE_NUM),
         )
-        return
-    
-    adjust_gpu_nums = phase_info.adjust_gpus
-    if adjust_gpu_nums <= 0:
-        raise ValueError("Vertical elastic target GPU count must be positive")
-    
-    logger.info(f"adjust gpu nums from brain is: {adjust_gpu_nums}")
-    config.nproc_per_node = adjust_gpu_nums
+    if dimension == ElasticDimension.VERTICAL:
+        _auto_param_tuning_by_vertical_elastic(config, args, allocated_gpus)
 
-    # 上报master超参数调优完成，更新执行计划状态
-    _master_client.set_param_tunning_ready(
+
+def _auto_param_tuning_by_vertical_elastic(
+    config: ElasticLaunchConfig, args: List[Any], allocated_gpus=None
+):
+    # Auto launches use their Pod allocation even without an active tuning plan.
+    # Explicit vertical launches retain CLI settings until a plan is ready.
+    master_client = MasterClient.singleton_instance()
+    phase_info: PhaseInfo = master_client.get_vertical_elastic_phase()
+    tuning = (
+        phase_info is not None
+        and phase_info.ready
+        and phase_info.phase == VerticalElasticPhaseType.TUNE_PARAM
+    )
+    target_gpus = allocated_gpus
+    if tuning:
+        from dlrover.python.master.elasticity_policy import integer_quantity
+
+        target_gpus = integer_quantity(phase_info.adjust_gpus, "target GPU count")
+        if target_gpus <= 0:
+            raise ValueError("Vertical elastic target GPU count must be positive")
+        if allocated_gpus is not None and target_gpus != allocated_gpus:
+            raise ValueError(
+                "ALLOCATION_MISMATCH: vertical plan requests "
+                f"{target_gpus} GPUs but worker Pod is allocated {allocated_gpus}"
+            )
+
+    # Validate first so a rejected plan neither mutates config nor reports ready.
+    if target_gpus is not None:
+        config.nproc_per_node = target_gpus
+    if not tuning:
+        logger.info("No ready vertical tuning plan; nproc_per_node=%s",
+                    config.nproc_per_node)
+        return
+
+    master_client.set_param_tunning_ready(
         param_tunning_ready=True,
         plan_id=phase_info.plan_id,
         rank=env_utils.get_node_rank(),
     )
+    logger.info("After adjust, nproc_per_node: %s", config.nproc_per_node)
 
-    logger.info(f"After adjust, nproc_per_node: {config.nproc_per_node}")  
 
 def _create_worker_spec(
     node_rank: int,

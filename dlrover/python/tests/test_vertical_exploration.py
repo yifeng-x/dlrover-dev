@@ -388,7 +388,8 @@ def test_full_switch_keeps_latest_checkpoint_and_waits_for_observation(trial):
          patch.object(scaler, "_wait_for_ckpt_ready", side_effect=checkpoint), \
          patch.object(scaler, "_wait_for_param_tunning_ready", return_value=True), \
          patch.object(scaler, "execute_job_optimization_plan") as execute, \
-         patch.object(scaler, "_observe_exploration", return_value=True) as observe_loop:
+         patch.object(scaler, "_observe_exploration", return_value=True) as observe_loop, \
+         patch.object(scaler, "_wait_for_replacement_exits"):
         assert scaler._try_execute_optimization(100, .01, 1)
     execute.assert_called_once_with(plan)
     observe_loop.assert_called_once()
@@ -425,7 +426,9 @@ def test_stale_untagged_framework_reports_rejected_during_trial(trial):
     scaler.update_vertical_elastic_phase(8, Phase.SAVE_CHECKPOINT, Phase.REPLACING_WORKERS)
     scaler.set_save_ckpt_status_by_vertical_elastic(True, step=100, checkpoint_path="stale")
     assert not scaler._save_ckpt_status
-    scaler.set_save_ckpt_status_by_vertical_elastic(True, plan_id="trial-1", step=200, checkpoint_path="fresh")
+    with patch.object(scaler._ucp_task_manager, "get_checkpoint_task", return_value=MagicMock(task_id="checkpoint-200")) as lookup:
+        scaler.set_save_ckpt_status_by_vertical_elastic(True, plan_id="trial-1", step=200, checkpoint_path="fresh")
+    lookup.assert_called_once_with(200, "fresh")
     assert scaler._save_ckpt_step == 200
 
 

@@ -1,0 +1,15 @@
+# Optional. Load AFTER benefit-validation-env in Master envFrom.
+# Requires a real rollback reservation service and a persistent POSIX volume.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: benefit-validation-exploration-env
+  namespace: dlrover-benefit-test
+data:
+  DLROVER_BENEFIT_MODE: "enforce"
+  DLROVER_BENEFIT_EXPLORE: "true"
+  DLROVER_BENEFIT_STATE_DIR: "/var/lib/dlrover/benefit"
+  DLROVER_BENEFIT_TRIAL_SECONDS: "600"
+  DLROVER_BENEFIT_TRIAL_POLL_SECONDS: "10"
+  DLROVER_BENEFIT_TRIAL_GPU_HOURS: "10"
+  DLROVER_BENEFIT_TRIAL_COOLDOWN_SECONDS: "1800"

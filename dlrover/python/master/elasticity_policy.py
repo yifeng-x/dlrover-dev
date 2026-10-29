@@ -247,7 +247,7 @@ def validate_resource_plan(plan, current, dimension):
 
 
 def validate_worker_launch(config, dimension, gpu_count, replicas):
-    """Validate auto-managed launches and adapt local processes to allocated cards."""
+    """Validate an auto-managed launch without mutation; return allocated GPUs."""
     gpu_count = integer_quantity(gpu_count, "allocated GPU count")
     replicas = integer_quantity(replicas, "worker replicas")
     if not 1 <= gpu_count <= MAX_GPUS_PER_WORKER or replicas < 1:
@@ -261,8 +261,8 @@ def validate_worker_launch(config, dimension, gpu_count, replicas):
             raise ValueError(
                 "EXPLICIT_CONFIG_CONFLICT: auto vertical requires nnodes=1"
             )
-        # config.nproc_per_node = gpu_count
     elif config.nproc_per_node != gpu_count:
         raise ValueError(
             "EXPLICIT_CONFIG_CONFLICT: nproc_per_node must match GPUs per worker"
         )
+    return gpu_count

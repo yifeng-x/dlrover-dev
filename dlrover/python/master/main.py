@@ -73,6 +73,7 @@ def run(args):
     job_args.requested_elastic_dimension = args.elastic_dimension.lower()
     if job_args.requested_elastic_dimension != ElasticDimension.AUTO:
         job_args.elastic_dimension = job_args.requested_elastic_dimension
+        job_args.runtime_elastic_dimension = job_args.requested_elastic_dimension
     
     job_args.resource_monitor_switch = args.resource_monitor_switch.lower()
     job_args.configmap_manual_scale_switch = (

@@ -1,0 +1,19 @@
+# Apply only after the single test job has a valid steady training window.
+# CPU/memory/type must match its original worker resource; memory is GiB.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: brain-manual-scale-config
+  namespace: dlrover-benefit-test
+data:
+  config.json: |
+    {
+      "scale_action": "manual",
+      "customize_worker_resource": {
+        "cpu": 4,
+        "memory": 8,
+        "gpus": 8,
+        "gpu_type": "nvidia.com/gpu"
+      },
+      "job_names": "benefit-test"
+    }

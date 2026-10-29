@@ -7,9 +7,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from dlrover.python.common.constants import VerticalElasticPhaseType as Phase
+from dlrover.python.common.constants import NodeStatus, VerticalElasticPhaseType as Phase
 from dlrover.python.common.global_context import Context
-from dlrover.python.common.node import NodeGroupResource, NodeResource
+from dlrover.python.common.node import Node, NodeGroupResource, NodeResource
 from dlrover.python.master.node.job_context import get_job_context
 from dlrover.python.master.node.job_resource_scaler import AllreduceTrainingResourceScaler
 from dlrover.python.master.resource.benefit import BenefitGuard, evaluate
@@ -169,6 +169,7 @@ def test_gate_is_before_checkpoint_and_worker_replacement(mode, checkpoint_calle
     instance.vertical_elastic_phase_manager.create("p1")
     instance.vertical_metrics.start("add_gpus")
     get_job_context().clear_job_nodes()
+    get_job_context().update_job_node(Node("worker", 0, group(4).node_resource, status=NodeStatus.RUNNING))
     context = Context.singleton_instance()
     try:
         with patch.dict(context.__dict__, {"enable_elastic_resource": True,
@@ -205,12 +206,14 @@ def test_http_decision_controls_real_execution_path(throughput, allowed):
     instance.vertical_elastic_phase_manager.create("p1")
     instance.vertical_metrics.start("add_gpus")
     get_job_context().clear_job_nodes()
+    get_job_context().update_job_node(Node("worker", 0, group(4).node_resource, status=NodeStatus.RUNNING))
     try:
         with patch.dict(Context.singleton_instance().__dict__, {
             "enable_elastic_resource": True, "auto_elasticity": False,
         }), patch.object(instance, "_wait_for_ckpt_ready", return_value=True) as checkpoint, \
              patch.object(instance, "_wait_for_param_tunning_ready", return_value=True), \
-             patch.object(instance, "execute_job_optimization_plan") as execute:
+             patch.object(instance, "execute_job_optimization_plan") as execute, \
+             patch.object(instance, "_wait_for_replacement_exits"):
             assert instance._try_execute_optimization(1, .01, 1) is allowed
         assert checkpoint.called is allowed
         assert execute.called is allowed

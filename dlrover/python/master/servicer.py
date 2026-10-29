@@ -1027,7 +1027,6 @@ class MasterServicer(ABC):
             f"namespace:{message.namespace}"
         )
         metrics = getattr(self._job_manager, "vertical_metrics", None)
-        _dlrover_context.enable_elastic_resource = True
         if (
             not self._job_manager
             or _dlrover_context.runtime_elastic_dimension != ElasticDimension.VERTICAL

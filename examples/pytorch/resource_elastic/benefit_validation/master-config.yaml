@@ -1,0 +1,19 @@
+# Replace service URLs and task ID before use. Loaded at Master startup.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: benefit-validation-env
+  namespace: dlrover-benefit-test
+data:
+  DLROVER_BENEFIT_MODE: "shadow"
+  DLROVER_BENEFIT_OBJECTIVE: "time"
+  DLROVER_BENEFIT_HTTP_URL: "http://REPLACE-BENEFIT-SERVICE/benefit/snapshot"
+  DLROVER_BENEFIT_TIMEOUT_SECONDS: "3"
+  DLROVER_BENEFIT_MAX_AGE_SECONDS: "60"
+  DLROVER_BENEFIT_MIN_WINDOW_SECONDS: "30"
+  DLROVER_BENEFIT_MIN_GAIN_RATIO: "0.05"
+  DLROVER_BENEFIT_EXPLORE: "false"
+  DLROVER_SWANLAB_HTTP_URL: "http://REPLACE-METRICS-SERVICE/metrics/scalar/by-task-name"
+  DLROVER_SWANLAB_TASK_ID: "REPLACE-TASK-ID"
+  DLROVER_SWANLAB_UTC_OFFSET: "+08:00"
+  DLROVER_SWANLAB_KEYS: '{"work":"train/global_step","target_work":"train/total_steps","global_batch_size":"train/global_batch_size","generation":"train/generation","steady":"train/steady"}'

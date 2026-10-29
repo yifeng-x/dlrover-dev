@@ -12,7 +12,7 @@ from prometheus_client.parser import text_string_to_metric_families
 from dlrover.python.common.constants import VerticalElasticPhaseType as Phase
 from dlrover.python.common.global_context import Context
 from dlrover.python.common.metric.prometheus import MetricsServer
-from dlrover.python.common.node import NodeGroupResource, NodeResource
+from dlrover.python.common.node import Node, NodeGroupResource, NodeResource
 from dlrover.python.master.monitor.perf_monitor import PerfMonitor
 from dlrover.python.master.monitor.prometheus import MasterMetricsCollector
 from dlrover.python.master.monitor.vertical_metrics import VerticalExecutionMetrics
@@ -103,7 +103,10 @@ def scaler():
         "ckpt_save_status_check_max_wait_time": 1,
         "ckpt_save_status_check_interval": 0.01,
         "log_interval_check_nums": 5,
-    }):
+    }), patch.object(
+        scaler, "_get_replaceable_workers",
+        return_value=[Node("worker", 0, resource.node_group_resources["worker"].node_resource)],
+    ), patch.object(scaler, "_wait_for_replacement_exits"):
         yield scaler
     get_job_context().clear_job_nodes()
 
@@ -153,7 +156,7 @@ def test_skipped_plans_are_not_failures(scaler, reason):
     if reason == "cooldown":
         scaler.last_plan_time = time.time() + 100
     elif reason == "max_attempts":
-        scaler.opt_num = 11
+        scaler.valid_opt_num = 11
     else:
         plan = ResourcePlan()
         if reason == "same_resource":
