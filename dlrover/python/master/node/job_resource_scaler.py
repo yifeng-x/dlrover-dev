@@ -69,6 +69,7 @@ def new_job_resource_scaler(
     vertical_metrics=None,
     benefit_job=None,
     benefit_generation_provider=None,
+    benefit_context_provider=None,
     benefit_task_id=None,
 ):
     if job_strategy == DistributionStrategy.ALLREDUCE:
@@ -82,6 +83,7 @@ def new_job_resource_scaler(
             benefit_guard=BenefitGuard(
                 job=benefit_job, generation_provider=benefit_generation_provider,
                 platform_task_id=benefit_task_id,
+                training_context_provider=benefit_context_provider,
             ),
         )
     else:
@@ -195,6 +197,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         self.vertical_metrics = vertical_metrics or VerticalExecutionMetrics()
         self._benefit_log = BenefitLogger("execution")
         self.benefit_guard = benefit_guard or BenefitGuard()
+        self.benefit_guard.recovery_provider = self.vertical_metrics.training_observation_status
         self.exploration = Exploration(self.benefit_guard)
         self._benefit_stop = threading.Event()
         self.events = VerticalElasticEvents(

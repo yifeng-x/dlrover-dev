@@ -197,7 +197,7 @@ class BenefitGuard:
     """Opt-in HTTP gate: off preserves behavior; shadow observes; enforce gates."""
 
     def __init__(self, job=None, environ=None, clock=time.time, post=None,
-                 generation_provider=None, platform_task_id=None):
+                 generation_provider=None, platform_task_id=None, training_context_provider=None):
         env = dict(os.environ if environ is None else environ)
         label_task_id = isinstance(platform_task_id, str) and bool(platform_task_id.strip())
         # Only the task label supplies identity; never reuse a process env ID.
@@ -207,6 +207,8 @@ class BenefitGuard:
         self.clock = clock
         self.post = post or requests.post
         self.generation_provider = generation_provider
+        self.training_context_provider = training_context_provider
+        self.recovery_provider = None
         self.training_metrics = (
             SwanLabTrainingMetrics(env, post=self.post)
             if (env.get("DLROVER_SWANLAB_HTTP_URL")
@@ -281,6 +283,15 @@ class BenefitGuard:
         )
         return result
 
+    def _training_context(self):
+        context = dict(self.training_context_provider() if self.training_context_provider else {})
+        if self.recovery_provider:
+            context.update(self.recovery_provider())
+        else:
+            context.setdefault("recovery_ready", True)
+            context.setdefault("recovered_at", 0)
+        return context
+
     def _evaluate_request(self, current, target, plan_id, exploration=None):
         self.last_snapshot = None
         try:
@@ -318,7 +329,11 @@ class BenefitGuard:
                 exploration.get("authorize_mutation") or exploration.get("release_reservation")
             )
             training = None
+            training_context = None
             if self.training_metrics is not None and not control_request:
+                training_context = self._training_context()
+                if training_context.get("generation") != request.get("generation"):
+                    raise TrainingMetricsUnavailable("missing_or_changed_training_context")
                 after = max((exploration or {}).get("observation_after", 0),
                             (exploration or {}).get("last_window_end", 0))
                 training = self.training_metrics.fetch(
@@ -330,6 +345,7 @@ class BenefitGuard:
                     after=after,
                     plan_id=plan_id, 
                     request_id=request["request_id"],
+                    training_context=training_context,
                 )
                 request["training"] = training
             headers = {"Accept": "application/json"}
@@ -360,6 +376,8 @@ class BenefitGuard:
                 )}
                 snapshot["training"] = training
             self.last_snapshot = snapshot
+            if training_context is not None and training_context != self._training_context():
+                return BenefitResult("unknown", "training_context_changed_during_fetch")
             if not control_request and self.generation_provider is not None:
                 if request["generation"] != self.generation_provider():
                     return BenefitResult("unknown", "generation_changed_during_fetch")

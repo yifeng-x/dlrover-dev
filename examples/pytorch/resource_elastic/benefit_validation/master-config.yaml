@@ -19,5 +19,12 @@ data:
   # Testing only: true reads a raw scalar JSON file instead of calling SwanLab.
   DLROVER_SWANLAB_MOCK: "false"
   DLROVER_SWANLAB_MOCK_FILE: "/tmp/dlrover-benefit-validation/swanlab-mock.json"
+  # SwanLab createTime is confirmed to be training sampling time.
+  DLROVER_SWANLAB_TIME_SOURCE: "sample"
+  DLROVER_SWANLAB_WARMUP_SECONDS: "60"
+  DLROVER_SWANLAB_STEADY_WINDOWS: "2"
+  DLROVER_SWANLAB_MAX_THROUGHPUT_VARIATION: "0.1"
   DLROVER_SWANLAB_UTC_OFFSET: "+08:00"
-  DLROVER_SWANLAB_KEYS: '{"work":"train/global_step","target_work":"train/total_steps","global_batch_size":"train/global_batch_size","generation":"train/generation","steady":"train/steady"}'
+  # Assumption: optimizer-step work is fixed across all resource tiers.
+  DLROVER_SWANLAB_ASSUME_FIXED_BATCH: "true"
+  DLROVER_SWANLAB_KEYS: '{"work":"global_step","target_work":"max_steps","train_speed":"train_speed"}'

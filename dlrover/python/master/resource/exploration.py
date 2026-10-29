@@ -425,6 +425,7 @@ class Exploration:
                     or training["unit"] != state["baseline"]["training"]["unit"]
                     or training["target_work"] != state["baseline"]["training"]["target_work"]
                     or training.get("global_batch_size") != state["baseline"]["training"].get("global_batch_size")
+                    or training.get("global_batch_size_fixed") != state["baseline"]["training"].get("global_batch_size_fixed")
                     or start["observed_at"] < state["observation_after"]
                     or start["observed_at"] < state["last_window_end"]):
                 return self._wait("execution_or_window_mismatch")

@@ -132,9 +132,7 @@ Content-Type: application/json
   "taskScalarList": [
     {"key": "train/global_step"},
     {"key": "train/total_steps"},
-    {"key": "train/global_batch_size"},
-    {"key": "train/generation"},
-    {"key": "train/steady"}
+    {"key": "train/global_batch_size"}
   ]
 }
 ```
@@ -144,6 +142,29 @@ Content-Type: application/json
 `index` 不作为 global step，`epoch` 不作为恢复代次。
 `train/token_acc` 是准确率，不作为训练产出；`train/remaining_time` 不代替固定总训练目标。
 本客户端首期只生成 steps 口径，不能通过把 work key 改成 token_acc 或 token 数改变单位。
+
+### 固定 global batch size 的平台接入
+
+当前平台只提供 `global_step`、`max_steps`、`train_speed`（单位 step/s），没有 global_batch_size。
+按本任务约定，扩缩容前后 optimizer step 工作量保持不变，使用：
+
+```yaml
+DLROVER_SWANLAB_ASSUME_FIXED_BATCH: "true"
+DLROVER_SWANLAB_KEYS: '{"work":"global_step","target_work":"max_steps","train_speed":"train_speed"}'
+```
+
+此模式只请求上述三个指标，不要求 global_batch_size，也不伪造数值。归一化训练数据携带
+`global_batch_size_fixed=true`、`batch_size_source=assumed_fixed`，日志和事件保留该假设。
+默认不开启此假设，旧的在线 batch-size 校验模式继续可用；验证示例已按当前平台配置开启。
+
+收益计算与稳态判断仍使用 `Δglobal_step / ΔcreateTime`，避免瞬时或平滑后的 train_speed
+掩盖停滞、恢复或重放。返回的最新 train_speed 作为 `reported_train_speed` 记录，
+`speed_relative_difference` 为它与窗口吞吐的相对差异，供核对，差异本身不直接决定放行。
+train_speed 必须是有限正数，三类指标仍需按采样批次精确对齐。
+剩余工作量为 `max_steps - global_step`；elapsed time 和 remaining time 不属于当前必需查询指标。
+
+探索基线与观测必须采用一致的 batch 假设，不可在同一探索中切换该开关。
+固定 step 工作量不自动证明模型、数据集或并行语义一致，证据服务仍需提供 comparable。
 
 ### Master 配置
 
@@ -174,7 +195,12 @@ Master 将解析结果传入当前任务的收益客户端环境配置 `LOW_CODE
 | DLROVER_SWANLAB_HTTP_URL | 空 | 完整 scalar 接口 URL；非空开启独立训练数据获取 |
 | DLROVER_SWANLAB_HTTP_TOKEN | 空 | 可选 Bearer token，与收益证据服务 token 分离 |
 | DLROVER_SWANLAB_UTC_OFFSET | +08:00 | createTime 无时区时使用的 UTC 偏移 |
-| DLROVER_SWANLAB_KEYS | {} | JSON 对象，将内部字段映射到实际训练 key |
+| DLROVER_SWANLAB_KEYS | {} | 可映射 work、target_work、global_batch_size、train_speed；按模式请求三项，旧 generation/steady/observed_at 映射忽略 |
+| DLROVER_SWANLAB_ASSUME_FIXED_BATCH | false | 显式 true 时假设全任务 step 工作量固定，改为获取 global_step、max_steps、train_speed |
+| DLROVER_SWANLAB_TIME_SOURCE | sample | 已确认 createTime 为采样时间；显式 unknown/ingestion 返回 unknown |
+| DLROVER_SWANLAB_WARMUP_SECONDS | 60 | 当前代次开始、恢复确认两者较晚时间之后的预热秒数 |
+| DLROVER_SWANLAB_STEADY_WINDOWS | 2 | 判断稳定所需的非重叠子窗口数，至少 2 |
+| DLROVER_SWANLAB_MAX_THROUGHPUT_VARIATION | 0.1 | 子窗口吞吐的 (最大值−最小值)/最小值 上限 |
 
 例如：
 
@@ -187,7 +213,7 @@ env:
   - name: DLROVER_SWANLAB_HTTP_URL
     value: "http://metrics-service/metrics/scalar/by-task-name"
   - name: DLROVER_SWANLAB_KEYS
-    value: '{"work":"train/global_step","target_work":"train/total_steps","global_batch_size":"train/global_batch_size","generation":"train/generation","steady":"train/steady"}'
+    value: '{"work":"train/global_step","target_work":"train/total_steps","global_batch_size":"train/global_batch_size"}'
 ```
 
 内部字段及默认 key 如下：
@@ -197,57 +223,42 @@ env:
 | work | train/global_step | 已完成的 optimizer step，checkpoint 恢复后继承其进度 |
 | target_work | train/total_steps | 固定训练目标 |
 | global_batch_size | train/global_batch_size | 每个 optimizer step 实际处理的全局样本数 |
-| generation | train/generation | DLRover 为当前训练代次生成的整数标识 |
-| steady | train/steady | 0 为恢复、重放或预热中；1 为可用于稳态测量 |
-| observed_at | 默认使用 createTime | 可映射到如 train/observed_at，值为训练采样 Unix 秒 |
+| generation | DLRover 内部上下文 | 当前训练 rendezvous 的代次；不向 SwanLab 请求 |
+| steady | DLRover 推断 | 恢复、预热、进度和连续窗口吞吐检查通过后为 true |
+| observed_at | createTime | 必须是采样时间，不能使用接口请求时间或入库时间 |
 
-如果 createTime 后续改成服务入库时间，应设置
-`"observed_at":"train/observed_at"` 并由训练端同步上报。
-HTTP 超时、窗口长度和时效阈值沿用 DLROVER_BENEFIT 配置；两次 HTTP 各自受超时约束。
-未配置 scalar URL 时保留原完整快照模式；配置后任何 scalar 获取失败都不回退使用远端旧 training 数据。
+### 代次边界与推断稳态
 
-### generation 生成与训练端上报
+Master 在训练 rendezvous 完成时同时记录 generation 和开始时间，并原子读取二者。
+从 SwanLab 返回的数据仅选择当前代次开始时间之后、且晚于预热下界的数据。
+不直接给全部历史数据附加当前 generation。generation 仍经 Agent 传递到训练进程，
+但 SwanLab 不再要求上报 `train/generation`、`train/steady` 或 `train/observed_at`。
+现有 `training_metric_payload()` 可继续使用，其中这三个额外字段不参与 scalar 查询。
 
-训练 rendezvous 每次完成时，由 DLRover Master 生成新的随机整数代次，范围为
-`1 .. 2^53-1`，可由 float64 scalar 链路精确表示。RPC 中以字符串传递。
-同一轮全部 rank 共用；首次训练、扩缩容、回退、故障后重新 rendezvous 都更新代次。
-Agent 在启动训练进程前设置 `DLROVER_TRAIN_GENERATION`，训练子进程继承。
-网络检查 rendezvous 不覆盖训练代次。此链路适用于 DLRover Master rendezvous launcher；
-绕过该 launcher 的自定义训练入口需要接入相同代次机制。
+已确认真实 SwanLab 接口的 `createTime` 是采样时间，因此 `DLROVER_SWANLAB_TIME_SOURCE` 默认值为 `sample`。
+显式设置 unknown/ingestion 时仍返回 `untrusted_sample_time`，包括 mock 模式。Master 与采样端需要时钟同步，
+否则不能可靠地用代次边界归属采样点。若服务返回入库时间，
+需先改进时间语义；当前实现不会以请求时间估算吞吐，也不会在 enforce 下放行未知数据。
 
-仓库不包含用户的 SwanLab 训练上报实现。训练脚本应在 global rank 0、完成 optimizer step 后，
-将辅助函数返回的指标与原有指标放进同一次日志上报：
+稳态准入流程：
 
-```python
-from dlrover.python.common.training_metrics import training_metric_payload
+1. 获取当前 generation 和开始时间；未完成训练 rendezvous 或边界缺失则 unknown。
+2. 垂直调整进入 checkpoint 阶段后阻止观测；替换 worker 的连续进度确认恢复后记录恢复时间。
+   恢复超时或未验证不会被当作恢复完成。首次训练则以 rendezvous 边界和后续有效进度判断。
+3. 以 `max(代次开始时间, 恢复确认时间) + 预热秒数` 为采样下界，探索还需满足 observation_after 和上一窗口终点约束。
+4. 同批三个指标的 `(epoch, createTime)` 必须精确对齐。要求至少 N+1 个独立采样点，
+   总步数和 global batch size 一致、进度不回退、每个子窗口均有正进度。
+5. 从最新点向前选取 N 个不重叠子窗口，每段至少 `min_window/N` 秒，
+   因而总体跨度至少 min_window 秒。默认 N=2，吞吐相对波动不超过 10%。
+   批次配置变化或采样间隔超过 max_age 时重新积累稳态窗口，重复点不会增加证据。
+6. 通过后生成内部 `steady=true`、`steady_source=inferred`、`time_source=sample`，
+   并附加 Master generation。请求期间代次或恢复上下文改变，本次评估作废。
 
-# 与已有 SwanLab log 调用合并；其他 rank 不重复上报。
-metrics = training_metric_payload(
-    global_step=global_step,
-    total_steps=total_steps,
-    global_batch_size=actual_global_batch_size,
-    steady=restore_replay_and_warmup_finished,
-)
-swanlab.log(metrics)
-```
+数据新鲜度依然由采样时间计算。HTTP 超时、最小总窗口和数据时效沿用 DLROVER_BENEFIT 配置。
+未配置 scalar URL 且未开启 mock 时保留原完整快照模式；启用后失败不回退使用旧 training 数据。
 
-函数读取 DLRover 环境变量，不接受用户自己生成的代次；未取得有效代次时报错。
-辅助函数默认也生成 `train/observed_at`，Master 可按需请求该 key。
-若使用自定义 key，训练端也配置相同的 `DLROVER_SWANLAB_KEYS`，或传入 `keys` 参数。
-`steady` 默认 false，不能为通过收益校验而在恢复或重放期间写死为 true。
-
-服务端必须为一次日志批次保留相同的 `(epoch, createTime)`，并返回该批次的所有被请求指标。
-适配层以此关联 generation 与进度，绝不按数组位置、最近时间或最新 generation 给历史点补标签。
-不同 key 的 index 可以不同。如服务不保留共同批次标识，需先调整服务端存储/返回逻辑；
-此时客户端会返回 unknown，不推测数据关联。
-
-窗口仅选取 Master 当前 generation 的数据，校验完整批次、稳态标志、单调进度、
-一致的总步数和实际 global batch size。重复相同点去重，冲突点、过期或缺失数据拒绝使用。
-探索时还限定窗口在恢复完成之后、且不与已接受窗口重叠；前后 global batch size 不一致拒绝比较。
-模型、数据集和并行语义的可比性仍由证据服务核实，不能仅凭这些 scalar 证明。
-
-Master 重启后不会从 SwanLab 历史数据猜测当前 generation；未建立新的训练 rendezvous 时，
-无法获得当前代次，收益评估返回 unknown。未完成探索继续受 journal 保护，需按恢复流程处理。
+这是推断稳态，不是训练框架明确上报的稳态证明；模型、数据集和并行语义的可比性仍由证据服务核实。
+Master 重启后，在新训练 rendezvous 建立之前没有可靠代次边界，收益评估返回 unknown。
 
 ### 与原收益 HTTP 契约组合
 

@@ -12,8 +12,11 @@ from dlrover.python.common.constants import VerticalElasticPhaseType as Phase
 
 
 class VerticalExecutionMetrics:
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, wall_clock=time.time):
         self._clock = clock
+        self._wall_clock = wall_clock
+        self._observation_ready = True
+        self._recovered_at = 0
         self.events = None
         self._lock = threading.Lock()
         self._registry = CollectorRegistry()
@@ -179,6 +182,8 @@ class VerticalExecutionMetrics:
         with self._lock:
             if not self._active or phase == self._phase:
                 return
+            if phase in (Phase.SAVE_CHECKPOINT, Phase.REPLACING_WORKERS):
+                self._observation_ready = False
             now = self._clock()
             self.phase_duration.labels(
                 self._action, self._phase, "advanced"
@@ -252,8 +257,13 @@ class VerticalExecutionMetrics:
                     ).observe(elapsed)
                     observed.add(operation)
 
+    def training_observation_status(self):
+        with self._lock:
+            return dict(recovery_ready=self._observation_ready, recovered_at=self._recovered_at)
+
     def await_recovery(self, targets, checkpoint_step, timeout):
         with self._lock:
+            self._observation_ready = False
             self._recovery = {
                 "action": self._action, "targets": set(targets),
                 "baseline": checkpoint_step, "reports": {},
@@ -269,6 +279,9 @@ class VerticalExecutionMetrics:
         recovery = self._recovery
         if recovery is None:
             return
+        self._observation_ready = result == "recovered"
+        if self._observation_ready:
+            self._recovered_at = self._wall_clock()
         action = recovery["action"]
         self.recovery.labels(action, result).inc()
         if result == "recovered":

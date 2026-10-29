@@ -38,22 +38,31 @@ class SwanLabTrainingMetrics:
         self.mock_file = env.get("DLROVER_SWANLAB_MOCK_FILE", "")
         self.token = env.get("DLROVER_SWANLAB_HTTP_TOKEN", "")
         self.post = post or requests.post
-        self.keys = dict(TRAINING_METRIC_KEYS)
-        # The deployed API's createTime is a training sampling timestamp.
-        self.keys["observed_at"] = None
+        self.assume_fixed_batch = env.get("DLROVER_SWANLAB_ASSUME_FIXED_BATCH", "false").strip().lower() == "true"
+        self.keys = {name: TRAINING_METRIC_KEYS[name]
+                     for name in ("work", "target_work", "global_batch_size")}
+        if self.assume_fixed_batch:
+            self.keys = dict(work="global_step", target_work="max_steps", train_speed="train_speed")
+        self.time_source = env.get("DLROVER_SWANLAB_TIME_SOURCE", "sample")
         self.utc_offset = env.get("DLROVER_SWANLAB_UTC_OFFSET", "+08:00")
         self._log = BenefitLogger("swanlab")
         self.valid = True
         try:
+            self.warmup = float(env.get("DLROVER_SWANLAB_WARMUP_SECONDS", "60"))
+            self.steady_windows = int(env.get("DLROVER_SWANLAB_STEADY_WINDOWS", "2"))
+            self.max_variation = float(env.get("DLROVER_SWANLAB_MAX_THROUGHPUT_VARIATION", "0.1"))
+            if (not math.isfinite(self.warmup) or self.warmup < 0
+                    or self.steady_windows < 2
+                    or not math.isfinite(self.max_variation) or not 0 <= self.max_variation <= 1):
+                raise ValueError("invalid_steady_configuration")
             overrides = json.loads(env.get("DLROVER_SWANLAB_KEYS", "{}"))
-            if not isinstance(overrides, dict) or set(overrides) - set(self.keys):
+            if not isinstance(overrides, dict) or set(overrides) - (set(TRAINING_METRIC_KEYS) | {"train_speed"}):
                 raise ValueError("invalid_key_mapping")
-            self.keys.update(overrides)
-            required = {k: v for k, v in self.keys.items() if k != "observed_at" or v is not None}
-            if (not all(isinstance(v, str) and v for v in required.values())
-                    or len(set(required.values())) != len(required)):
+            # Legacy generation/steady/observed_at mappings are not requested.
+            self.keys.update({k: v for k, v in overrides.items() if k in self.keys})
+            if (not all(isinstance(v, str) and v for v in self.keys.values())
+                    or len(set(self.keys.values())) != len(self.keys)):
                 raise ValueError("invalid_key_mapping")
-            self.keys = required
             offset = datetime.fromisoformat("2000-01-01T00:00:00" + self.utc_offset)
             if offset.tzinfo is None:
                 raise ValueError("missing_timezone")
@@ -71,7 +80,7 @@ class SwanLabTrainingMetrics:
             self.valid = False
 
     def fetch(self, generation, clock, timeout, max_age, min_window, after=0,
-              plan_id=None, request_id=None):
+              plan_id=None, request_id=None, training_context=None):
         started = time.monotonic()
         context = dict(task_id=self.task_id, generation=generation,
                        plan_id=plan_id, request_id=request_id)
@@ -110,7 +119,7 @@ class SwanLabTrainingMetrics:
                 except (requests.RequestException, ValueError) as error:
                     raise TrainingMetricsUnavailable("swanlab_http_or_payload_error") from error
             stage = "window"
-            window = self.window(rows, generation, clock(), max_age, min_window, after)
+            window = self.window(rows, generation, clock(), max_age, min_window, after, training_context)
         except TrainingMetricsUnavailable as error:
             cause = error.__cause__
             self._log.emit(
@@ -129,26 +138,48 @@ class SwanLabTrainingMetrics:
             http_status=status, 
             series_count=len(rows),
             sample_count=sum(len(row["scalarMetricsList"]) for row in rows),
+            steady_source="inferred", time_source=self.time_source,
+            steady_windows=self.steady_windows, warmup_seconds=self.warmup,
             window_start=start["observed_at"], 
             window_end=end["observed_at"],
             work_start=start["work"], 
             work_end=end["work"],
             throughput=(end["work"] - start["work"]) / (end["observed_at"] - start["observed_at"]),
             target_work=window["target_work"], 
-            global_batch_size=window["global_batch_size"],
+            global_batch_size=window.get("global_batch_size"),
+            batch_size_source=window.get("batch_size_source", "measured"),
+            reported_train_speed=window.get("reported_train_speed"),
+            speed_relative_difference=window.get("speed_relative_difference"),
             duration_ms=round((time.monotonic() - started) * 1000, 3), **context,
         )
         if self.mock:
             window["data_source"] = "mock"
         return window
 
-    def window(self, rows, generation, now, max_age, min_window, after=0):
-        """Require exact (epoch, createTime) alignment, never positional joins.
+    def window(self, rows, generation, now, max_age, min_window, after=0,
+               training_context=None):
+        """Infer steady progress from aligned, post-recovery sampling times.
 
-        The service must preserve a common epoch/createTime for each log batch.
-        createTime is the sampling time unless an observed_at scalar is mapped.
-        Conflicting duplicates or missing batches fail closed.
+        createTime must be confirmed as sampling time, not ingestion time.
+        Generation is supplied by Master and never inferred from HTTP history.
         """
+        if not self.valid:
+            raise TrainingMetricsUnavailable("invalid_swanlab_configuration")
+        if self.time_source != "sample":
+            raise TrainingMetricsUnavailable("untrusted_sample_time")
+        context = training_context or {}
+        if not generation or context.get("generation") != generation:
+            raise TrainingMetricsUnavailable("missing_or_changed_training_context")
+        started = context.get("started_at")
+        recovered = context.get("recovered_at", 0)
+        if (any(isinstance(v, bool) or not isinstance(v, (int, float))
+                or not math.isfinite(v) or v < 0 for v in (started, recovered))
+                or started <= 0 or max(started, recovered) > now):
+            raise TrainingMetricsUnavailable("invalid_generation_boundary")
+        if context.get("recovery_ready") is not True:
+            raise TrainingMetricsUnavailable("training_recovery_pending")
+        boundary = max(started, recovered) + self.warmup
+        lower = max(boundary, after)
         if not isinstance(rows, list):
             raise TrainingMetricsUnavailable("invalid_scalar_response")
         series = {}
@@ -170,7 +201,18 @@ class SwanLabTrainingMetrics:
                 if (isinstance(epoch, bool) or not isinstance(epoch, (int, str))
                         or not isinstance(created, str) or not created):
                     raise TrainingMetricsUnavailable("missing_sample_identity")
-                identity = (epoch, created)
+                try:
+                    timestamp = datetime.fromisoformat(created)
+                    if timestamp.tzinfo is None:
+                        timestamp = datetime.fromisoformat(created + self.utc_offset)
+                    observed = timestamp.timestamp()
+                except (ValueError, OverflowError, OSError) as error:
+                    raise TrainingMetricsUnavailable("invalid_sample_time") from error
+                if not 0 < observed <= now:
+                    raise TrainingMetricsUnavailable("invalid_sample_time")
+                if observed < lower or observed <= started:
+                    continue
+                identity = (epoch, observed)
                 value = scalar(point.get("data"))
                 if identity in values and values[identity] != value:
                     raise TrainingMetricsUnavailable("conflicting_scalar_sample")
@@ -178,38 +220,21 @@ class SwanLabTrainingMetrics:
             series[key] = values
         if set(series) != set(reverse):
             raise TrainingMetricsUnavailable("missing_training_keys")
-        batches = set()
-        for batch, gen in series[self.keys["generation"]].items():
-            if not gen.is_integer() or not 0 < gen < 2**53:
-                raise TrainingMetricsUnavailable("invalid_generation")
-            if str(int(gen)) == generation:
-                batches.add(batch)
-        # Incomplete batches are not silently bridged into a steady window.
-        # Legacy/other-generation history need not contain the new scalar keys.
-        if any(not batches.issubset(points) for points in series.values()):
+        batches = set().union(*(set(points) for points in series.values()))
+        if any(set(points) != batches for points in series.values()):
             raise TrainingMetricsUnavailable("unaligned_scalar_samples")
         samples = []
         for batch in batches:
             sample = {name: series[key][batch] for name, key in self.keys.items()}
-            if "observed_at" not in sample:
-                try:
-                    timestamp = datetime.fromisoformat(batch[1])
-                    if timestamp.tzinfo is None:
-                        timestamp = datetime.fromisoformat(batch[1] + self.utc_offset)
-                    sample["observed_at"] = timestamp.timestamp()
-                except (ValueError, OverflowError, OSError) as error:
-                    raise TrainingMetricsUnavailable("invalid_sample_time") from error
-            for name in ("work", "target_work", "global_batch_size"):
-                value = sample[name]
-                if not value.is_integer() or value >= 2**53:
-                    raise TrainingMetricsUnavailable("invalid_step_counter")
-            if (sample["global_batch_size"] <= 0 or sample["target_work"] <= 0
-                    or sample["work"] > sample["target_work"]
-                    or sample["steady"] not in (0, 1)
-                    or not 0 < sample["observed_at"] <= now):
+            sample["observed_at"] = batch[1]
+            if any(not sample[name].is_integer() or sample[name] >= 2**53
+                   for name in ("work", "target_work", "global_batch_size") if name in sample):
+                raise TrainingMetricsUnavailable("invalid_step_counter")
+            if (sample.get("global_batch_size", 1) <= 0 or sample.get("train_speed", 1) <= 0
+                    or sample["target_work"] <= 0
+                    or sample["work"] > sample["target_work"]):
                 raise TrainingMetricsUnavailable("invalid_training_sample")
-            if sample["observed_at"] >= after:
-                samples.append(sample)
+            samples.append(sample)
         samples.sort(key=lambda point: point["observed_at"])
         if not samples or now - samples[-1]["observed_at"] > max_age:
             raise TrainingMetricsUnavailable("stale_or_missing_generation")
@@ -223,23 +248,40 @@ class SwanLabTrainingMetrics:
                     raise TrainingMetricsUnavailable("conflicting_training_sample")
                 if point["work"] < previous["work"]:
                     raise TrainingMetricsUnavailable("progress_regressed_within_generation")
-                if any(point[key] != previous[key] for key in ("target_work", "global_batch_size")):
+                if (point["observed_at"] - previous["observed_at"] > max_age
+                        or any(point[k] != previous[k] for k in ("target_work", "global_batch_size") if k in point)):
                     stable = []
-            if point["steady"] != 1:
-                stable = []
-            else:
-                stable.append(point)
-        if len(stable) < 2:
+            stable.append(point)
+        if len(stable) < self.steady_windows + 1:
             raise TrainingMetricsUnavailable("insufficient_steady_samples")
-        end = stable[-1]
-        starts = [p for p in stable[:-1]
-                  if end["observed_at"] - p["observed_at"] >= min_window]
-        if not starts or end["work"] <= starts[-1]["work"]:
+        # Nonoverlapping subwindows cover at least min_window seconds in total.
+        ends = [stable[-1]]
+        interval = min_window / self.steady_windows
+        for point in reversed(stable[:-1]):
+            if ends[-1]["observed_at"] - point["observed_at"] >= interval:
+                ends.append(point)
+                if len(ends) == self.steady_windows + 1:
+                    break
+        if len(ends) != self.steady_windows + 1:
             raise TrainingMetricsUnavailable("insufficient_progress_window")
-        start = starts[-1]
-        return dict(
-            unit="steps", target_work=end["target_work"],
-            steady=True, global_batch_size=end["global_batch_size"],
+        rates = [(end["work"] - start["work"]) / (end["observed_at"] - start["observed_at"])
+                 for end, start in zip(ends, ends[1:])]
+        if min(rates) <= 0:
+            raise TrainingMetricsUnavailable("no_progress")
+        if (max(rates) - min(rates)) / min(rates) > self.max_variation:
+            raise TrainingMetricsUnavailable("unstable_throughput")
+        start, end = ends[-1], ends[0]
+        result = dict(
+            unit="steps", target_work=end["target_work"], steady=True,
+            steady_source="inferred", time_source="sample", steady_windows=self.steady_windows,
             start=dict(generation=generation, observed_at=start["observed_at"], work=start["work"]),
             end=dict(generation=generation, observed_at=end["observed_at"], work=end["work"]),
         )
+        if self.assume_fixed_batch:
+            computed = (end["work"] - start["work"]) / (end["observed_at"] - start["observed_at"])
+            result.update(batch_size_source="assumed_fixed", global_batch_size_fixed=True,
+                          reported_train_speed=end["train_speed"],
+                          speed_relative_difference=abs(end["train_speed"] - computed) / computed)
+        else:
+            result["global_batch_size"] = end["global_batch_size"]
+        return result

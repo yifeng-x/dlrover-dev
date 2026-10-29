@@ -117,18 +117,15 @@ print(gpu_result.to_dict())
 在 global rank 0、optimizer step 完成后，与已有 SwanLab 日志合并为一次上报：
 
 ```python
-from dlrover.python.common.training_metrics import training_metric_payload
-
-metrics = training_metric_payload(
-    global_step=global_step,
-    total_steps=total_steps,
-    global_batch_size=actual_global_batch_size,
-    steady=restore_replay_and_warmup_finished,
-)
-swanlab.log(metrics)
+swanlab.log({
+    "train/global_step": global_step,
+    "train/total_steps": total_steps,
+    "train/global_batch_size": actual_global_batch_size,
+})
 ```
 
-变量由真实训练循环提供。generation 来自 Agent 设置的 `DLROVER_TRAIN_GENERATION`，不能在真实测试中固定为示例值。恢复、重放和预热期间 steady=false。若训练期间 global batch 改变，当前 steps 适配链路不能直接比较前后收益，应记录不可比并调整测试训练配置。
+三个变量由真实训练循环提供。同批指标需保留相同的采样时间和 epoch。generation 在 DLRover 内部管理，
+稳态由恢复、预热、连续窗口稳定性推断，不再要求训练侧上报 generation、steady、observed_at。
 
 ### 4.2 请求与返回检查
 
@@ -136,18 +133,18 @@ swanlab.log(metrics)
 curl --fail-with-body -X POST \
   'http://REPLACE-METRICS-SERVICE/metrics/scalar/by-task-name' \
   -H 'Content-Type: application/json' \
-  --data '{"taskId":"REPLACE-TASK-ID","taskScalarList":[{"key":"train/global_step"},{"key":"train/total_steps"},{"key":"train/global_batch_size"},{"key":"train/generation"},{"key":"train/steady"}]}'
+  --data '{"taskId":"REPLACE-TASK-ID","taskScalarList":[{"key":"train/global_step"},{"key":"train/total_steps"},{"key":"train/global_batch_size"}]}'
 ```
 
 有鉴权时按环境安全方式增加认证头。返回必须为按 key 分组的数组，每项包含对应 taskId/key/scalarMetricsList；每个点包含 data/createTime/epoch/index。同批所有 key 的 `(epoch, createTime)` 应相同，index 可不同，epoch 不等于 generation。
 
-默认使用 createTime 作为训练采样时间，时区为 +08:00。如 createTime 是入库时间，需将配置中的 observed_at 映射到 `train/observed_at`，并确保训练端同批上报该 key。
+已确认 createTime 为采样时间，DLROVER_SWANLAB_TIME_SOURCE 默认 sample；显式 unknown 或 ingestion 不参与收益判断。无时区的采样时间按配置时区解释，默认 +08:00。
 
 验证顺序：
 
-1. 第一次 rendezvous 后获取当前 generation 的完整数据；至少两个稳态采样点，间隔 ≥30 秒，窗口末端距当前 ≤60 秒。
+1. 第一次 rendezvous 后获取当前 generation 的完整数据；等待恢复确认与预热后，至少三个采样点形成两个不重叠子窗口，总跨度 ≥30 秒、吞吐波动 ≤10%，末端距当前 ≤60 秒。
 2. 检查全局步数单调增加、总步数和实际 global batch 不变；剩余工作量为总步数减窗口末端步数。
-3. 调整资源后 generation 改变，新窗口只使用新 generation；旧代次即使时间很近也不能混入。
+3. 调整资源后 generation 改变，新窗口必须在 DLRover 记录的新代次时间边界与预热下界之后。
 4. 修改 work key 为 `trainer/step`，训练上报与 Master 映射同时修改，应正常获取。只改一侧应 unknown，不能补零。
 5. 用测试接口代理或既有测试服务注入以下异常；不要污染生产训练数据。
 
@@ -155,8 +152,8 @@ curl --fail-with-body -X POST \
 | --- | --- | --- |
 | taskId 不一致、缺 key、重复冲突 key | unknown，拒绝调整 | evaluated.reason_code 与接口日志 |
 | 同批缺点、createTime/epoch 对不齐 | unknown，拒绝调整 | 不按最近时间拼接 |
-| 旧 generation、代次混合、进度回退 | unknown，拒绝调整 | 不产生有效吞吐 |
-| 窗口过短、末端过期、steady=0 | unknown，拒绝调整 | 等待后续完整稳态窗口 |
+| 代次边界缺失、请求期间代次改变、进度回退 | unknown，拒绝调整 | 不产生有效吞吐 |
+| 窗口过短、末端过期、吞吐不稳或未完成预热 | unknown，拒绝调整 | 等待后续完整稳态窗口 |
 | NaN/Infinity、非法计数 | unknown，拒绝调整 | 事件仍可序列化，非法数值不隐藏拒绝结果 |
 | 超时、非 200、非法 JSON | unknown，拒绝调整 | 不使用收益服务里的旧 training 兜底 |
 

@@ -25,6 +25,9 @@ def mock_env(path):
 def write_rows(path, client, times, generation="101", work_start=160, speed=2):
     data = rows(client, times, generation)
     for series in data:
+        if series["key"] == client.keys.get("train_speed"):
+            for point in series["scalarMetricsList"]:
+                point["data"] = str(speed)
         if series["key"] == client.keys["work"]:
             for point, stamp in zip(series["scalarMetricsList"], times):
                 point["data"] = str(work_start + speed * (stamp - times[0]))
@@ -41,13 +44,13 @@ def test_mock_requires_explicit_switch(tmp_path, switch):
     client = SwanLabTrainingMetrics(env, post)
     write_rows(path, client, [940, 970, 1000])
     post.return_value = response(rows(client, [940, 970, 1000]))
-    result = client.fetch("101", lambda: 1000, 3, 120, 60)
+    result = client.fetch("101", lambda: 1000, 3, 120, 60, training_context=dict(generation="101", started_at=800, recovery_ready=True, recovered_at=800))
     enabled = switch in ("true", " TRUE ")
     assert post.called is not enabled
     assert (result.get("data_source") == "mock") is enabled
 
 
-@pytest.mark.parametrize("failure", ["missing_file", "invalid_json", "wrong_task", "stale", "wrong_generation"])
+@pytest.mark.parametrize("failure", ["missing_file", "invalid_json", "wrong_task", "stale", "missing_context"])
 def test_mock_errors_never_fall_back_to_http(tmp_path, failure):
     path = tmp_path / "rows.json"
     post = MagicMock()
@@ -61,8 +64,8 @@ def test_mock_errors_never_fall_back_to_http(tmp_path, failure):
         data[0]["taskId"] = "another-task"
         path.write_text(json.dumps(data))
     with pytest.raises(TrainingMetricsUnavailable):
-        client.fetch("202" if failure == "wrong_generation" else "101",
-                     lambda: 2000 if failure == "stale" else 1000, 3, 120, 60)
+        client.fetch("202" if failure == "missing_context" else "101",
+                     lambda: 2000 if failure == "stale" else 1000, 3, 120, 60, training_context=None if failure == "missing_context" else dict(generation="101", started_at=800, recovery_ready=True, recovered_at=800))
     post.assert_not_called()
 
 
@@ -71,7 +74,7 @@ def test_mock_still_requires_task_label(tmp_path):
     assert gate.training_metrics is not None
     assert not gate.training_metrics.valid
     with pytest.raises(TrainingMetricsUnavailable):
-        gate.training_metrics.fetch("101", lambda: 1000, 3, 120, 60)
+        gate.training_metrics.fetch("101", lambda: 1000, 3, 120, 60, training_context=dict(generation="101", started_at=800, recovery_ready=True, recovered_at=800))
 
 
 @pytest.mark.parametrize("candidate,allowed", [(4, True), (1, False)])
@@ -85,6 +88,7 @@ def test_mock_drives_real_benefit_gate_before_execution(tmp_path, candidate, all
     gate = BenefitGuard(
         job={"job_uid": "job"}, platform_task_id="test-task", clock=lambda: 1000,
         generation_provider=lambda: "101", post=evidence,
+        training_context_provider=lambda: dict(generation="101", started_at=800),
         environ={**mock_env(path), "DLROVER_BENEFIT_MODE": "enforce",
                  "DLROVER_BENEFIT_HTTP_URL": "http://benefit.test/snapshot"},
     )
@@ -121,10 +125,14 @@ def test_mock_drives_real_benefit_gate_before_execution(tmp_path, candidate, all
 
 
 @pytest.mark.parametrize("speed,outcome", [(2, "ACCEPTED"), (0.5, "rollback")])
-def test_mock_exploration_requires_new_windows_and_verifies_rollback(trial, tmp_path, speed, outcome):
+@pytest.mark.parametrize("fixed_batch", [False, True])
+def test_mock_exploration_requires_new_windows_and_verifies_rollback(trial, tmp_path, speed, outcome, fixed_batch):
     path = tmp_path / "rows.json"
     data = admission(trial)
     data["training"].update(target_work=10000, global_batch_size=64)
+    if fixed_batch:
+        data["training"].pop("global_batch_size")
+        data["training"].update(global_batch_size_fixed=True, batch_size_source="assumed_fixed")
     for point in ("start", "end"):
         data["training"][point]["generation"] = "101"
     trial.guard.last_result = evaluate(data, trial.guard.last_request, 1000)
@@ -134,7 +142,9 @@ def test_mock_exploration_requires_new_windows_and_verifies_rollback(trial, tmp_
     trial.observing()
     generation = ["202"]
     trial.guard.generation_provider = lambda: generation[0]
-    client = SwanLabTrainingMetrics(mock_env(path), MagicMock())
+    trial.guard.training_context_provider = lambda: dict(generation=generation[0], started_at=1100)
+    client = SwanLabTrainingMetrics({**mock_env(path),
+        "DLROVER_SWANLAB_ASSUME_FIXED_BATCH": "true" if fixed_batch else "false"}, MagicMock())
     trial.guard.training_metrics = client
     def evidence(url, **kwargs):
         now = trial.test_clock[0]

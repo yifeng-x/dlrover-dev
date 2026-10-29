@@ -35,7 +35,7 @@ def test_swanlab_logs_window_and_correlation_without_secrets(logs):
     client = SwanLabTrainingMetrics({**ENV, "DLROVER_SWANLAB_HTTP_URL":
                                     "https://example.test/scalars?token=URL_SECRET"})
     client.post = MagicMock(return_value=response(rows(client, [940, 970, 1000])))
-    client.fetch("101", lambda: 1000, 3, 120, 60, plan_id="plan", request_id="request")
+    client.fetch("101", lambda: 1000, 3, 120, 60, plan_id="plan", request_id="request", training_context=dict(generation="101", started_at=800, recovery_ready=True, recovered_at=800))
     event = next(record for record in logs if record["event"] == "window_selected")
     assert event["plan_id"] == "plan"
     assert event["request_id"] == "request"
@@ -63,7 +63,7 @@ def test_swanlab_failure_stage_and_no_exception_body(logs, failure, stage, statu
     if failure == "timeout":
         client.post.side_effect = requests.Timeout("PRIVATE_RESPONSE_BODY")
     with pytest.raises(TrainingMetricsUnavailable):
-        client.fetch("101", lambda: 1000, 3, 120, 60)
+        client.fetch("101", lambda: 1000, 3, 120, 60, training_context=dict(generation="101", started_at=800, recovery_ready=True, recovered_at=800))
     event = next(record for record in logs if record["event"] == "fetch_failed")
     assert event["stage"] == stage
     assert event["http_status"] == status
@@ -73,6 +73,7 @@ def test_swanlab_failure_stage_and_no_exception_body(logs, failure, stage, statu
 def test_guard_propagates_request_identity_and_excludes_provider_fields(logs):
     gate = guard()
     gate.generation_provider = lambda: "101"
+    gate.training_context_provider = lambda: dict(generation="101", started_at=800)
     client = SwanLabTrainingMetrics(ENV)
     client.post = MagicMock(return_value=response(rows(client, [940, 970, 1000])))
     gate.training_metrics = client
@@ -112,7 +113,7 @@ def test_logging_failure_cannot_change_fetch_result():
     with patch("dlrover.python.master.resource.benefit_log.logger") as logger:
         for method in (logger.debug, logger.info, logger.warning):
             method.side_effect = RuntimeError("log sink unavailable")
-        assert client.fetch("101", lambda: 1000, 3, 120, 60)["end"]["work"] == 280
+        assert client.fetch("101", lambda: 1000, 3, 120, 60, training_context=dict(generation="101", started_at=800, recovery_ready=True, recovered_at=800))["end"]["work"] == 280
 
 
 def test_exploration_admission_and_wait_reasons(trial, logs):

@@ -20,7 +20,7 @@
 | --- | --- | --- | --- |
 | 已完成训练步数 | `train/global_step` → `training.start/end.work` | 已完成的 optimizer step | SwanLab 接口 |
 | 总训练步数 | `train/total_steps` → `training.target_work` | 本次训练的固定目标，step | SwanLab 接口 |
-| 训练采样时间 | `createTime` → `start/end.observed_at` | 窗口起止时间，转换为 Unix 秒 | SwanLab 接口；可配置独立时间 key |
+| 训练采样时间 | `createTime` → `start/end.observed_at` | 窗口起止时间，转换为 Unix 秒 | SwanLab 接口；已确认是采样时间 |
 | 当前吞吐 q0 | `current_throughput` | 原配置稳定训练速度，steps/s | 根据进度和时间差计算 |
 | 候选吞吐 q1 | `candidate.throughput_lower` | 候选配置的保守吞吐，steps/s | 收益证据接口；探索时采用调整后实测值 |
 | 调整前 worker 数 | `current.workers` | 原配置 worker 数量 | DLRover |
@@ -74,8 +74,8 @@
 | 指标或条件 | 字段 | 用途与判断方式 |
 | --- | --- | --- |
 | 实际 global batch size | `train/global_batch_size` | 确保 step 工作量可比；检查窗口内一致，探索时还检查前后一致 |
-| 训练运行代次 | `train/generation` | 由 DLRover 生成；窗口两端必须属于 Master 当前代次 |
-| 是否处于稳定阶段 | `train/steady` → `training.steady` | 排除恢复、重放和预热阶段 |
+| 训练运行代次 | DLRover 内部 generation 与开始时间 | 按代次时间边界过滤历史，合格窗口附加当前代次 |
+| 是否处于稳定阶段 | DLRover 推断 → `training.steady` | 恢复确认、预热及连续子窗口吞吐稳定性检查 |
 | 训练配置是否可比 | `training.comparable` | 由证据服务确认模型、数据、并行方式等训练语义可比 |
 | GPU 资源类型 | `current/target.gpu_type` | 当前要求前后资源类型一致；该字符串不能独立证明硬件性能一致 |
 | 候选吞吐证据 | `candidate.evidence`、`candidate.evidence_id` | 要求来自可追溯的 trial、profile 或 history |
@@ -200,7 +200,12 @@
 
 ## 7. SwanLab 接口采集清单
 
-当前默认请求以下五个 key，实际 key 可通过 `DLROVER_SWANLAB_KEYS` 配置：
+当前平台固定 batch 模式开启 `DLROVER_SWANLAB_ASSUME_FIXED_BATCH=true` 后，请求
+`global_step`、`max_steps`、`train_speed`（step/s）。不需要在线 global_batch_size，
+但事件明确记录 `batch_size_source=assumed_fixed`。窗口吞吐继续由进度增量与采样时间计算，
+train_speed 用于交叉核对。以下为未开启该假设时的原指标模式。
+
+当前默认请求以下三个 key，实际 key 可通过 `DLROVER_SWANLAB_KEYS` 配置：
 
 ```json
 {
@@ -208,18 +213,18 @@
   "taskScalarList": [
     {"key": "train/global_step"},
     {"key": "train/total_steps"},
-    {"key": "train/global_batch_size"},
-    {"key": "train/generation"},
-    {"key": "train/steady"}
+    {"key": "train/global_batch_size"}
   ]
 }
 ```
 
-默认从每个采样点的 `createTime` 获取时间，无时区时默认按 `+08:00` 解释，可配置。若单独映射 `observed_at` 字段，例如映射到 `train/observed_at`，则额外请求该 key，并使用其 Unix 秒值计算窗口。
+已确认 `createTime` 为采样时间，默认 `DLROVER_SWANLAB_TIME_SOURCE=sample`，直接使用各采样点的 `createTime`。
+不使用请求时间或入库时间代替采样时间，也不请求 train/observed_at。
+同批三个指标需要保留共同的 `(epoch, createTime)`，不能按数组位置关联。
 
-同批上报的指标需要保留共同的 `(epoch, createTime)`，用于关联代次与训练进度；不同 key 的 index 可以不同。适配器不会将接口 index 当成 global step，也不会把 epoch 当成 generation。
-
-generation 由 DLRover Master 在训练 rendezvous 完成时生成，经 Agent 传给训练进程。训练脚本仍需调用上报辅助函数，将其与训练进度同批写入 SwanLab。仅有 Master 生成代次，并不能让历史训练数据自动具备可靠代次标签。
+generation 及其开始时间由 DLRover 内部提供，用于过滤旧数据；steady 由恢复确认、预热、
+连续进度和多个窗口吞吐波动推断。SwanLab 不需要返回 generation 或 steady。
+详细配置见 [HTTP 契约的代次边界与推断稳态](vertical-elastic-benefit-http-cn.md#代次边界与推断稳态)。
 
 ## 8. 当前未直接参与计算的指标与实现边界
 

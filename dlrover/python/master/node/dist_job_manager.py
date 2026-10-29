@@ -147,6 +147,7 @@ class DistributedJobManager(JobManager):
             "namespace": job_args.namespace, "cluster": job_args.cluster,
         })
         self.training_generation_provider = lambda: ""
+        self.training_context_provider = lambda: {}
         self._remove_exited_node = job_args.remove_exited_node
         node_restart_count: Dict[str, int] = {}
         for type, node_args in job_args.node_args.items():
@@ -752,6 +753,7 @@ class DistributedJobManager(JobManager):
             self._scaler,
             vertical_metrics=self.vertical_metrics,
             benefit_generation_provider=self.training_generation_provider,
+            benefit_context_provider=self.training_context_provider,
             benefit_task_id=getattr(self._job_args, "low_code_platform_task_id", ""),
             benefit_job={
                 "job_uid": self._job_args.job_uuid,

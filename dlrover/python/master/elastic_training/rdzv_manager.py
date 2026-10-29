@@ -141,6 +141,7 @@ class RendezvousManager(metaclass=ABCMeta):
         self._rdzv_params = RendezvousParameters(0, 0)
         self._rdzv_round = 0
         self._training_generation = ""
+        self._training_generation_started_at = 0
         self._workspace_rdzv_state = WorkspaceRendezvousState()
         self._node_unit = 1
         self._name = ""
@@ -171,6 +172,13 @@ class RendezvousManager(metaclass=ABCMeta):
     def get_training_generation(self):
         with self._lock:
             return self._training_generation if self._rdzv_nodes else ""
+
+    def get_training_context(self):
+        with self._lock:
+            return dict(
+                generation=self._training_generation if self._rdzv_nodes else "",
+                started_at=self._training_generation_started_at if self._rdzv_nodes else 0,
+            )
 
     def get_comm_world_with_generation(self, node_rank):
         # Bind world and generation atomically, including during re-rendezvous.
@@ -661,6 +669,7 @@ class ElasticTrainingRendezvousManager(RendezvousManager):
 
                     # Exactly representable by scalar float64 transports.
                     self._training_generation = str(secrets.randbelow(2**53 - 1) + 1)
+                    self._training_generation_started_at = time.time()
 
                     self._rdzv_nodes = self._topology_sorter.sort(
                         self._rdzv_nodes

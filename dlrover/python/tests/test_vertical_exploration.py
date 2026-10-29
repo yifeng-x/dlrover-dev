@@ -191,6 +191,7 @@ def test_exploration_observes_real_scalar_contract(trial):
     trial.test_clock[0] = 1120
     trial.observing()
     trial.guard.generation_provider = lambda: "202"
+    trial.guard.training_context_provider = lambda: dict(generation="202", started_at=1100)
 
     def post(url, **kwargs):
         now = trial.test_clock[0]

@@ -310,6 +310,9 @@ class DistributedJobMaster(JobMaster):
             self.job_manager.training_generation_provider = self.rdzv_managers[
                 RendezvousName.TRAINING
             ].get_training_generation
+            self.job_manager.training_context_provider = self.rdzv_managers[
+                RendezvousName.TRAINING
+            ].get_training_context
         self.diagnosis_manager = DiagnosisMaster(args)
         self._event_reporter = get_event_reporter()
         self.job_metric_collector = self._create_metric_collector_if_needed(

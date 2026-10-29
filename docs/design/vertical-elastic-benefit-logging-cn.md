@@ -21,7 +21,7 @@ rg 'fetch_failed|observation_wait|gate_decision|finished' master.log
 | --- | --- | --- |
 | 发起获取（DEBUG） | `fetch_started` | 超时、允许数据年龄、最小窗口、观察时间下界 |
 | 数据获取失败（WARNING） | `fetch_failed` | configuration/http/decode/window 阶段、状态码、错误类型、原因、耗时 |
-| 选中训练窗口 | `window_selected` | 指标序列数、返回采样点总数、窗口起止时间与步数、吞吐、目标步数、global batch size |
+| 选中训练窗口 | `window_selected` | 指标序列数、返回采样点总数、窗口起止时间与步数、吞吐、目标步数、global batch size、steady_source=inferred、time_source、稳态子窗口数及预热时长 |
 | 开始收益评估（DEBUG） | `evaluation_started` | 当前/目标资源、模式、目标、请求 ID |
 | 证据 HTTP | `evidence_response` / `evidence_failed` | 状态码、响应耗时或异常类型；成功响应为 DEBUG，失败为 WARNING |
 | 完成收益评估 | `evaluation_finished` | status/reason、估算值、最小收益比例、总耗时、operation |
