@@ -38,6 +38,7 @@ from dlrover.python.master.monitor.perf_monitor import PerfMonitor
 from dlrover.python.master.monitor.vertical_metrics import VerticalExecutionMetrics
 from dlrover.python.master.monitor.vertical_events import VerticalElasticEvents, resource_snapshot
 import uuid
+from dlrover.python.master.resource.benefit_log import BenefitLogger
 from dlrover.python.master.resource.benefit import BenefitGuard
 from dlrover.python.master.resource.exploration import Exploration, unpack
 from dlrover.python.master.node.job_context import get_job_context
@@ -190,6 +191,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         self._adjust_gpu_nums = 0
         self._scaling_lock = threading.Lock()
         self.vertical_metrics = vertical_metrics or VerticalExecutionMetrics()
+        self._benefit_log = BenefitLogger("execution")
         self.benefit_guard = benefit_guard or BenefitGuard()
         self.exploration = Exploration(self.benefit_guard)
         self._benefit_stop = threading.Event()
@@ -478,6 +480,12 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
 
     def _execute_resource_plan(self, plan, ckpt_wait_time, ckpt_check_sec, log_step,
                                rollback=False):
+        self._benefit_log.emit(
+            "execution_started",
+            plan_id=self.vertical_elastic_phase_manager.get_plan_id(),
+            rollback=rollback,
+            target_gpus=plan.node_group_resources[NodeType.WORKER].node_resource.gpu_num
+        )
         # Reuse the existing checkpoint/replacement protocol in both directions.
         self._adjust_gpu_nums = plan.node_group_resources[NodeType.WORKER].node_resource.gpu_num
         self._save_ckpt_status = False
@@ -502,6 +510,11 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             )
             return False
 
+        self._benefit_log.emit(
+            "checkpoint_ready",
+            plan_id=self.vertical_elastic_phase_manager.get_plan_id(),
+            checkpoint_step=self._save_ckpt_step
+        )
         # C. 执行计划
         try:
             if self.exploration.active:
@@ -522,6 +535,11 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
 
             self._wait_for_replacement_exits()
             self.execute_job_optimization_plan(plan)
+            self._benefit_log.emit(
+                "replacement_submitted",
+                plan_id=self.vertical_elastic_phase_manager.get_plan_id(),
+                target_workers=sorted(self._target_tunning_nodes)
+            )
 
             if self.exploration.active:
                 ckpt_wait_time = min(ckpt_wait_time, max(0, self.exploration.state["expires_at"] - self.exploration.clock()))
@@ -676,6 +694,13 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
     def _check_resource_benefit(self, plan, alive_num):
         guard = self.benefit_guard
         if guard.mode == "off":
+            self._benefit_log.emit(
+                "gate_decision",
+                plan_id=self.vertical_elastic_phase_manager.get_plan_id(),
+                mode="off", 
+                decision="allow", 
+                reason="disabled"
+            )
             self.events.evaluated(guard, True, False)
             return True
         allowed = guard.check(
@@ -702,6 +727,17 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             self.exploration.active
         )
         result = guard.last_result
+        self._benefit_log.emit(
+            "gate_decision", 
+            plan_id=self.vertical_elastic_phase_manager.get_plan_id(),
+            request_id=(guard.last_request or {}).get("request_id"), 
+            mode=guard.mode,
+            status=result.status, 
+            reason=result.reason,
+            decision="explore" if self.exploration.active else "allow" if allowed else "reject",
+            exploration_enabled=self.exploration.enabled, 
+            workers_healthy=healthy,
+        )
         self.vertical_metrics.benefit_evaluations.labels(
             guard.mode if guard.valid else "invalid", result.status, result.reason
         ).inc()

@@ -19,6 +19,7 @@ import time
 from dlrover.python.common.log import default_logger as logger
 from dlrover.python.common.node import NodeGroupResource, NodeResource
 from dlrover.python.master.resource.benefit import number
+from dlrover.python.master.resource.benefit_log import BenefitLogger
 
 TERMINAL = {"ACCEPTED", "RETAINED", "ROLLED_BACK"}
 
@@ -95,6 +96,7 @@ class TrialStore:
 class Exploration:
     def __init__(self, guard, env=None, clock=time.time):
         env = os.environ if env is None else env
+        self._log = BenefitLogger("exploration")
         self.guard = guard
         self.clock = clock
         # Startup switch: only explicit true enables trials. Keep journal
@@ -133,6 +135,18 @@ class Exploration:
             return True, True
 
     def enter(self, recovering=False):
+        allowed = self._enter(recovering)
+        self._log.emit(
+            "entry", 
+            recovering=recovering, 
+            allowed=allowed,
+            enabled=self.enabled, valid=self.valid,
+            plan_id=(self.state or {}).get("id"),
+            status=(self.state or {}).get("status")
+        )
+        return allowed
+
+    def _enter(self, recovering=False):
         """Called with scaler mutex held, also fences other Masters via PVC."""
         if not self.enabled and self.store is None:
             return not recovering
@@ -170,61 +184,89 @@ class Exploration:
             next_state["status"] = status
         self.store.save(next_state)
         self.state = next_state
-        logger.info("Vertical exploration id=%s status=%s reason=%s",
-                    self.state["id"], self.state["status"], self.state.get("reason", ""))
+        self._log.emit(
+            "state_saved", 
+            repeat_key=(
+                self.state["id"], 
+                self.state["status"],
+                self.state.get("windows"), 
+                self.state.get("reported")
+            ),
+            plan_id=self.state["id"], 
+            rollback_plan_id=self.state.get("rollback_plan_id"),
+            status=self.state["status"], 
+            reason=self.state.get("reason"),
+            windows=self.state.get("windows"), 
+            measured_lower=self.state.get("measured_lower"),
+            spent_gpu_seconds=self.state.get("spent_gpu_seconds"),
+            gpu_budget=self.state.get("gpu_budget"), 
+            reported=self.state.get("reported", False),
+        )
 
     def finish(self, status, reason):
         self.save(status, reason=reason, cooldown_until=self.clock() + self.cooldown)
         self.active = False
+        self._log.emit(
+            "finished", 
+            plan_id=self.state["id"], 
+            status=status, 
+            reason=reason,
+            windows=self.state.get("windows"),
+            spent_gpu_seconds=self.state.get("spent_gpu_seconds")
+        )
 
     def prepare(self, current, target, plan_id):
         """Only explicit missing candidate evidence can enter exploration."""
+        def reject(reason):
+            self._log.emit("admission", plan_id=plan_id, allowed=False, reason=reason)
+            return False
+
         if (not self.enabled or not self.valid or self.state is not None
                 or self.guard.mode != "enforce" or self.guard.objective not in ("time", "gpu_hours")
                 or self.guard.last_result.reason != "candidate_unavailable"
                 or self.store is None or self.store.lock is None):
-            return False
+            return reject("ineligible_or_disabled")
         snapshot = self.guard.last_snapshot
         try:
             admission = snapshot["exploration"]
             if not all(admission.get(k) is True for k in (
                 "allowed", "checkpoint_compatible", "rollback_supported", "quiescent_checkpoint"
             )):
-                return False
+                return reject("admission_conditions")
             tiers = admission["gpu_tiers"]
             if (not isinstance(tiers, list) or len(tiers) < 2 or
                     any(type(t) is not int or t <= 0 for t in tiers) or
                     tiers != sorted(set(tiers))):
-                return False
+                return reject("invalid_gpu_tiers")
             a, b = pack(current), pack(target)
             if abs(tiers.index(a["gpu_num"]) - tiers.index(b["gpu_num"])) != 1:
-                return False
+                return reject("nonadjacent_gpu_tiers")
             if {k: v for k, v in a.items() if k != "gpu_num"} != {
                 k: v for k, v in b.items() if k != "gpu_num"
             }:
-                return False
+                return reject("resource_shape_changed")
             rollback_seconds = number(admission, "rollback_seconds_upper", positive=True)
             rollback_gpu = number(admission, "rollback_gpu_seconds_upper", positive=True)
             limits = snapshot["limits"]
             baseline = self.guard.last_result.estimates["baseline_seconds"]
             if baseline <= self.duration + rollback_seconds:
-                return False
+                return reject("insufficient_remaining_time")
             if limits["max_delay_seconds"] < self.duration + rollback_seconds:
-                return False
+                return reject("delay_budget")
             deadline = limits.get("deadline_at")
             if deadline is not None and self.clock() + baseline + self.duration + rollback_seconds > deadline:
-                return False
+                return reject("deadline")
             gpu_budget = self.max_gpu_hours * 3600
             # Conservative budget includes reserved rollback capacity, not just
             # the GPUs doing useful work during the trial.
             trial_gpu = max(a["gpu_num"], b["gpu_num"]) * a["count"] * self.duration
             if trial_gpu + rollback_gpu > gpu_budget:
-                return False
+                return reject("gpu_budget")
             reservation = admission["rollback_reservation"]
             if (not isinstance(reservation.get("id"), str) or not reservation["id"]
                     or reservation.get("confirmed") is not True
                     or number(reservation, "expires_at") <= self.clock() + self.duration + rollback_seconds):
-                return False
+                return reject("rollback_reservation")
             self.state = dict(
                 version=1, id=plan_id, status="PREPARING", original=a, target=b,
                 started_at=self.clock(), expires_at=self.clock() + self.duration,
@@ -237,21 +279,47 @@ class Exploration:
             )
             self.store.save(self.state)
             self.active = True
+            self._log.emit(
+                "admission", 
+                plan_id=plan_id, 
+                allowed=True,
+                reason="eligible", 
+                baseline_throughput=self.state["q0"],
+                expires_at=self.state["expires_at"], 
+                gpu_budget=gpu_budget,
+                current_gpus=a["gpu_num"], 
+                target_gpus=b["gpu_num"]
+            )
             return True
         except (KeyError, TypeError, ValueError, OSError):
             # No resource mutation may follow an uncertain journal write.
             self.active = False
-            return False
+            return reject("invalid_evidence_or_journal")
 
     def authorize_mutation(self, rollback=False):
+        allowed = self._authorize_mutation(rollback)
+        self._log.emit(
+            "mutation_authorized", 
+            plan_id=self.state["id"],
+            rollback_plan_id=self.state.get("rollback_plan_id"),
+            rollback=rollback, 
+            allowed=allowed,
+            request_id=(self.guard.last_request or {}).get("request_id")
+        )
+        return allowed
+
+    def _authorize_mutation(self, rollback=False):
         """Refresh scheduler reservation immediately before replacing workers."""
         state = self.state
         current = unpack(state["target"] if rollback else state["original"])
         target = unpack(state["original"] if rollback else state["target"])
-        context = dict(id=state["id"], status=state["status"],
-                       reservation_id=state["reservation_id"],
-                       checkpoint_path=state["checkpoint_path"],
-                       authorize_mutation=True)
+        context = dict(
+            id=state["id"], 
+            status=state["status"],
+            reservation_id=state["reservation_id"],
+            checkpoint_path=state["checkpoint_path"],
+            authorize_mutation=True
+        )
         self.guard._check(current, target, state.get("rollback_plan_id", state["id"]), context)
         data, request = self.guard.last_snapshot, self.guard.last_request
         try:
@@ -290,6 +358,12 @@ class Exploration:
                     and ack.get("exploration_id") == state["id"]
                     and ack.get("request_id") == self.guard.last_request["request_id"]):
                 self.save(reported=True)
+            self._log.emit(
+                "result_reported", 
+                plan_id=state["id"],
+                acknowledged=self.state.get("reported", False),
+                request_id=(self.guard.last_request or {}).get("request_id")
+            )
         except Exception:
             logger.warning("Exploration reservation release notification failed")
 
@@ -303,6 +377,19 @@ class Exploration:
         self.save("VERIFYING_ROLLBACK" if rollback else "OBSERVING",
                   observation_after=self.clock(), last_window_end=0, windows=0,
                   observation_generation=None, measured_lower=None)
+
+    def _wait(self, reason):
+        self._log.emit(
+            "observation_wait", 
+            repeat_key=(self.state["id"], self.state["status"], reason),
+            plan_id=self.state["id"], 
+            status=self.state["status"], 
+            reason=reason,
+            request_id=(self.guard.last_request or {}).get("request_id"),
+            windows=self.state.get("windows"),
+            remaining_seconds=max(0, self.state["expires_at"] - self.clock())
+        )
+        return "wait"
 
     def inspect(self):
         """Poll one observation. Return wait, rollback, or terminal status."""
@@ -325,7 +412,7 @@ class Exploration:
         snapshot, request = self.guard.last_snapshot, self.guard.last_request
         # This also validates identities, freshness, window and constraints.
         if result.status == "unknown" and result.reason != "candidate_unavailable":
-            return "wait"
+            return self._wait(result.reason)
         try:
             execution = snapshot["execution"]
             training = snapshot["training"]
@@ -340,17 +427,17 @@ class Exploration:
                     or training.get("global_batch_size") != state["baseline"]["training"].get("global_batch_size")
                     or start["observed_at"] < state["observation_after"]
                     or start["observed_at"] < state["last_window_end"]):
-                return "wait"
+                return self._wait("execution_or_window_mismatch")
             if state.get("observation_generation") not in (None, start["generation"]):
-                return "wait"
+                return self._wait("observation_generation_changed")
             if not rollback and start["generation"] == state["baseline"]["training"]["end"]["generation"]:
-                return "wait"
+                return self._wait("original_generation")
             if rollback and start["generation"] == state.get("candidate_generation"):
-                return "wait"
+                return self._wait("candidate_generation")
             if training["unit"] == "steps" and end["work"] <= state["checkpoint_step"]:
-                return "wait"
+                return self._wait("checkpoint_not_exceeded")
             if snapshot["scheduling"].get("constraints_satisfied") is not True:
-                return "wait"
+                return self._wait("scheduler_constraints")
             reservation = snapshot["exploration"]["rollback_reservation"]
             if (reservation.get("id") != state["reservation_id"] or
                     reservation.get("confirmed") is not True or
@@ -359,21 +446,21 @@ class Exploration:
                 return "INCONCLUSIVE"
             spent = number(snapshot["execution"], "trial_gpu_seconds")
             if spent < state["spent_gpu_seconds"]:
-                return "wait"
+                return self._wait("gpu_accounting_regressed")
             required = spent + (0 if rollback else state["rollback_gpu_seconds"])
             if required > state["gpu_budget"]:
                 self.finish("INCONCLUSIVE", "gpu_budget_exhausted")
                 return "INCONCLUSIVE"
             q1 = (end["work"] - start["work"]) / (end["observed_at"] - start["observed_at"])
             if not math.isfinite(q1) or q1 <= 0:
-                return "wait"
+                return self._wait("invalid_throughput")
             q1 = min(q1, state.get("measured_lower") or q1)
             self.save(last_window_end=end["observed_at"], windows=state["windows"] + 1,
                       spent_gpu_seconds=spent, observation_generation=start["generation"],
                       measured_lower=q1)
             state = self.state
             if state["windows"] < 2:
-                return "wait"
+                return self._wait("more_windows_required")
             if rollback:
                 self.finish("ROLLED_BACK", "rollback_progress_verified")
                 return "ROLLED_BACK"
@@ -408,6 +495,16 @@ class Exploration:
             values = dict(candidate_throughput=q1, overall_gain=total_gain,
                           keep_seconds=keep, rollback_seconds=back,
                           future_rollback_gain=future_gain)
+            self._log.emit(
+                "observed_benefit", 
+                plan_id=state["id"],
+                objective=state["objective"], 
+                windows=state["windows"],
+                keep_allowed=keep_allowed, 
+                rollback_allowed=back_allowed,
+                min_gain_ratio=self.guard.min_gain, 
+                **values
+            )
             self.save(result=values, candidate_generation=start["generation"],
                       candidate_observed_at=end["observed_at"])
             budget_available = spent + state["rollback_gpu_seconds"] <= state["gpu_budget"]
@@ -419,7 +516,7 @@ class Exploration:
                 # Current reverse plan must still be schedulable. Evidence is
                 # supplied by the reservation service for this exact request.
                 if snapshot["scheduling"].get("target_feasible") is not True:
-                    return "wait"
+                    return self._wait("rollback_target_infeasible")
                 self.save("ROLLING_BACK", rollback_attempted=True,
                           rollback_plan_id=state["id"] + "-rollback",
                           expires_at=now + state["rollback_seconds"])
@@ -430,4 +527,4 @@ class Exploration:
             self.finish("INCONCLUSIVE", "constraint_or_budget_violation")
             return "INCONCLUSIVE"
         except (KeyError, TypeError, ValueError, ArithmeticError):
-            return "wait"
+            return self._wait("invalid_observation")

@@ -4,12 +4,14 @@
 
 import json
 import math
+import time
 from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
 
 from dlrover.python.common.training_metrics import TRAINING_METRIC_KEYS
+from dlrover.python.master.resource.benefit_log import BenefitLogger
 
 
 class TrainingMetricsUnavailable(ValueError):
@@ -38,6 +40,7 @@ class SwanLabTrainingMetrics:
         # The deployed API's createTime is a training sampling timestamp.
         self.keys["observed_at"] = None
         self.utc_offset = env.get("DLROVER_SWANLAB_UTC_OFFSET", "+08:00")
+        self._log = BenefitLogger("swanlab")
         self.valid = True
         try:
             overrides = json.loads(env.get("DLROVER_SWANLAB_KEYS", "{}"))
@@ -59,25 +62,65 @@ class SwanLabTrainingMetrics:
         except (ValueError, TypeError):
             self.valid = False
 
-    def fetch(self, generation, clock, timeout, max_age, min_window, after=0):
-        if not self.valid or not generation:
-            raise TrainingMetricsUnavailable("swanlab_not_configured_or_no_generation")
-        headers = {"Accept": "application/json"}
-        if self.token:
-            headers["Authorization"] = "Bearer " + self.token
-        body = {"taskId": self.task_id, "taskScalarList": [
-            {"key": key} for key in self.keys.values()
-        ]}
+    def fetch(self, generation, clock, timeout, max_age, min_window, after=0,
+              plan_id=None, request_id=None):
+        started = time.monotonic()
+        context = dict(task_id=self.task_id, generation=generation,
+                       plan_id=plan_id, request_id=request_id)
+        stage, status = "configuration", None
+        self._log.emit("fetch_started", level="debug",
+                       timeout_seconds=timeout, max_age_seconds=max_age,
+                       min_window_seconds=min_window, after=after, **context)
         try:
-            with self.post(self.url, json=body, headers=headers,
-                           timeout=timeout, allow_redirects=False) as response:
-                if response.status_code != 200:
-                    raise TrainingMetricsUnavailable("swanlab_http_error")
-                rows = response.json()
-        except (requests.RequestException, ValueError) as error:
-            raise TrainingMetricsUnavailable("swanlab_http_or_payload_error") from error
-        # Metrics may be produced while the request is in flight.
-        return self.window(rows, generation, clock(), max_age, min_window, after)
+            if not self.valid or not generation:
+                raise TrainingMetricsUnavailable("swanlab_not_configured_or_no_generation")
+            headers = {"Accept": "application/json"}
+            if self.token:
+                headers["Authorization"] = "Bearer " + self.token
+            body = {"taskId": self.task_id, "taskScalarList": [
+                {"key": key} for key in self.keys.values()
+            ]}
+            stage = "http"
+            try:
+                with self.post(self.url, json=body, headers=headers,
+                               timeout=timeout, allow_redirects=False) as response:
+                    status = response.status_code
+                    if status != 200:
+                        raise TrainingMetricsUnavailable("swanlab_http_error")
+                    stage = "decode"
+                    rows = response.json()
+            except (requests.RequestException, ValueError) as error:
+                raise TrainingMetricsUnavailable("swanlab_http_or_payload_error") from error
+            stage = "window"
+            window = self.window(rows, generation, clock(), max_age, min_window, after)
+        except TrainingMetricsUnavailable as error:
+            cause = error.__cause__
+            self._log.emit(
+                "fetch_failed", 
+                level="warning",
+                repeat_key=(plan_id, generation, stage, status, str(error)),
+                stage=stage, http_status=status, reason=str(error),
+                error_type=type(cause or error).__name__,
+                duration_ms=round((time.monotonic() - started) * 1000, 3), **context,
+            )
+            raise
+        start, end = window["start"], window["end"]
+        self._log.emit(
+            "window_selected", 
+            repeat_key=(plan_id, generation, start["observed_at"], end["observed_at"]),
+            http_status=status, 
+            series_count=len(rows),
+            sample_count=sum(len(row["scalarMetricsList"]) for row in rows),
+            window_start=start["observed_at"], 
+            window_end=end["observed_at"],
+            work_start=start["work"], 
+            work_end=end["work"],
+            throughput=(end["work"] - start["work"]) / (end["observed_at"] - start["observed_at"]),
+            target_work=window["target_work"], 
+            global_batch_size=window["global_batch_size"],
+            duration_ms=round((time.monotonic() - started) * 1000, 3), **context,
+        )
+        return window
 
     def window(self, rows, generation, now, max_age, min_window, after=0):
         """Require exact (epoch, createTime) alignment, never positional joins.

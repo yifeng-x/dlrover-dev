@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from dlrover.python.master.resource.benefit_log import BenefitLogger
 from dlrover.python.master.resource.swanlab import (
     SwanLabTrainingMetrics,
     TrainingMetricsUnavailable,
@@ -198,6 +199,7 @@ class BenefitGuard:
     def __init__(self, job=None, environ=None, clock=time.time, post=None,
                  generation_provider=None):
         env = os.environ if environ is None else environ
+        self._log = BenefitLogger("guard")
         self.job = dict(job or {})
         self.clock = clock
         self.post = post or requests.post
@@ -241,6 +243,32 @@ class BenefitGuard:
         )
 
     def _check(self, current, target, plan_id, exploration=None):
+        started = time.monotonic()
+        self.last_request = None
+        result = self._evaluate_request(current, target, plan_id, exploration)
+        request = self.last_request or {}
+        operation = ("authorize_mutation" if (exploration or {}).get("authorize_mutation")
+                     else "release_reservation" if (exploration or {}).get("release_reservation")
+                     else "observation" if exploration else "evaluation")
+        self._log.emit(
+            "evaluation_finished", 
+            repeat_key=(plan_id, operation, result.status, result.reason),
+            plan_id=plan_id, 
+            request_id=request.get("request_id"),
+            job_uid=self.job.get("job_uid"), 
+            generation=request.get("generation"),
+            operation=operation, 
+            mode=self.mode, 
+            objective=self.objective,
+            status=result.status, 
+            reason=result.reason, 
+            estimates=result.estimates,
+            min_gain_ratio=getattr(self, "min_gain", None),
+            duration_ms=round((time.monotonic() - started) * 1000, 3),
+        )
+        return result
+
+    def _evaluate_request(self, current, target, plan_id, exploration=None):
         self.last_snapshot = None
         try:
             parsed = urlparse(self.url)
@@ -262,6 +290,17 @@ class BenefitGuard:
             if self.generation_provider is not None:
                 request["generation"] = self.generation_provider()
             self.last_request = request
+            self._log.emit(
+                "evaluation_started", 
+                level="debug",
+                plan_id=plan_id, 
+                request_id=request["request_id"],
+                generation=request.get("generation"),
+                current=request["current"], 
+                target=request["target"],
+                mode=self.mode, 
+                objective=self.objective
+            )
             control_request = exploration and (
                 exploration.get("authorize_mutation") or exploration.get("release_reservation")
             )
@@ -270,15 +309,31 @@ class BenefitGuard:
                 after = max((exploration or {}).get("observation_after", 0),
                             (exploration or {}).get("last_window_end", 0))
                 training = self.training_metrics.fetch(
-                    request.get("generation"), self.clock, self.timeout,
-                    self.max_age, self.min_window, after=after,
+                    generation=request.get("generation"), 
+                    clock=self.clock, 
+                    timeout=self.timeout,
+                    max_age=self.max_age, 
+                    min_window=self.min_window, 
+                    after=after,
+                    plan_id=plan_id, 
+                    request_id=request["request_id"],
                 )
                 request["training"] = training
             headers = {"Accept": "application/json"}
             if self.token:
                 headers["Authorization"] = "Bearer " + self.token
+            http_started = time.monotonic()
             with self.post(self.url, json=request, headers=headers,
                            timeout=self.timeout, allow_redirects=False) as response:
+                self._log.emit(
+                    "evidence_response", 
+                    level="debug" if response.status_code == 200 else "warning",
+                    repeat_key=(plan_id, response.status_code),
+                    plan_id=plan_id, 
+                    request_id=request["request_id"],
+                    http_status=response.status_code,
+                    duration_ms=round((time.monotonic() - http_started) * 1000, 3),
+                )
                 if response.status_code != 200:
                     return BenefitResult("unknown", "http_error")
                 snapshot = response.json()
@@ -299,5 +354,12 @@ class BenefitGuard:
                             self.min_window, self.objective, self.min_gain)
         except TrainingMetricsUnavailable as error:
             return BenefitResult("unknown", str(error))
-        except (requests.RequestException, ValueError, TypeError, AttributeError):
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as error:
+            self._log.emit(
+                "evidence_failed", level="warning",
+                repeat_key=(plan_id, type(error).__name__),
+                plan_id=plan_id, 
+                request_id=(self.last_request or {}).get("request_id"),
+                error_type=type(error).__name__
+            )
             return BenefitResult("unknown", "http_or_payload_error")
