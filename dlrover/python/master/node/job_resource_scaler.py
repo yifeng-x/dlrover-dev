@@ -190,6 +190,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         self._save_ckpt_path = ""
         self._checkpoint_task_id = ""
         self._old_worker_ids = None
+        self._replacement_started = False
         self._param_tunning_ready_nodes = set()
         self._target_tunning_nodes = set()
         self._adjust_gpu_nums = 0
@@ -303,7 +304,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
                     and phase.get("phase")
                     == VerticalElasticPhaseType.PREPARING
                 ):
-                    self.vertical_elastic_phase_manager.fail(
+                    self.vertical_elastic_phase_manager.skip(
                         "No executable resource change"
                     )
             finally:
@@ -337,6 +338,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             self._save_ckpt_path = ""
             self._checkpoint_task_id = ""
             self._old_worker_ids = None
+            self._replacement_started = False
             self._param_tunning_ready_nodes = set()
             self._target_tunning_nodes = set()
 
@@ -467,12 +469,12 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             )
             return False
 
+        if not self._check_resource_benefit(plan, alive_num):
+            return False
+
         self._old_worker_ids = {w.id for w in self._get_replaceable_workers()}
         if not self._old_worker_ids:
             raise RuntimeError("No workers available for vertical replacement")
-
-        if not self._check_resource_benefit(plan, alive_num):
-            return False
 
         if not self._execute_resource_plan(plan, ckpt_wait_time, ckpt_check_sec, log_step):
             if self.exploration.active:
@@ -538,6 +540,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
                 VerticalElasticPhaseType.TUNE_PARAM
             )
 
+            self._replacement_started = True
             self._wait_for_replacement_exits()
             self.execute_job_optimization_plan(plan)
             self._benefit_log.emit(
@@ -714,13 +717,13 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
             self.vertical_elastic_phase_manager.get_plan_id(),
         )
         current = self._get_current_worker_group_resource(alive_num)
-        workers = self._get_replaceable_workers() if self.exploration.enabled else []
+        workers = self._get_replaceable_workers()
         healthy = current is not None and len(workers) == current.count and all(
             worker.status == NodeStatus.RUNNING and not worker.is_released
             and worker.config_resource.gpu_num == current.node_resource.gpu_num
             for worker in workers
         )
-        if not allowed and healthy:
+        if not allowed and healthy and self.exploration.enabled:
             allowed = self.exploration.prepare(
                 current,
                 plan.node_group_resources[NodeType.WORKER],
@@ -751,7 +754,7 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
                     guard.mode, result.to_dict())
         if not allowed:
             self.vertical_metrics.finish("skipped", "benefit_" + result.status)
-            self.vertical_elastic_phase_manager.fail(
+            self.vertical_elastic_phase_manager.skip(
                 "Benefit gate: " + result.reason
             )
         return allowed

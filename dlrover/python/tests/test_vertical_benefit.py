@@ -179,7 +179,10 @@ def test_gate_is_before_checkpoint_and_worker_replacement(mode, checkpoint_calle
         assert checkpoint.called is checkpoint_called
         instance._scaler.scale.assert_not_called()
         if mode == "enforce":
-            assert instance.get_phase_info()["phase"] == Phase.FAILED
+            assert instance.get_phase_info()["phase"] == Phase.SKIPPED
+            assert not instance.get_phase_info()["ready"]
+            assert instance._old_worker_ids is None
+            assert not instance._replacement_started
             assert instance.benefit_guard.last_result.status == "unknown"
     finally:
         get_job_context().clear_job_nodes()

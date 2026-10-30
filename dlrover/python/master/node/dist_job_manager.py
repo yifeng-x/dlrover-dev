@@ -514,7 +514,7 @@ class DistributedJobManager(JobManager):
         scaler = getattr(self, "_job_resource_scaler", None)
         if (
             self._job_args.runtime_elastic_dimension == ElasticDimension.VERTICAL
-            and getattr(scaler, "_old_worker_ids", None) is not None
+            and getattr(scaler, "_replacement_started", False)
             and scaler.get_phase_info().get("phase")
             == VerticalElasticPhaseType.FAILED
         ):

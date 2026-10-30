@@ -41,8 +41,10 @@ class SwanLabTrainingMetrics:
         self.assume_fixed_batch = env.get("DLROVER_SWANLAB_ASSUME_FIXED_BATCH", "false").strip().lower() == "true"
         self.keys = {name: TRAINING_METRIC_KEYS[name]
                      for name in ("work", "target_work", "global_batch_size")}
+        
         if self.assume_fixed_batch:
             self.keys = dict(work="global_step", target_work="max_steps", train_speed="train_speed")
+
         self.time_source = env.get("DLROVER_SWANLAB_TIME_SOURCE", "sample")
         self.utc_offset = env.get("DLROVER_SWANLAB_UTC_OFFSET", "+08:00")
         self._log = BenefitLogger("swanlab")
@@ -55,19 +57,24 @@ class SwanLabTrainingMetrics:
                     or self.steady_windows < 2
                     or not math.isfinite(self.max_variation) or not 0 <= self.max_variation <= 1):
                 raise ValueError("invalid_steady_configuration")
+            
             overrides = json.loads(env.get("DLROVER_SWANLAB_KEYS", "{}"))
             if not isinstance(overrides, dict) or set(overrides) - (set(TRAINING_METRIC_KEYS) | {"train_speed"}):
                 raise ValueError("invalid_key_mapping")
+            
             # Legacy generation/steady/observed_at mappings are not requested.
             self.keys.update({k: v for k, v in overrides.items() if k in self.keys})
             if (not all(isinstance(v, str) and v for v in self.keys.values())
                     or len(set(self.keys.values())) != len(self.keys)):
                 raise ValueError("invalid_key_mapping")
+            
             offset = datetime.fromisoformat("2000-01-01T00:00:00" + self.utc_offset)
             if offset.tzinfo is None:
                 raise ValueError("missing_timezone")
+            
             if not self.task_id:
                 raise ValueError("missing_task_id")
+            
             if self.mock:
                 if not self.mock_file:
                     raise ValueError("missing_mock_file")
@@ -76,6 +83,7 @@ class SwanLabTrainingMetrics:
                 if (parsed.scheme not in ("http", "https") or not parsed.hostname
                         or parsed.username or parsed.password):
                     raise ValueError("invalid_swanlab_configuration")
+                
         except (ValueError, TypeError):
             self.valid = False
 

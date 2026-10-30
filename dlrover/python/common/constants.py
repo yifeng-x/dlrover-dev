@@ -20,11 +20,12 @@ class VerticalElasticPhaseType(object):
     TUNE_PARAM = "tune_param"               # 新 Worker 调参
     RENDEZVOUS_READY = "rendezvous_ready"   # 新 Worker 准备入网
     COMPLETED = "completed"                 # 完成
+    SKIPPED = "skipped"                     # 执行前跳过
     FAILED = "failed"                       # 失败
 
     _VALID_PHASES = {
         IDLE, PREPARING, SAVE_CHECKPOINT, REPLACING_WORKERS, TUNE_PARAM,
-        RENDEZVOUS_READY, COMPLETED, FAILED,
+        RENDEZVOUS_READY, COMPLETED, SKIPPED, FAILED,
     }
 
 class WorkerResourceScaleAction(object):

@@ -27,6 +27,7 @@ def main():
             or not 0 <= args.work_start < args.work_end <= args.total_steps < 2**53
             or not 0 < args.global_batch_size < 2**53):
         parser.error("Invalid window, counters or batch size")
+
     times = [now - args.window_seconds, now - args.window_seconds / 2, now]
     work = [args.work_start, (args.work_start + args.work_end) // 2, args.work_end]
     series = {
@@ -40,10 +41,20 @@ def main():
             "max_steps": [args.total_steps] * 3,
             "train_speed": [(args.work_end - args.work_start) / args.window_seconds] * 3,
         }
-    data = [dict(taskId=args.task_id, key=key, scalarMetricsList=[
-        dict(epoch=index, createTime=datetime.fromtimestamp(stamp, timezone.utc).isoformat(),
-             data=str(values[index])) for index, stamp in enumerate(times)
-    ]) for key, values in series.items()]
+
+    data = [
+        dict(
+            taskId=args.task_id, 
+            key=key, 
+            scalarMetricsList=[
+                dict(
+                    epoch=index, 
+                    createTime=datetime.fromtimestamp(stamp, timezone.utc).isoformat(),
+                    data=str(values[index])
+                ) for index, stamp in enumerate(times)
+            ]
+        ) for key, values in series.items()]
+    
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(dir=args.output.parent, prefix="swanlab-")
     try:

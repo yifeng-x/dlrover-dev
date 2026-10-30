@@ -168,6 +168,8 @@ def test_skipped_plans_are_not_failures(scaler, reason):
     assert value(metrics, "plans_started_total") == 1
     assert value(metrics, "plans_finished_total", result="skipped", reason=reason) == 1
     assert value(metrics, "plans_finished_total", result="failed") == 0
+    assert value(metrics, "phase", phase=Phase.SKIPPED) == 1
+    assert scaler.get_phase_info()["phase"] == Phase.SKIPPED
     assert value(metrics, "inflight") == 0
     assert not scaler._scaling_lock.locked()
 
@@ -260,6 +262,7 @@ def test_execution_failures_are_classified(scaler, reason):
     assert value(scaler.vertical_metrics, "plans_finished_total", result="failed", reason=reason) == 1
     assert value(scaler.vertical_metrics, "plans_finished_total") == 1
     assert value(scaler.vertical_metrics, "phase", phase=Phase.FAILED) == 1
+    assert scaler._replacement_started is (reason in ("param_timeout", "scale_failed"))
 
 
 def test_concurrent_finishes_only_count_once():

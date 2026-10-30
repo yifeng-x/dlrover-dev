@@ -243,7 +243,7 @@ class MasterExitTest(unittest.TestCase):
         from dlrover.python.master.node.dist_job_manager import DistributedJobManager
         self.manager = object.__new__(DistributedJobManager)
         self.manager._job_args = SimpleNamespace(runtime_elastic_dimension=ElasticDimension.VERTICAL)
-        self.manager._job_resource_scaler = SimpleNamespace(_old_worker_ids={0})
+        self.manager._job_resource_scaler = SimpleNamespace(_old_worker_ids={0}, _replacement_started=True)
         self.old = Node(NodeType.WORKER, 0, name="old", status=NodeStatus.FAILED)
         self.new = Node(NodeType.WORKER, 1, name="new", status=NodeStatus.FAILED)
         self.manager._enable_relaunch_node = True
@@ -273,6 +273,26 @@ class MasterExitTest(unittest.TestCase):
         self.manager._job_resource_scaler.get_phase_info = lambda: {"phase": Phase.FAILED}
         should_stop, _, _ = self.manager.should_early_stop()
         self.assertTrue(should_stop)
+
+    def test_pre_execution_failure_does_not_stop_training(self):
+        self.manager._job_resource_scaler._replacement_started = False
+        self.manager._job_resource_scaler.get_phase_info = lambda: {"phase": Phase.FAILED}
+        self.manager._workspace_training_state = SimpleNamespace(releasing=False)
+        self.manager.is_all_reduce_type_job = lambda: False
+        self.manager._ps_manager = MagicMock()
+        self.manager._ps_manager.get_pending_timeout_oom_recovered_node.return_value = []
+        self.manager._ps_manager.find_pending_node_caused_training_hang.return_value = None
+        self.manager._worker_manager = MagicMock()
+        self.manager._worker_manager.find_pending_node_caused_training_hang.return_value = None
+        self.manager._workspace_training_state.should_skip_pending_early_stop = lambda _: False
+        self.manager.get_job_nodes = lambda: {}
+        self.manager.get_ps_num = lambda: 0
+        self.manager.get_worker_num = lambda: 1
+        self.manager.get_job_type = lambda: "allreduce"
+        for phase in (Phase.FAILED, Phase.SKIPPED):
+            with self.subTest(phase=phase):
+                self.manager._job_resource_scaler.get_phase_info = lambda: {"phase": phase}
+                self.assertEqual(self.manager.should_early_stop(), (False, "", ""))
 
     def test_successful_ucp_does_not_override_explicit_rendezvous_block(self):
         from dlrover.python.master.elastic_training.rdzv_manager import UcpRdzvManager

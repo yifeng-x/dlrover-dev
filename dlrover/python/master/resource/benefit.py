@@ -123,16 +123,20 @@ def evaluate(snapshot, request, now, max_age=60, min_window=30,
         number(limits, "max_delay_seconds")
         if limits.get("deadline_at") is not None:
             number(limits, "deadline_at", positive=True)
+
         candidate = snapshot["candidate"]
         if candidate == {"status": "unavailable"}:
             return BenefitResult("unknown", "candidate_unavailable", {
                 "current_throughput": q0, "remaining_work": remaining,
                 "baseline_seconds": remaining / q0,
             })
+        
         if candidate.get("evidence") not in ("trial", "profile", "history"):
             raise InvalidSnapshot("candidate_evidence_missing")
+        
         if not candidate.get("evidence_id"):
             raise InvalidSnapshot("candidate_evidence_missing")
+        
         q1 = number(candidate, "throughput_lower", positive=True)
 
         g0 = request["current"]["workers"] * request["current"]["gpus_per_worker"]
@@ -152,14 +156,17 @@ def evaluate(snapshot, request, now, max_age=60, min_window=30,
         max_delay = number(limits, "max_delay_seconds")
         if predicted - baseline > max_delay:
             return BenefitResult("negative", "delay_budget", values)
+        
         if limits.get("deadline_at") is not None:
             deadline = number(limits, "deadline_at", positive=True)
             if now + predicted > deadline:
                 return BenefitResult("negative", "deadline", values)
+        
         if objective == "gpu_hours":
             gain, denominator = h0 - h1, h0
         else:
             gain, denominator = baseline - predicted, baseline
+        
         if objective == "cluster_jct":
             if scheduling.get("impacts_complete") is not True:
                 raise InvalidSnapshot("queue_impact_unknown")
@@ -179,10 +186,13 @@ def evaluate(snapshot, request, now, max_age=60, min_window=30,
                 gain += weight * (before - after)
                 denominator += weight * before
             values["cluster_jct_gain_seconds"] = gain
+        
         if not all(math.isfinite(v) for v in values.values()) or not math.isfinite(gain):
             raise InvalidSnapshot("nonfinite_estimate")
+        
         if not math.isfinite(denominator) or denominator <= 0:
             raise InvalidSnapshot("invalid_denominator")
+        
         positive = gain > 0 and gain >= min_gain_ratio * denominator
         return BenefitResult(
             "positive" if positive else "negative",

@@ -210,7 +210,8 @@ class VerticalExecutionMetrics:
             self.finished.labels(self._action, result, reason).inc()
             self._active = False
             self._set_phase(
-                Phase.COMPLETED if result == "completed" else Phase.FAILED
+                Phase.COMPLETED if result == "completed" else
+                Phase.SKIPPED if result == "skipped" else Phase.FAILED
             )
             self.workers.labels("target").set(0)
             self.workers.labels("param_ready").set(0)

@@ -71,6 +71,7 @@ class VerticalElasticPhase:
         ],
         VerticalElasticPhaseType.PREPARING: [
             VerticalElasticPhaseType.SAVE_CHECKPOINT,
+            VerticalElasticPhaseType.SKIPPED,
             VerticalElasticPhaseType.FAILED
         ],
         VerticalElasticPhaseType.SAVE_CHECKPOINT: [
@@ -88,6 +89,9 @@ class VerticalElasticPhase:
         VerticalElasticPhaseType.RENDEZVOUS_READY: [
             VerticalElasticPhaseType.COMPLETED,
             VerticalElasticPhaseType.FAILED
+        ],
+        VerticalElasticPhaseType.SKIPPED: [
+            VerticalElasticPhaseType.IDLE
         ],
         VerticalElasticPhaseType.FAILED: [
             VerticalElasticPhaseType.IDLE
@@ -257,6 +261,20 @@ class VerticalElasticPhase:
             self._phase_info["phase"] = target
             self._phase_info["state_machine"]["current_state"] = target
             self._phase_info["ready"] = False
+            self._phase_info["metadata"]["updated_at"] = datetime.now().isoformat()
+
+    def skip(self, reason: str = "") -> None:
+        """Finish a plan before execution without marking training as failed."""
+        with self._lock:
+            if self._phase_info["phase"] != VerticalElasticPhaseType.PREPARING:
+                raise ValueError("Only a preparing vertical plan can be skipped")
+            self._phase_info["phase"] = VerticalElasticPhaseType.SKIPPED
+            self._phase_info["state_machine"].update(
+                current_state=VerticalElasticPhaseType.SKIPPED,
+                expected_next_phase=None,
+            )
+            self._phase_info["ready"] = False
+            self._phase_info["metadata"]["reason"] = reason
             self._phase_info["metadata"]["updated_at"] = datetime.now().isoformat()
 
     def fail(self, reason: str = "") -> None:

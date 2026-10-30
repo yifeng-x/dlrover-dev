@@ -162,6 +162,8 @@ class VerticalElasticEvents:
         if context is None or context["_finished"]:
             return
         context["execution_status"] = result
+        if result == "skipped":
+            context["phase"] = "skipped"
         if result == "completed":
             self._observe(context)
             self._emit(context, "control_completed", reason_code=reason)

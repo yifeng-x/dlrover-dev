@@ -186,23 +186,46 @@ def test_plan_ids_do_not_repeat_when_sequence_restarts(scaler):
     assert all(e["reason_code"] == "empty_plan" for e in finished)
 
 
-def test_benefit_rejection_is_recorded_before_checkpoint(scaler):
+@pytest.mark.parametrize("status,reason", [("negative", "insufficient_gain"),
+                                          ("unknown", "stale_or_missing_generation")])
+@pytest.mark.parametrize("worker_status", [NodeStatus.RUNNING, NodeStatus.PENDING])
+def test_benefit_rejection_is_recorded_before_checkpoint(scaler, status, reason, worker_status):
     messages = []
     scaler.events.sink = messages.append
     plan = ResourcePlan()
     plan.node_group_resources["worker"] = group(8)
     scaler._job_optimizer.get_job_resource_plan.return_value = plan
     scaler.benefit_guard.mode = "enforce"
-    scaler.benefit_guard.last_result = BenefitResult("negative", "insufficient_gain")
+    scaler.benefit_guard.last_result = BenefitResult(status, reason)
+    worker = scaler._get_replaceable_workers()[0]
+    worker.status = worker_status
+    # A prior attempt must not leak replacement state into this rejection.
+    scaler._replacement_started = True
+    scaler._old_worker_ids = {99}
+    from dlrover.python.master.node.job_context import get_job_context
+    get_job_context().update_job_node(worker)
     with patch.object(scaler.benefit_guard, "check", return_value=False), \
-         patch.object(scaler, "_wait_for_ckpt_ready") as checkpoint:
+         patch.object(scaler, "_wait_for_ckpt_ready") as checkpoint, \
+         patch.object(scaler._benefit_log, "emit") as log:
         scaler._scaling_lock.acquire()
         scaler._run_resource_scaling()
     checkpoint.assert_not_called()
     evaluated = next(e for e in messages if e["event_type"] == "evaluated")
     assert evaluated["benefit"]["decision"] == "reject"
-    assert evaluated["benefit"]["evaluation_status"] == "negative"
-    assert messages[-1]["reason_code"] == "benefit_negative"
+    assert evaluated["benefit"]["evaluation_status"] == status
+    assert messages[-1]["reason_code"] == "benefit_" + status
+    assert messages[-1]["execution_status"] == "skipped"
+    assert messages[-1]["phase"] == "skipped"
+    assert scaler.get_phase_info()["phase"] == Phase.SKIPPED
+    assert not scaler.get_phase_info()["ready"]
+    assert scaler._old_worker_ids is None
+    assert not scaler._replacement_started
+    scaler._scaler.scale.assert_not_called()
+    assert worker.status == worker_status
+    assert not worker.is_released
+    gate_log = next(c.kwargs for c in log.call_args_list if c.args == ("gate_decision",))
+    assert gate_log["workers_healthy"] is (worker_status == NodeStatus.RUNNING)
+    assert gate_log["exploration_enabled"] is False
     assert messages[-1]["resources"]["actual_after"] is None
 
 
