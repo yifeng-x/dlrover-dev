@@ -92,65 +92,48 @@
 
 当前没有将采集覆盖率、上报延迟、基线可信度实现为独立评分指标；已有的是时效、完整性、代次和证据合法性检查。
 
-## 4. 受控探索专用指标
+## 4. 只观测探索专用指标
 
-受控探索仅在 `enforce` 模式、探索开关开启、候选吞吐明确不可用且其他准入条件满足时执行。当前支持时间和 GPU 卡时目标，不支持未知候选性能下的集群 JCT 自动探索。
+仅在enforce、探索开启、候选明确unavailable及其他准入条件满足时执行，支持time/gpu_hours。策略固定observe_only，切换后记录候选实测收益，不自动回退。
 
 | 指标或条件 | 字段 | 用途 |
 | --- | --- | --- |
-| 调整后的实测吞吐 | `measured_lower` | 至少接受两个独立窗口，取已接受窗口吞吐最小值作为保守估计 |
-| 探索已耗时间 | 当前时间 - `started_at` | 将切换、恢复、预热和观测耗时计入整体收益 |
-| 探索累计 GPU 占用 | `execution.trial_gpu_seconds` | 已消耗 GPU·秒，应包括预留资源占用；由证据接口提供 |
-| 预计回退耗时上界 | `exploration.rollback_seconds_upper` | 计算从当前时刻回退需要的时间 |
-| 预计回退资源开销上界 | `exploration.rollback_gpu_seconds_upper` | 计算回退卡时及预算是否足够 |
-| 探索时间预算 | `DLROVER_BENEFIT_TRIAL_SECONDS` | 默认 600 秒，限制一次探索持续时间 |
-| 探索卡时预算 | `DLROVER_BENEFIT_TRIAL_GPU_HOURS` | 必须显式配置，限制探索与回退开销 |
-| 回退资源预留 | `rollback_reservation.id/confirmed/expires_at` | 确认回退资源真实存在且有效期足够 |
-| 新配置执行确认 | `execution.applied_plan_id/all_workers_ready` | 确认观测来自已生效的计划 |
-| 恢复 checkpoint | `execution.restored_checkpoint`、checkpoint step | 确认恢复来源正确且训练继续推进 |
-| 执行代次 | `execution.generation` | 必须与训练指标中的 generation 一致 |
-| 探索准入条件 | `allowed`、`checkpoint_compatible`、`rollback_supported`、`quiescent_checkpoint`、`gpu_tiers` | 限制可探索作业、合法档位及可回退性 |
+| 候选保守吞吐 | measured_lower | 至少两个独立完整窗口吞吐的最小值 |
+| 已耗时间 | 当前时间-started_at | 包含切换、恢复、预热、观测和人工等待 |
+| 累计GPU秒 | execution.trial_gpu_seconds | 真实资源计量，不用GPU利用率代替 |
+| 探索时间上限 | DLROVER_BENEFIT_TRIAL_SECONDS | 默认600秒，有效时长=min(配置值,基线剩余秒数) |
+| 探索卡时预算 | DLROVER_BENEFIT_TRIAL_GPU_HOURS | 需显式配置，不额外要求回退预留 |
+| 新配置执行确认 | execution.applied_plan_id/all_workers_ready | 实际生效计划和全部worker就绪 |
+| checkpoint及代次 | execution.restored_checkpoint/generation | 实际恢复来源、新代次且work超过checkpoint |
+| 准入能力 | policy/allowed/checkpoint_compatible/quiescent_checkpoint/gpu_tiers | observe_only授权、恢复能力与相邻档位 |
 
-预留资源必须由外部调度服务实际建立；DLRover 不会仅凭返回的 `confirmed=true` 创建预留。
+### 4.1 整体收益
 
-### 4.1 整体收益与未来回退收益
-
-探索开始时保存原配置基线吞吐 q0 和基线剩余时间 Tbase。设已耗时间为 E，当前剩余工作量为 Wnow，实测候选吞吐为 q1：
+设基线预计剩余时间Tbase、已耗时间E、当前剩余工作R、候选实测吞吐q1、累计GPU秒S、原/候选总GPU数G0/G1：
 
 ```text
-继续当前配置所需时间 = Wnow / q1
-回退后完成所需时间 = 回退耗时 + Wnow / q0
-
-整体时间收益 = Tbase - E - 继续当前配置所需时间
-未来回退时间收益 = 继续当前配置所需时间 - 回退后完成所需时间
-
-整体资源收益
-= G0 × Tbase - 已耗 GPU·秒 - G1 × Wnow / q1
-
-未来回退资源收益
-= G1 × Wnow / q1 - 回退 GPU·秒 - G0 × Wnow / q0
+keep_seconds = max(0,R)/q1
+时间收益 = Tbase - E - keep_seconds
+资源收益 = G0*Tbase - S - G1*keep_seconds
 ```
 
-这两类收益回答不同问题：
-
-- 整体收益：从探索开始算起，此次调整是否划算。
-- 未来回退收益：从当前时刻算起，回退是否比继续执行更划算。
-
-整体收益为负，不代表必须回退。回退还需满足资源预算、可调度性、截止时间等约束；如果回退更差且继续执行满足约束，可以保留当前配置，但不标记为已获得正收益。
-
-上述回退公式基于当前实现要求的新鲜、停稳 checkpoint；不能将其直接套用于允许未计量重放的其他回退方式。
+不再计算未来回退收益。有效观测且约束满足时，正收益达到阈值为ACCEPTED，否则RETAINED并保存负向结果。违反延迟/deadline则INCONCLUSIVE并保留保护；证据或预算不足不等于已经测得负收益。所有分支不自动回退。
 
 ### 4.2 探索输出
 
-| 结果字段 | 含义 | 单位 |
-| --- | --- | --- |
-| `candidate_throughput` | 候选配置保守实测吞吐 | steps/s |
-| `overall_gain` | 包含已耗探索开销的整体收益 | 时间目标为秒；资源目标为 GPU·秒 |
-| `keep_seconds` | 从当前时刻继续执行到完成的预计时间 | 秒 |
-| `rollback_seconds` | 从当前时刻回退并完成训练的预计时间 | 秒 |
-| `future_rollback_gain` | 从当前时刻比较，回退相对继续执行的收益 | 时间目标为秒；资源目标为 GPU·秒 |
+| 字段 | 含义 |
+| --- | --- |
+| candidate_throughput / baseline_throughput | 候选保守实测/原基线吞吐 |
+| overall_gain / gain_unit | 整体收益及seconds或gpu_seconds单位 |
+| gain_ratio | 整体收益相对于基线时间或基线GPU秒的比例 |
+| keep_seconds / elapsed_seconds | 继续候选预计剩余秒数/已耗秒数 |
+| remaining_work / trial_gpu_seconds | 剩余工作/已耗卡秒 |
+| evaluation_status / constraints_satisfied | 收益评价/延迟与deadline是否满足 |
+| unit / data_source / windows | 工作量单位、mock或http来源、窗口数 |
+| candidate_resource | 本次实际观测的候选资源配置 |
+| candidate_generation / candidate_observed_at | journal中的候选代次和窗口末端时间 |
 
-注意：探索输出的 `rollback_seconds` 包含回退后的剩余训练时间，不等同于仅表示切换耗时的 `rollback_seconds_upper`。资源目标下的探索收益结果尚未除以 3600。
+资源目标收益需除3600才能转换为GPU小时。result持久化后通过report_result回传；INCONCLUSIVE/FAILED也回传，但无有效测量时result为空。结果保存不等于已建立跨作业候选数据库，服务仍需自行做可比性与复用判断。
 
 ## 5. 集群收益额外指标
 
@@ -196,7 +179,7 @@
 | `status` | `positive`、`negative` 或 `unknown` | 分类值 |
 | `reason` | 结果原因，例如收益不足、超时限或证据缺失 | 分类值 |
 
-这些计算结果保存在评估结果或探索状态中，不代表每个字段均已注册为 Prometheus 指标。证据缺失时也不保证返回完整结果字段；例如候选吞吐明确不可用时，只返回当前吞吐、剩余工作量和基线时间等已知结果。
+基线/候选吞吐、收益比例、时间收益、GPU秒收益、有效性和证据时间已接入Prometheus；探索还暴露窗口数、累计卡秒、状态和回传确认。完整名称与查询见[收益Prometheus指标](vertical-elastic-benefit-prometheus-cn.md)。其他计算字段仍保存在评估结果或journal中。证据缺失时也不保证返回完整结果字段；例如候选吞吐明确不可用时，只返回当前吞吐、剩余工作量和基线时间等已知结果。
 
 ## 7. SwanLab 接口采集清单
 
@@ -244,7 +227,7 @@ generation 及其开始时间由 DLRover 内部提供，用于过滤旧数据；
 
 - [收益评估及 HTTP 证据获取](../../dlrover/python/master/resource/benefit.py)
 - [SwanLab scalar 接口适配](../../dlrover/python/master/resource/swanlab.py)
-- [探索准入、观测与回退判断](../../dlrover/python/master/resource/exploration.py)
+- [探索准入、观测与结果记录](../../dlrover/python/master/resource/exploration.py)
 - [训练端 scalar 上报辅助函数](../../dlrover/python/common/training_metrics.py)
 - [Master 训练代次生成](../../dlrover/python/master/elastic_training/rdzv_manager.py)
 - [资源调整执行入口](../../dlrover/python/master/node/job_resource_scaler.py)

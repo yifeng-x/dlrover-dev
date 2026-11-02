@@ -193,6 +193,9 @@ def evaluate(snapshot, request, now, max_age=60, min_window=30,
         if not math.isfinite(denominator) or denominator <= 0:
             raise InvalidSnapshot("invalid_denominator")
         
+        values["gain_ratio"] = gain / denominator
+        if not math.isfinite(values["gain_ratio"]):
+            raise InvalidSnapshot("nonfinite_estimate")
         positive = gain > 0 and gain >= min_gain_ratio * denominator
         return BenefitResult(
             "positive" if positive else "negative",
@@ -273,6 +276,7 @@ class BenefitGuard:
         result = self._evaluate_request(current, target, plan_id, exploration)
         request = self.last_request or {}
         operation = ("authorize_mutation" if (exploration or {}).get("authorize_mutation")
+                     else "report_result" if (exploration or {}).get("report_result")
                      else "release_reservation" if (exploration or {}).get("release_reservation")
                      else "observation" if exploration else "evaluation")
         self._log.emit(
@@ -337,6 +341,7 @@ class BenefitGuard:
             )
             control_request = exploration and (
                 exploration.get("authorize_mutation") or exploration.get("release_reservation")
+                or exploration.get("report_result")
             )
             training = None
             training_context = None

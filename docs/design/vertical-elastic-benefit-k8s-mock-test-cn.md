@@ -1,6 +1,6 @@
 # Kubernetes 集群上的 SwanLab mock 收益场景测试手册
 
-本文依据当前仓库代码编写，日期为 2026-10-30。目标是在真实 Kubernetes 垂直弹性链路中，用可控 SwanLab scalar 数据验证收益判断、checkpoint 前拦截、资源替换，以及具备执行证据服务时的探索与回退。
+本文依据当前仓库代码编写，日期为 2026-10-30。目标是在真实 Kubernetes 垂直弹性链路中，用可控 SwanLab scalar 数据验证收益判断、checkpoint 前拦截、资源替换，以及具备执行证据服务时的只观测探索。
 
 本文提供完整的测试基础设施 YAML、ElasticJob YAML、手动触发 YAML、探索配置 YAML、操作步骤与验收矩阵。镜像、StorageClass、Brain 地址、模型和数据路径必须替换为本集群已有值。文档编写不代表已在你的集群执行或通过验收。
 
@@ -18,11 +18,11 @@ BenefitGuard → 拒绝：保持当前 worker
 ```
 
 - `DLROVER_SWANLAB_MOCK=true` 只替换 SwanLab 的 HTTP 获取，仍检查任务身份、训练代次边界、预热、稳定窗口、数据时效和工作量。它不模拟 Kubernetes、Brain 或训练框架。
-- 本文的 `benefit-fixture` 是**普通门禁测试桩**，候选性能、切换成本和调度字段均为合成输入。它拒绝探索控制请求，也不提供回退预留，不能用于验收探索执行。
+- 本文的 `benefit-fixture` 是**普通门禁测试桩**，候选性能、切换成本和调度字段均为合成输入。它拒绝探索控制请求，也不提供真实恢复证据，不能用于验收探索执行。
 - 正收益和 shadow/off 场景会真实替换 worker。checkpoint、资源调度和恢复必须由已集成垂直弹性的训练镜像完成。
 - 模拟吞吐与真实训练速度无关。因此 `positive`、基于 mock 得到的 `ACCEPTED` 都只能证明控制行为，不能证明真实加速、降本或训练质量。
 
-建议先完成普通门禁矩阵，再执行第 8 节探索扩展。仅验证门禁不需要对接真实 SwanLab，也不需要探索预留服务。
+建议先完成普通门禁矩阵，再执行第 8 节探索扩展。仅验证门禁不需要对接真实 SwanLab，也不需要探索执行证据服务。
 
 ### 1.1 哪些是真实状态，哪些是测试输入
 
@@ -53,7 +53,7 @@ BenefitGuard → 拒绝：保持当前 worker
 
 ### 1.3 时间配置分析与本文采用的手动测试档位
 
-原来的60秒有效期要求生成文件后很快触发，600秒探索还要包含真实checkpoint、Pod重建、恢复与人工看日志，300秒回退也容易被恢复耗时耗尽。另一个问题是默认1800秒冷却让同一作业的后续观察等待较长。因此本文采用以下**隔离mock测试配置**，代码默认值不变：
+原来的60秒有效期要求生成文件后很快触发，600秒探索还要包含真实checkpoint、Pod重建、恢复与人工看日志。另一个问题是默认1800秒冷却让同一作业的后续观察等待较长。因此本文采用以下**隔离mock测试配置**，代码默认值不变：
 
 | 项目 | 原示例 | 本文设置 | 手动测试效果 |
 | --- | --- | --- | --- |
@@ -65,10 +65,10 @@ BenefitGuard → 拒绝：保持当前 worker
 | 探索HTTP轮询 | 10秒 | 保留10秒 | 新文件通常下轮就读到；不是10秒内必须手工更新文件 |
 | 第二候选窗口的提交操作区间 | 30秒 | 5分钟 | 更方便先确认journal再提交，仍受探索到期时间限制 |
 | 正常探索总预算 | 600秒 | 1800秒（30分钟） | 包含真实切换和人工操作；满足条件会提前结束，无需等满 |
-| 回退预算（服务端字段） | 300秒 | 900秒（15分钟） | 给真实恢复及两轮验证留出时间 |
+| 回退预算/预留 | 旧策略要求 | 不需要 | 当前策略不会自动回退 |
 | 探索终态冷却 | 1800秒 | 60秒 | 减少后续普通调整等待；不允许同UID重复探索，不解除失败保护 |
 
-只延长总预算仍不够：探索基线剩余工作同步改为7200 step、允许延后3600秒、预留TTL至少5400秒、卡时预算5 GPU·h，具体约束见8.3。普通G系列仍用原3600 step算例及1800秒允许延后，不改变其收益期望。
+只延长总预算仍不够：探索基线剩余工作同步改为7200 step、允许延后3600秒、卡时预算5 GPU·h，具体约束见8.3。普通G系列仍用原3600 step算例及1800秒允许延后，不改变其收益期望。
 
 正常测试留足操作时间；故意测过期、HTTP超时或探索到期时，使用第7节和8.6的**专用短预算用例**，不用为了看失败等10或30分钟。上述参数只针对本手册mock控制流程，不能直接当成生产数据时效/稳态标准。
 
@@ -824,15 +824,13 @@ kubectl exec -n "$NS" "$MASTER" -c main -- cat /mock/swanlab.json \
 
 例如G05的2→1缩容，q1=0.75时T1≈1298.667秒，H0≈0.491111、H1≈0.427407 GPU·h，仍为卡时正收益，但不是原表30%的节省。报告中必须标记使用“1044步版本”，保存实际mock和fixture输入。
 
-#### 4.5.4 1044步任务不能直接照抄长预算探索
+#### 4.5.4 1044步任务的探索预算
 
-用100→160、total=1044时，基线剩余884秒，小于正常探索1800秒加回退900秒的2700秒，`prepare()`会以`insufficient_remaining_time`拒绝；开启探索开关也不会放行。这是预期保护，不是mock文件格式错误。
+使用100→160、total=1044时，基线剩余884秒。新策略有效探索时长为min(1800,884)=884秒，不再要求覆盖额外回退预算；在min_window=30、max_delay=3600及GPU预算充足时可通过时间准入。但884秒包含checkpoint、替换、恢复、预热、两轮窗口和人工操作；若实测恢复较慢，应使用更长任务，不能靠延长mock有效期延长真实训练。
 
-如果该任务真实吞吐较低，1044步仍可能有足够剩余时间，应使用合理的实际进度/吞吐重新判断。例如模拟100→106/60秒得到q0=0.1，R=938，基线9380秒，可满足时间准入；但这表示另一个慢训练场景，不能据此声称真实1 step/s的任务也适合30分钟探索。
+候选mock必须使用同一个total_steps=1044，work_end超过真实checkpoint_step且不超过1044，保持连续累计进度。例如基线100→160，候选160→280→400，每窗口60秒，表示q1=2；仅当实际checkpoint_step<280、窗口时间/恢复代次有效时首轮才可接受，第二轮还需检查剩余预算。若checkpoint已超过这些模拟值，应在触发前重设计整条轨迹，不能运行中跳跃增加work来伪造收益。
 
-探索还要求候选和回退窗口的work超过各自真实checkpoint_step，并始终≤1044、total_steps始终为1044。第8节100000以上的偏移轨迹不能用于1044总目标；只把其total_steps换成1044会因work>target直接失败。需根据触发时真实step、checkpoint进度及剩余时间单独设计连续轨迹，并协调缩短探索/回退预算；总时间仍须覆盖真实切换、恢复和两轮窗口，不能只为准入通过随意缩小。
-
-实际任务若会在操作期间接近或达到1044步，应优先完成普通门禁测试，或另开长任务验证探索回退。延长mock有效期不能延长真实训练生命期。
+第8节的100000偏移轨迹用于长任务，不能直接用于1044总目标。真实任务已经接近结束时，优先完成普通门禁测试。
 
 ## 5. 场景切换方法
 
@@ -1000,20 +998,20 @@ PY
 
 注入必须在窗口仍新鲜时触发。普通门禁结束本次计划后不自行轮询；如果重复 apply 相同 trigger 内容，Kubernetes 可能没有产生变化事件。先复位 idle，等待配置更新与已有伸缩线程结束，再触发 manual；也应检查外层冷却/优化次数。最易复现的方式仍是每个用例新建作业。
 
-## 8. 无候选数据的受控探索与回退
+## 8. 无候选数据的只观测探索
 
 ### 8.1 与普通测试桩的边界
 
-G09/S10 已覆盖“首次无候选且不开探索”的集群行为。要覆盖自动探索，需要将 `DLROVER_BENEFIT_HTTP_URL` 切换到本环境真实的执行/调度证据适配服务。本文测试桩没有预留资源，也不观察 checkpoint，不能将其响应改为 `confirmed=true` 后宣称完成了探索验收。
+G09/S10覆盖首次无候选且不开探索。探索必须对接真实执行/调度证据服务；普通fixture无法证明checkpoint恢复和实际资源，不可伪造ready来验收。
 
-真实适配服务需支持 [收益 HTTP 契约](vertical-elastic-benefit-http-cn.md) 中四种交互：
+服务需支持[收益HTTP契约](vertical-elastic-benefit-http-cn.md)：
 
-1. **准入**：明确 `candidate={"status":"unavailable"}`；提供完整训练可比性、成本、调度约束、limits，以及真实 checkpoint 兼容性、静止 checkpoint 支持、GPU 档位、回退预算和已建立的回退资源预留。
-2. **变更授权**：处理 `exploration.authorize_mutation=true`，再次核验本次请求身份、资源、预留 ID 与到期时间。不能要求此时必须取得训练窗口，训练可能已暂停。
-3. **观测**：提供真实 `applied_plan_id`、`restored_checkpoint`、`all_workers_ready`、generation、累计 `trial_gpu_seconds` 和预留状态。观测请求的 current 是试运行配置、target 是原配置。
-4. **终态回传**：处理 `release_reservation=true`，按探索 ID 幂等保存结果、释放预留，并返回匹配的 request_id、exploration_id、`recorded=true`。
+1. 准入明确candidate.status=unavailable，并给出exploration.policy=observe_only、allowed/checkpoint_compatible/quiescent_checkpoint=true、gpu_tiers=[1,2]以及完整成本、调度和limits。不再要求回退预算/预留。
+2. authorize_mutation=true：核对身份、目标可调度、约束及policy/allowed；训练暂停时不要求新窗口。
+3. 观测提供真实applied_plan_id、restored_checkpoint、all_workers_ready、generation、trial_gpu_seconds。current/target均为候选2卡，exploration.original为原1卡。
+4. report_result=true：按探索ID幂等记录成功、负收益或异常结果，响应匹配request_id、exploration_id、recorded=true。无需释放新回退预留。
 
-没有该服务时，第 8 节记录为“依赖未具备，未执行”，普通门禁矩阵仍可独立执行。现有本地 mock 单测可覆盖算法分支，但不能替代此集群验收。
+没有该服务时，探索标记“依赖未具备，未执行”，普通门禁仍可独立验收。
 
 ### 8.2 `04-exploration-env.yaml`：完整探索 ConfigMap
 
@@ -1064,28 +1062,21 @@ kubectl apply -f "$MANIFEST_DIR/05-exploration-job.yaml"
 
 ### 8.3 准入准备和预算
 
-本节正常探索采用30分钟总预算、15分钟回退预算；这些是上限，达到有效观测后会立即决策，不会固定等满。初始1卡、目标2卡，GPU tiers为`[1,2]`。
+正常探索配置为1800秒总上限、5 GPU·h、10秒轮询、60秒冷却。上限包含checkpoint、替换、恢复、30秒预热、两轮60秒窗口和人工核对；达到两轮有效窗口即决策，无需等满。建议在20分钟内完成观测。
 
-以下字段需要在**真实证据适配服务的测试任务配置**中设置，不属于Master env；只改04-exploration-env.yaml不足以完成配置：
+在真实证据服务设置下列字段（不是Master env）：
 
-| 适配服务字段 | 本文正常探索值 | 配置来源/含义 |
+| 字段 | 值 | 含义 |
 | --- | --- | --- |
-| exploration.rollback_seconds_upper | 900秒 | 回退切换、恢复和验证的预算；代码也用它估计回退代价 |
-| exploration.rollback_gpu_seconds_upper | 2700卡秒 | 本例按最多3卡占用（2卡候选+1卡预留）×900秒准备；实际资源账本仍必须真实计量 |
-| limits.max_delay_seconds | 3600秒 | 准入允许至少2700秒附加时间；普通fixture仍用1800秒，不改普通门禁算例 |
-| limits.deadline_at | null | 常规探索先不加deadline；专门测deadline时再设，不能用过近deadline遮蔽其他场景 |
-| exploration.rollback_reservation.expires_at | 准入时刻之后至少5400秒 | 真实预留90分钟，并满足服务自身释放/续期策略；不是JSON声明就完成资源预留 |
+| exploration.policy | observe_only | 必须显式支持新策略 |
+| exploration.allowed/checkpoint_compatible/quiescent_checkpoint | true | 真实授权与checkpoint能力 |
+| exploration.gpu_tiers | [1,2] | 本次1→2卡，相邻档位 |
+| limits.max_delay_seconds | 3600 | 常规探索约束；E02按下文专门放宽 |
+| limits.deadline_at | null | 常规场景不设deadline |
 
-联动检查：
+基线T0=7200秒时，D=min(1800,7200)=1800；D>2×30且max_delay≥D。若设deadline，须覆盖准入时刻之后至少7200+1800=9000秒。准入卡秒max(1,2)×1×1800=3600≤5×3600=18000，不再加回退和预留费用；实际累计卡秒由服务真实计量。
 
-- 当前worker健康，只有GPU档位变化；基础数据仍要求steady/comparable。
-- 探索基线按8.4设`T0=7200`秒，严格大于`1800+900=2700`秒。
-- `max_delay_seconds=3600 >= 2700`；如果额外设deadline，准入时至少需覆盖`7200+2700=9900`秒并留余量。
-- 准入卡秒为`max(1,2)×1×1800+2700=6300`，小于`5×3600=18000`。5 GPU·h是上限，不是固定消费；累计实际占用含预留仍由服务核算。
-- 预留不能只勉强覆盖去程和观测。代码在回退验证阶段仍检查“预留过期时间>当前时间+rollback_seconds”；示例5400秒覆盖最迟1800秒请求回退、900秒回退验证，再加900秒检查余量，另留1800秒缓冲。
-- 1800秒包含checkpoint、替换、恢复、30秒预热、两轮60秒窗口、轮询与人工核对。调试过程中不要人为等满预算再测正收益；建议候选决策在20分钟内完成。
-
-### 8.4 探索数据：基线、候选、回退分别何时生成
+### 8.4 探索数据：基线和候选分别何时生成
 
 #### 8.4.1 先设计整条模拟累计进度，不能中途换算例
 
@@ -1122,7 +1113,7 @@ kubectl exec -n "$NS" "$MASTER" -c main -- cat /mock/swanlab.json \
 kubectl apply -f "$MANIFEST_DIR/03-trigger.yaml"
 ```
 
-适配服务应明确返回candidate_unavailable以及有效准入/预留。依次确认admission.allowed=true、gate_decision=explore、PREPARING、checkpoint和SWITCHING。此时不要再提交第二次manual，也不要一直刷新基线文件；Master会在切换后进入探索轮询。
+适配服务应明确返回candidate_unavailable以及有效observe_only准入。依次确认admission.allowed=true、gate_decision=explore、PREPARING、checkpoint和SWITCHING。此时不要再提交第二次manual，也不要一直刷新基线文件；Master会在切换后进入探索轮询。
 
 #### 8.4.3 读取当前探索状态并等待真实恢复
 
@@ -1156,7 +1147,7 @@ CANDIDATE_READY_AT=$(kubectl exec -n "$NS" "$MASTER" -c main -- \
   python -c 'import time; print(time.time())')
 ```
 
-这样第一个完整60秒窗口会晚于observation_after、代次/恢复预热下界。此时检查expires_at是否还能覆盖95秒等待、第二窗口60秒、至少300秒人工操作及30秒请求余量（合计至少485秒）；不足则本轮无法按此流程完成观测，记录原因，不靠伪造时间或修改journal延长预算。下一个独立用例应在准入前协调增大trial预算、delay/deadline和预留TTL。
+这样第一个完整60秒窗口会晚于observation_after、代次/恢复预热下界。此时检查expires_at是否还能覆盖95秒等待、第二窗口60秒、至少300秒人工操作及30秒请求余量（合计至少485秒）；不足则本轮无法按此流程完成观测，记录原因，不靠伪造时间或修改journal延长预算。下一个独立用例应在准入前协调增大trial预算、delay/deadline。
 
 #### 8.4.4 第一个候选窗口：以E01为例
 
@@ -1182,7 +1173,7 @@ kubectl exec -n "$NS" "$MASTER" -c main -- cat /mock/swanlab.json \
   > "$CASE_DIR/candidate-window-1.json"
 ```
 
-等待Master下一次轮询后，重新执行8.4.3的只读journal命令，确认 `windows=1`、E01的`measured_lower=2`（E02为0.5，E03为1）、`last_window_end>0`。仅看到SwanLab window_selected还不够：探索还会检查真实执行/预留证据，只有journal计数增加才证明本轮被探索接受。
+等待Master下一次轮询后，重新执行8.4.3的只读journal命令，确认 `windows=1`、E01的`measured_lower=2`（E02为0.5，E03为1）、`last_window_end>0`。仅看到SwanLab window_selected还不够：探索还会检查真实执行证据，只有journal计数增加才证明本轮被探索接受。
 
 若一直为0，查observation_wait.reason，例如execution_or_window_mismatch、original_generation、checkpoint_not_exceeded、training_recovery_pending。不要生成下一轮覆盖问题输入；先保存日志和当前JSON。相同文件反复读取不会增加有效窗口数。
 
@@ -1195,7 +1186,7 @@ SECOND_END=$(python - "$CASE_DIR/trial-state.json" <<'PY'
 import json
 import sys
 s = json.load(open(sys.argv[1]))
-assert s['status'] in ('OBSERVING', 'VERIFYING_ROLLBACK') and s['windows'] == 1
+assert s['status'] == 'OBSERVING' and s['windows'] == 1
 print(s['last_window_end'] + 60)
 PY
 )
@@ -1203,7 +1194,7 @@ PY
 
 等Master时钟到达SECOND_END后，可以在之后5分钟内生成第二窗口，无需抢在30秒内操作。下面检查同时要求0≤age≤300，且journal所记录的本阶段expires_at至少还剩30秒。5分钟是本文操作窗口；数据有效期为10分钟，剩余余量供下一轮HTTP观测。总预算是独立限制，即使数据新鲜，探索也可能已经结束。
 
-先从本轮已保存的journal取本阶段到期时间（候选OBSERVING和回退VERIFYING_ROLLBACK分别使用各自最新journal）：
+先从本轮已保存的journal取本阶段到期时间（使用当前OBSERVING的最新journal）：
 
 ```bash
 TRIAL_EXPIRES_AT=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["expires_at"])' "$CASE_DIR/trial-state.json")
@@ -1228,52 +1219,42 @@ fi
 
 若错过模板时间段，不要把相同step计数配到一个随意的新时间；应记录当前轮未按预定输入完成，并按实际journal/预算处理。后续独立用例重新设计时间安排，或显式记录窗口间空档的模拟进度及重新计算预期。不要修改journal的last_window_end/windows来强行通过。
 
-#### 8.4.6 回退后还需要第三、第四轮窗口
+#### 8.4.6 两轮之后验证保留和结果回传
 
-E02第二个候选窗口后应进入回退分支。此时真实框架要保存**当前最新**checkpoint并恢复原1卡配置，不是重新加载探索开始时的旧checkpoint。等待新1卡worker、回退新generation、真实training_recovered和VERIFYING_ROLLBACK，再重新按恢复后的时间下界提供两个q=1窗口。
+不再生成第三、第四轮回退窗口。E01/E02/E03结束后均检查worker保持2卡、generation未因收益结论再次切换、无第二次checkpoint/替换、无“-rollback”计划。读取同一journal，核对status/reason/result/windows=2、candidate_generation、candidate_observed_at以及reported=true。RETAINED的evaluation_status必须为negative。
 
-按上述E02轨迹，模拟回退等待期间暂停进展，可用 `100120→100180`、`100180→100240`，total_steps始终107260；先确认新checkpoint_step也低于这些work，单位/batch假设没有变化。两轮之间同样采用上一已接受窗口末端+60秒衔接，并确认journal windows先为1再为2。回退进入观测时windows会清零，不能把候选阶段的两轮计入回退验证。
-
-回退预算从请求回退时重新按rollback_seconds计时，本文900秒同时容纳真实回退切换、恢复、95秒保守预热/窗口等待、第二窗口60秒及人工操作。可按真实切换/恢复300秒、等待95秒、第二窗口60秒、人工核对300秒、请求余量30秒规划，共785秒，还余115秒。若本环境切换明显超过5分钟，需提前调整适配服务预算和预留，而不是在运行中改journal。只看到资源回到1卡不算ROLLED_BACK，必须完成两轮新代次进度验证。
+INCONCLUSIVE/FAILED也会回传，但result可能为空，不能当成有效候选样本。reported=false表示服务尚未确认入库，不表示应该回退；保留journal和请求证据供重试。
 
 ### 8.5 探索场景矩阵与步骤
 
-每个独立探索用例使用新 job_uid。当前实现每个作业最多一次探索、一次回退，冷却到期不意味着允许第二次探索；不要通过删除 journal 重试。
+每个独立用例使用新job_uid，最多一次探索，冷却后也不会再次探索；不要删除journal重试。
 
 | ID | 场景及操作 | 验收 |
 | --- | --- | --- |
-| E01 | time，基线 q0=1，候选两个窗口 q1=2；剩余工作量和预算充足 | `ACCEPTED/positive_observed_gain`，保留 2 卡；结果回传成功，预留释放 |
-| E02 | time，候选两个窗口 q1=0.5；确认回退的未来时间更短、约束/预算仍满足 | `ROLLBACK_REQUESTED`，使用**当前最新** checkpoint 回退到 1 卡；再提供回退新代次两个窗口 q=1，且 work 超过回退 checkpoint，最终 `ROLLED_BACK` |
-| E03 | time，候选 q1=1，保持可行且回退更慢 | 整体收益通常因切换成本不达标，但回退要再付成本，`RETAINED/rollback_not_beneficial`；不能记成正收益 |
-| E04 | 专用新作业设trial_seconds=300，确认在240秒内进入OBSERVING；此后不提供有效新窗口，直到300秒总预算耗尽 | `INCONCLUSIVE/observation_budget_exhausted`；不自动回退，不证明目标配置有收益，后续自动调整被保护阻止 |
-| E05 | 准入回退预留未确认/TTL不足，或 max_delay<2700（正常1800秒探索+900秒回退配置） | 准入拒绝，不 checkpoint、不替换；检查 admission.reason |
-| E06 | 明确 unavailable，但目标设为 cluster_jct | 不进入探索，拒绝；当前仅支持 time/gpu_hours 探索 |
-| E07 | 缺 candidate 字段、HTTP 错误或基线未稳 | unknown，不进入探索，不能把所有 unknown 当作试运行许可 |
-| E08 | OBSERVING 中重启 Master，保留同一 ElasticJob UID、持久卷和原配置 | 恢复 journal，不重复首次资源替换；重新建立可信代次/执行上下文后提供新窗口，继续观测；预算超时则 INCONCLUSIVE |
-| E09 | 在隔离用例的 SWITCHING/ROLLING_BACK 状态中断 Master | 重启后保护阻止自动重放变更，需要核对真实资源/checkpoint；不删除 journal 强行继续 |
-| E10 | 变更前预留授权拒绝 | 不执行后续 worker 替换，记录失败/拒绝；检查 checkpoint 与当前 worker 实际状态 |
+| E01 | time，q0=1，候选两窗口q1=2 | ACCEPTED/positive_observed_gain，保留2卡，结果回传 |
+| E02 | time，q1=0.5；在准入前将服务max_delay_seconds设为20000，观测响应保持同值，无deadline | RETAINED/insufficient_observed_gain，负收益入库、保留2卡，无反向计划 |
+| E03 | time，q1=1，max_delay=3600 | RETAINED，不能记为正收益 |
+| E04 | trial_seconds=300，240秒内进入OBSERVING，不提供有效新窗口 | INCONCLUSIVE/observation_budget_exhausted，后续自动调整被保护阻止 |
+| E05 | policy缺失/旧值，或allowed=false，或max_delay<1800 | 准入拒绝，不checkpoint、不替换，检查admission.reason |
+| E06 | unavailable但objective=cluster_jct | 拒绝，当前不支持集群目标探索 |
+| E07 | 缺candidate、HTTP失败或基线未稳 | unknown，不进入探索 |
+| E08 | OBSERVING中重启Master，保留同UID、持久卷 | 恢复观测，不重复替换，不重置expires_at；重新建立可信恢复上下文 |
+| E09 | SWITCHING中中断Master | 不自动重放，核对真实资源/checkpoint；旧策略未完成journal同样被保护 |
+| E10 | 替换前目标授权被拒绝 | exploration_authorization_denied，不提交后续替换，核对checkpoint和worker现场 |
 
-E01/E02 的吞吐只是输入设计，最终分支还依赖 elapsed、remaining、卡秒、deadline，不能只凭 q1 的大小预断结果。time 目标的关键计算为：
+E02另加一个独立约束测试：保持max_delay=3600，其他输入不变，预期INCONCLUSIVE/constraint_violation，仍保留2卡，保存负向测量并阻止后续自动调整。它不能冒充RETAINED场景通过。
 
-```text
-整体收益 = 基线剩余时间 - 已消耗时间 - 当前剩余工作量/q1
-继续耗时 = 当前剩余工作量/q1
-回退耗时 = 回退时间上界 + 当前剩余工作量/q0
-```
+时间收益=T0−elapsed−remaining/q1。正且达到阈值、约束满足为ACCEPTED；约束满足但收益不足为RETAINED；违反约束则INCONCLUSIVE，所有分支均不自动回退。
 
-整体收益为正且超过阈值、继续满足约束时 ACCEPTED；回退更划算或继续违反约束且回退可行时才回退；继续可行但回退不划算可 RETAINED。观测超时或预留失效时不保证自动回退。
+以第二窗口决策时实际elapsed=600秒为例（假设值仅供手算，不修改时钟）：
 
-以8.4的新基线和三套输入为例，假定第二轮决策时从准入起实际已过600秒，回退上界900秒、max_delay=3600、无deadline且预留/卡时满足要求，可手算：
+| 用例 | 剩余work | keep_seconds | overall_gain | 约束与结果 |
+| --- | --- | --- | --- | --- |
+| E01 | 6960 | 3480 | 3120秒 | 43.33%>5%，600+3480≤7200+3600，ACCEPTED |
+| E02 | 7140 | 14280 | -7680秒 | 600+14280≤7200+20000，RETAINED |
+| E03 | 7080 | 7080 | -480秒 | 600+7080≤7200+3600，RETAINED |
 
-| 用例 | 第二轮剩余work | 保持预计耗时 | 整体收益 | 回退预计耗时 | 预期分支依据 |
-| --- | --- | --- | --- | --- | --- |
-| E01 | 6960 | 6960/2=3480秒 | 7200−600−3480=3120秒 | 900+6960=7860秒 | 整体收益43.33%超过5%，ACCEPTED |
-| E02 | 7140 | 7140/0.5=14280秒 | 7200−600−14280=−7680秒 | 900+7140=8040秒 | 回退更快，且600+8040≤7200+3600，申请回退 |
-| E03 | 7080 | 7080秒 | 7200−600−7080=−480秒 | 900+7080=7980秒 | 整体未盈利，但回退多花900秒，RETAINED |
-
-600秒是说明用的elapsed假设，不是伪造时钟。采用更大的7200秒基线后，即使E01在1800秒预算临近结束时才取得两轮窗口，整体收益仍约1920秒，超过360秒阈值；不会因为正常人工操作稍慢就轻易改变预期分支。真正到期前未完成有效观测仍是INCONCLUSIVE，不可修改时间绕过。
-
-E08 不是简单“重启后马上能用旧文件”：Master 新进程可能尚无可信训练代次边界，`/mock` 也可能已丢失；必须观察实际恢复上下文并重建新窗口。重启不会重置原 trial expires_at。
+E01即使在1800秒期限附近取得两窗口仍有约1920秒正收益；但超过expires_at则INCONCLUSIVE。E08重启后须重建mock窗口和可信代次上下文，不能直接复用旧文件。
 
 ### 8.6 专门验证探索超时，不等30分钟
 
@@ -1289,7 +1270,7 @@ kubectl patch configmap benefit-exploration-env -n "$NS" --type merge \
 
 短预算的前提是本环境从准入到OBSERVING能在240秒内完成，至少留下60秒观察超时。若未进入OBSERVING就超时，应记录“切换阶段超时”，不能算E04观测超时通过；下个新用例把trial_seconds设为实测切换时间加至少120秒。不能运行中修改journal来缩短或延长当前倒计时。
 
-正常探索结束后的60秒冷却不是E04的恢复手段：FAILED/INCONCLUSIVE会保留保护，需核对资源、checkpoint与预留。下一正常用例先重新apply04-exploration-env.yaml恢复1800秒，并使用新UID；保留失败journal供排查。
+正常探索结束后的60秒冷却不是E04的恢复手段：FAILED/INCONCLUSIVE会保留保护，需核对资源、checkpoint与journal。下一正常用例先重新apply04-exploration-env.yaml恢复1800秒，并使用新UID；保留失败journal供排查。
 
 ## 9. 收益控制参数说明
 
@@ -1334,7 +1315,7 @@ kubectl patch configmap benefit-exploration-env -n "$NS" --type merge \
 | `DLROVER_BENEFIT_STATE_DIR` | 空 | 持久化 POSIX 状态目录绝对路径；支持 flock、原子替换和持久化 |
 | `DLROVER_BENEFIT_TRIAL_SECONDS` | 600 | 本文正常探索设1800秒（30分钟）；从准入开始，包含切换、恢复与人工操作，非纯测量时间 |
 | `DLROVER_BENEFIT_TRIAL_POLL_SECONDS` | 10 | 两次观测间等待时间，实际周期还包括请求耗时 |
-| `DLROVER_BENEFIT_TRIAL_GPU_HOURS` | 0 | 本文设5 GPU·h；默认不具备探索预算，计入回退预算和预留占用 |
+| `DLROVER_BENEFIT_TRIAL_GPU_HOURS` | 0 | 本文设5 GPU·h；默认不具备探索预算，仅计探索实际资源占用，不额外要求回退预留 |
 | `DLROVER_BENEFIT_TRIAL_COOLDOWN_SECONDS` | 1800 | 本文设60秒；减少结束后的观察等待，不解除每job_uid最多一次探索或失败保护 |
 
 时长、轮询、冷却、卡时预算均要求有限且>0。关闭探索开关不会清除已有 journal 或自动回退；存在未完成状态时仍保留保护。
@@ -1384,7 +1365,7 @@ kubectl patch configmap benefit-exploration-env -n "$NS" --type merge \
 
 探索中的参数就绪等待还会受剩余trial预算限制；控制完成后的训练恢复确认也有执行侧超时。因此把trial设为1800秒不代表每个执行阶段都能等1800秒。若真实checkpoint/恢复超过执行侧900秒，应先定位框架或通过本环境Brain配置机制调整，不要单独增加mock有效期。
 
-预估操作节奏：首次确认真实step后约95秒可生成基线；普通门禁在触发链路正常时通常一个HTTP请求内返回判断，真实扩容耗时另算。正常探索建议10–20分钟内完成候选观测，回退另预留15分钟。期间可持续观察日志、Pod、journal，正常分支完成即结束，无需等预算耗尽；收益结果始终使用实际elapsed扣除人工等待时间。
+预估操作节奏：首次确认真实step后约95秒可生成基线；普通门禁在触发链路正常时通常一个HTTP请求内返回判断，真实扩容耗时另算。正常探索建议10–20分钟内完成候选观测，不再安排回退窗口。期间可持续观察日志、Pod、journal，正常分支完成即结束，无需等预算耗尽；收益结果始终使用实际elapsed扣除人工等待时间。
 
 ## 10. 日志、指标与问题定位
 
@@ -1403,6 +1384,8 @@ curl --fail http://127.0.0.1:19090/metrics > /tmp/benefit-k8s-test/metrics.prom
 rg 'dlrover_master_vertical_' /tmp/benefit-k8s-test/metrics.prom
 ```
 
+新增收益数值、有效性、来源和探索状态的核验步骤、完整指标名及PromQL见[收益Prometheus指标](vertical-elastic-benefit-prometheus-cn.md)。E02负收益应保留负值，E04无完整观测应valid=0且收益为NaN；不能都画成0。
+
 重点检查 `dlrover_master_vertical_benefit_evaluations_total` 的 mode/result/reason，以及探索终态计数。off 路径不增加收益评估计数，不应强求出现 positive/negative。Master 重启后计数器会重置，跨进程不能直接相减。
 
 | 现象 | 优先检查 |
@@ -1412,10 +1395,10 @@ rg 'dlrover_master_vertical_' /tmp/benefit-k8s-test/metrics.prom
 | 明明设置正收益却拒绝 | 环境变量是否新进程生效、HTTP 服务实际 scenario、objective、delay/deadline、当前是否仍为预期初始卡数 |
 | 修改场景后仍是旧结果 | ConfigMap 投影传播；GET /scenario；不要使用 subPath；确保没有重新 apply 初始的 `00-fixture-scenario.yaml` 覆盖当前场景 |
 | 收益放行后卡住 | checkpoint 协议、持久路径、真实节点可调度性、框架参数调整、rendezvous/恢复；fixture 的 feasible=true 不会创建 GPU |
-| 无候选但没有探索 | enabled、mode/objective、baseline 是否合格、PVC/文件锁、预算、预留、worker 健康、是否已有探索 journal |
+| 无候选但没有探索 | enabled、mode/objective、baseline 是否合格、PVC/文件锁、预算、policy授权、worker 健康、是否已有探索 journal |
 | 一直 more_windows_required | 是否重复同一文件，第二窗口是否在上次终点之后；至少两轮有效窗口 |
-| 探索回退没有 ROLLED_BACK | 回退真实恢复及新的两个窗口、最新 checkpoint step、generation、预留和剩余时间 |
-| INCONCLUSIVE 后仍在2卡 | 当前实现不在证据不足时强制回退；核对实际资源、checkpoint、预留并处理状态，不能直接删 journal |
+| 负收益后仍为2卡 | 新策略预期行为；核对RETAINED或INCONCLUSIVE、负向result、无反向计划 |
+| INCONCLUSIVE 后仍在2卡 | 当前实现不在证据不足时强制回退；核对实际资源、checkpoint、journal并处理状态，不能直接删 journal |
 
 ## 11. 报告模板与测试结束
 
@@ -1426,7 +1409,7 @@ rg 'dlrover_master_vertical_' /tmp/benefit-k8s-test/metrics.prom
 | 用例身份 | ID、执行时间、操作者、namespace、job name/UID、taskId |
 | 版本 | 仓库 commit、Master/worker 镜像 digest、controller/Brain 版本 |
 | 输入 | 最终 job YAML、env ConfigMap、实际加载的 scenario、每轮 scalar JSON、初始与目标 GPU |
-| 关联 | plan_id、request_id、generation；探索另加 reservation_id 和 rollback_plan_id |
+| 关联 | plan_id、request_id、generation；探索另加 policy、status、reason、reported |
 | 预期/实际 | evaluation status/reason、gate decision、公式估计值、探索终态 |
 | 执行证据 | checkpoint 路径/step、前后 Pod UID、GPU 配置、恢复后的持续进度 |
 | 结论 | 门禁是否通过、集群执行是否通过、未执行项/依赖和失败原因分别记录 |
@@ -1440,24 +1423,26 @@ kubectl delete deployment benefit-fixture -n elastic-training
 kubectl delete service benefit-fixture -n elastic-training
 ```
 
-探索用例先确认真实预留已释放或按约定 TTL 到期，保存 journal；不要通过清空状态目录消除失败记录。PVC 包含模型、数据和 checkpoint，以上清理命令保留该卷。
+探索用例先核对实际资源和终态回传，保存journal；升级遗留的旧预留需按服务流程结清；不要通过清空状态目录消除失败记录。PVC 包含模型、数据和 checkpoint，以上清理命令保留该卷。
 
 ## 12. 文档校验记录
 
-本次文档生成时已在本地完成：11 个 YAML 代码块共 14 个 Kubernetes 对象的 YAML 解析、必需标识检查、内嵌 HTTP 服务的 Python 语法检查、相对文件链接检查，以及将测试服务生成的 20 组场景快照传入当前 `evaluate()` 核对结果与表格一致。503 响应分支也已检查。
+本次只观测策略已通过本地pytest验证正收益、收益不足保留、约束违反、重复窗口拒绝、预算超限、重启兼容和SwanLab mock采样。具体测试数量见本次变更报告。
 
-本次细化后额外校验了全部shell代码块的Bash语法和嵌入Python语法；直接运行仓库mock生成器及SwanLab窗口校验，确认100→160基线得到q0=1、R=3600，预热不足和过期样本被拒绝，E01/E02/E03两轮示例在时间与累计work上连续且吞吐符合表格。
+本文未执行真实Kubernetes、checkpoint、GPU调度或适配服务集群验收；第11节应填写实际集群证据。E02必须同步放宽准入和观测响应的max_delay到20000，否则结果应为约束超限。
 
-调整手动测试时间后，重新用max_age=600验证20组普通收益场景；通过实际生成器和窗口校验确认生成5分钟后可用、601秒后过期，S04专用60秒有效期下65秒后过期。还以模拟时钟/执行证据直接调用当前Exploration.prepare/inspect，验证新预算准入、E01接受、E02请求回退并设置900秒回退预算、E03保留，以及elapsed=1790秒时E01仍满足收益阈值。这是本地状态机验证，不包含真实K8s回退执行。
+## 13. 按场景自动执行
 
-这些校验未部署 Kubernetes，没有执行真实 HTTP 超时、checkpoint、GPU 调度或探索回退。当前本地 Python 环境未安装 pytest，未运行现有 pytest 回归集。集群结果按第 11 节逐项填写，不能将上述静态/函数级校验当作端到端通过。
+现在可使用 [自动化入口](../../examples/pytorch/resource_elastic/benefit_validation/run_k8s_cases.py)
+和 [场景配置示例](../../examples/pytorch/resource_elastic/benefit_validation/k8s-cases.example.yaml)。
+完整使用方法、场景覆盖范围、探索服务 hook 契约见
+[自动化说明](../../examples/pytorch/resource_elastic/benefit_validation/k8s-automation.md)。
 
-相关实现与已有材料：
+配置中的 `infrastructure` 可以全局定义，也可以在 `cases.G01`、`cases.S04` 等场景中分别定义。
+列表严格控制第3.1节哪些 YAML 会被部署；场景列表替换全局列表，空列表表示全部复用。
+`templates` 可为标准 YAML 指定自定义文件，也可在基础设施列表中直接加入其他 YAML 路径。
+先使用 `render` 离线检查，再使用 `run` 执行；多场景顺序运行需要 `--cleanup`，仅清理本轮创建且 UID 匹配的 ElasticJob，不清理 PVC 和 journal。
 
-- [收益门禁计算](../../dlrover/python/master/resource/benefit.py)
-- [SwanLab mock/稳态校验](../../dlrover/python/master/resource/swanlab.py)
-- [受控探索状态机](../../dlrover/python/master/resource/exploration.py)
-- [mock 生成器](../../examples/pytorch/resource_elastic/benefit_validation/generate_swanlab_mock.py)
-- [整体流程说明](vertical-elastic-benefit-flow-cn.md)
-- [HTTP 与探索契约](vertical-elastic-benefit-http-cn.md)
-- [已有分层测试方案](vertical-elastic-benefit-validation-cn.md)
+G01–G23、S01–S10 提供内置执行和断言。收益拒绝时必须确认原 Worker UID/重启次数不变、训练继续增长、终态 skipped 且未执行 checkpoint/替换。
+E 系列需要真实适配服务；E08–E10 的环境相关故障通过 hook 执行并归档证据。依赖缺失记录为 NOT_RUN，不视为通过。
+本脚本的离线测试不代表已经执行集群验收。

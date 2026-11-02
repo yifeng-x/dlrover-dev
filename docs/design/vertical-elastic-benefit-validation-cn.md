@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | 计算正确性 | 相同输入是否产生正确收益与决策？ | 固定数据集的时间、卡时、集群 JCT 结果与手算一致 |
 | 数据正确性 | SwanLab 数据是否可用于计算？ | taskId、key、采样批次、generation、窗口和进度校验通过；错误数据不被放行 |
-| 控制正确性 | 拒绝、调整、探索和回退是否符合判断？ | enforce 拒绝发生在 checkpoint 前；探索仅在明确缺候选吞吐且准入通过时执行 |
+| 控制正确性 | 拒绝、调整、探索和结果记录是否符合判断？ | enforce 拒绝发生在 checkpoint 前；探索仅在明确缺候选吞吐且准入通过时执行 |
 | 可观测性 | 能否还原一次调整？ | 事件关联身份、资源四态、收益依据和执行结果；控制完成与训练恢复可区分 |
 | 实际收益 | 相同工作量或同一任务集合是否确实改善？ | 实测完成时间、资源积分及集群 JCT/任务吞吐满足预设目标，训练质量不退化 |
 
@@ -32,7 +32,7 @@
 2. 训练框架支持当前 checkpoint、参数调整与恢复协议；检查点可在两个档位加载。训练进度保留 optimizer step，实际 global batch size 在调整前后保持一致。
 3. Master 能访问两个 HTTP 服务。收益证据服务不是仓库内自动部署的服务，必须由环境提供；SwanLab 接口只提供训练数据。
 4. 使用独立测试命名空间 `dlrover-benefit-test`，其中只启用一个手动监听作业。**当前 Master 回调没有按 `job_names` 过滤；该字段不能隔离触发对象。** Brain 手动优化器读取固定名称 `brain-manual-scale-config`，仅修改 Master 监听名称不能完整隔离链路。
-5. 探索额外要求真实回退资源预留和持久化 POSIX 卷，验证跨 Pod 文件锁及原子 rename；不能用 emptyDir，不能用返回 `confirmed=true` 的模拟接口冒充实际预留。
+5. 探索要求真实目标调度/恢复证据及policy=observe_only、持久化POSIX卷；验证跨Pod锁及原子rename，不能用emptyDir或伪造ready冒充执行证据。
 6. 保存测试代码提交号、镜像 digest、配置、GPU 型号、并行策略、训练数据版本和时钟同步状态。HTTP token 通过既有 Secret 注入，不写入测试报告。
 
 ## 3. 第一阶段：无需 GPU 的逻辑回归
@@ -163,7 +163,7 @@ curl --fail-with-body -X POST \
 
 隔离的模拟测试可用第 3.1 节 snapshot 作为响应模板，按本次请求回填身份与资源，并使用受控时钟/实时生成的模拟采样序列；固定日期样本不能直接用于实时 Master。实际训练测试不得刷新旧观测时间伪装新数据，也不得简单回显请求就宣称 checkpoint 已恢复、资源已预留。
 
-探索测试需另外覆盖三类请求：资源替换前 `authorize_mutation=true`；观测时真实 execution、reservation 和 trial_gpu_seconds；终态 `release_reservation=true` 的幂等入库及释放。没有这些能力，只验收普通门禁，探索标记为“未具备测试条件”。
+探索测试需另外覆盖三类请求：资源替换前 `authorize_mutation=true`；观测时真实execution和trial_gpu_seconds；终态 `report_result=true`的幂等入库。没有这些能力，只验收普通门禁，探索标记为“未具备测试条件”。
 
 ## 5. 第三阶段：Kubernetes 配置与执行
 
@@ -197,7 +197,7 @@ Master 原启动命令应包括 `--elastic_dimension vertical --configmap_manual
 
 ### 5.2 开启受控探索的附加片段
 
-确认预留服务与卷准备好后应用 exploration-config.yaml，并合并以下内容。`REPLACE-POSIX-PVC` 是当前命名空间已绑定、具备可靠锁语义的持久卷，不提供虚构 StorageClass：
+确认执行证据服务与卷准备好后应用 exploration-config.yaml，并合并以下内容。`REPLACE-POSIX-PVC` 是当前命名空间已绑定、具备可靠锁语义的持久卷，不提供虚构 StorageClass：
 
 ```yaml
 spec:
@@ -221,9 +221,9 @@ spec:
                   mountPath: /var/lib/dlrover/benefit
 ```
 
-后一个 envFrom 覆盖前一个同名值。示例预算 600 秒、10 GPU·h；准入响应若给出回退时间 300 秒，允许延后至少覆盖 900 秒，当前剩余训练时间也需大于 900 秒，预留 TTL 覆盖两者并留出余量。真实预算按框架恢复耗时设置。
+后一个 envFrom 覆盖前一个同名值。示例上限600秒、10 GPU·h；有效时长D=min(600,基线剩余秒数)，需D>2×min_window、允许延后≥D，deadline覆盖基线剩余时间+D，不需要回退预留。真实预算按框架恢复耗时设置。
 
-每个 job_uid 最多一次探索、一次回退。独立探索用例创建新测试作业以获得新 UID；重启恢复测试必须使用原 UID 和原持久目录，不能删除 journal 来重试。
+每个 job_uid 最多一次探索，不自动回退。独立探索用例创建新测试作业以获得新 UID；重启恢复测试必须使用原 UID 和原持久目录，不能删除 journal 来重试。
 
 ### 5.3 触发与收集
 
@@ -283,21 +283,21 @@ G03/G04 中的固定数据仅用于模拟联调。真实训练时使用实际 q0
 
 | 编号 | 设置与测试动作 | 期望行为 |
 | --- | --- | --- |
-| E01 | enforce，探索开启，candidate 明确 unavailable，其他证据与预留完整 | unknown/explore；记录基线，持久化状态后执行调整 |
+| E01 | enforce，探索开启，candidate 明确 unavailable，其他证据与observe_only授权完整 | unknown/explore；记录基线，持久化状态后执行调整 |
 | E02 | 候选字段缺失、接口故障或数据失效 | 不满足 candidate_unavailable 条件；拒绝，不试跑 |
-| E03 | 预留不确认、预算不足、非相邻 GPU 档位或 checkpoint 不兼容 | 准入失败，checkpoint 前结束 |
+| E03 | policy不匹配/授权拒绝、预算不足、非相邻 GPU 档位或 checkpoint 不兼容 | 准入失败，checkpoint 前结束 |
 | E04 | 调整后至少两个独立稳态窗口，整体收益超过阈值 | ACCEPTED；记录实测 q1 与整体收益，保留目标配置并回传结果 |
-| E05 | 新配置较差，回退未来代价更低且满足预算/期限 | 仅一次回退；新 plan_id，root/parent 关联；保存当前新 checkpoint，恢复原资源并验证新代次，最终 ROLLED_BACK |
-| E06 | 整体收益不达标，但回退更贵，继续仍满足约束 | RETAINED；不宣称正收益，也不进行无收益回退 |
+| E05 | 新配置较差，但延迟/deadline仍满足 | RETAINED，保存负向结果，继续候选配置；无新checkpoint/反向计划 |
+| E06 | 整体收益不达标，继续仍满足约束 | RETAINED；不宣称正收益，也不进行无收益回退 |
 | E07 | 重复窗口、旧代次、预热数据或尚未越过 checkpoint | 不增加有效观测次数；有效数据到来前等待，耗尽预算后 INCONCLUSIVE |
-| E08 | 观测期预留失效或资源预算耗尽 | INCONCLUSIVE；停止自动调整，不凭空承诺安全回退 |
-| E09 | 回退 checkpoint/执行失败 | FAILED；不无限重试，不绕过保护强删训练进程 |
-| E10 | OBSERVING / VERIFYING_ROLLBACK 时重启 Master | 使用原 journal 恢复观测；重新核实代次、执行和预留；不能猜测旧数据属于当前代次 |
+| E08 | 观测期违反延迟/deadline或资源预算耗尽 | INCONCLUSIVE；停止自动调整，不凭空承诺安全回退 |
+| E09 | 候选checkpoint/执行失败 | FAILED；不无限重试，不绕过保护强删训练进程 |
+| E10 | 新策略OBSERVING时重启Master | 使用原 journal 恢复观测；重新核实代次与执行；不能猜测旧数据属于当前代次 |
 | E11 | SWITCHING / ROLLING_BACK 时中断 | 防护状态阻止自动重放资源变更，保留现场供核对 |
 | E12 | 未完成探索时关闭开关并重启 | 原状态保护仍生效，不恢复自动观测，也不清除 journal |
-| E13 | 终态回传失败后恢复服务 | 保留本地结果，后续进入/重启重发；服务按探索 ID 幂等存证和释放预留 |
+| E13 | 终态回传失败后恢复服务 | 保留本地结果，后续进入/重启重发；服务按探索 ID 幂等存证 |
 
-确定性分支可运行现有 `test_vertical_exploration.py` 对应用例，其中 `test_negative_measurement_rolls_back_once_and_verifies_new_checkpoint`、`test_sunk_cost_does_not_force_harmful_rollback` 分别覆盖回退和保留。真实集群测试可以用独立测试训练负载控制新配置下的计算/等待开销，但必须保持有效工作量和训练语义可比，不能修改标量来伪造性能；人为限速结果单独标记为故障注入实验。
+确定性分支可运行现有 `test_vertical_exploration.py` 对应用例，其中 `test_negative_measurement_retains_candidate_without_rollback`、`test_constraint_violation_records_negative_without_rollback`分别覆盖负收益保留和约束超限保护。真实集群测试可以用独立测试训练负载控制新配置下的计算/等待开销，但必须保持有效工作量和训练语义可比，不能修改标量来伪造性能；人为限速结果单独标记为故障注入实验。
 
 ### 6.3 事件与指标核对
 
@@ -307,7 +307,7 @@ G03/G04 中的固定数据仅用于模拟联调。真实训练时使用实际 q0
 2. evaluated 同时保存 evaluation_status 与 decision；shadow 下 negative/allow、探索下 unknown/explore 均是合法组合。
 3. 普通成功计划：control_completed 后确认进度，再有 training_recovered 和 finished。探索可能由稳态窗口验证恢复，不强制要求每条成功探索都有原生进度事件。
 4. 资源包含 before/target/actual_after/final。目标不是实测；缺节点或混合配置时观测为未知，不能用 target 填补 final。
-5. 回退原计划 finished=rollback_requested、final=null；回退子计划使用共同 root_plan_id，parent_plan_id 指向原计划，确认后记录最终资源。
+5. 收益不足时同一plan记录RETAINED，evaluation_status=negative，final来自真实候选资源；不得出现回退子计划。
 6. 正常单进程内每个计划上下文只产生一次 finished。日志平台按 event_id 去重；重启可能产生不同 ID 的同业务状态事件，不能宣称全链路 exactly-once。
 7. 比较 `benefit_evaluations_total`、`plans_finished_total`、`recovery_total`、`explorations_total` 与对应日志。plans_finished 表示控制流程终态，事件 finished 可能等恢复/探索完成才出现；二者时间与数量口径不必逐条同步。
 8. Prometheus 不增加 plan_id/request_id 等高基数标签。日志写入失败不能改变资源控制决策；模拟 sink 故障由 `test_reporting_failure_does_not_break_metrics_or_controller` 验证。
@@ -360,8 +360,8 @@ G03/G04 中的固定数据仅用于模拟联调。真实训练时使用实际 q0
 | 用例 | job_uid / taskId | root_plan_id / plan_id | 输入与目标 | 预期 | 实际 | 原始证据路径 | 结论 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | G03 | 待填 | 待填 | time，4→8 | allow、恢复确认 | 待填 | 待填 | 未执行 |
-| E05 | 待填 | 原计划/回退计划 | 负向观测且回退有利 | 一次回退、ROLLED_BACK | 待填 | 待填 | 未执行 |
+| E05 | 待填 | 探索计划 | 负向观测且约束满足 | RETAINED，候选资源保留 | 待填 | 待填 | 未执行 |
 
-最终报告分别列出：逻辑回归结论、接口联调结论、真实资源调整结论、探索故障恢复结论、实测单任务/集群收益结论。未部署的服务、未验证的预留能力、未执行的 GPU 实验写“未验证”，不以本地测试通过代替。
+最终报告分别列出：逻辑回归结论、接口联调结论、真实资源调整结论、探索故障恢复结论、实测单任务/集群收益结论。未部署的服务、未验证的授权/恢复能力、未执行的 GPU 实验写“未验证”，不以本地测试通过代替。
 
-测试结束先核实任务终态、回退预留已释放和 journal 状态，再按环境流程清理测试资源；保留异常现场与原始证据。本文仅提供测试材料，不会自动部署或触发实际资源调整。
+测试结束先核实任务终态、结果回传和journal状态，再按环境流程清理测试资源；保留异常现场与原始证据。本文仅提供测试材料，不会自动部署或触发实际资源调整。

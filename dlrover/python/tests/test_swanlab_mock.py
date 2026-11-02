@@ -124,9 +124,9 @@ def test_mock_drives_real_benefit_gate_before_execution(tmp_path, candidate, all
         context.clear_job_nodes()
 
 
-@pytest.mark.parametrize("speed,outcome", [(2, "ACCEPTED"), (0.5, "rollback")])
+@pytest.mark.parametrize("speed,outcome", [(2, "ACCEPTED"), (0.9, "RETAINED")])
 @pytest.mark.parametrize("fixed_batch", [False, True])
-def test_mock_exploration_requires_new_windows_and_verifies_rollback(trial, tmp_path, speed, outcome, fixed_batch):
+def test_mock_exploration_requires_new_windows_and_retains_candidate(trial, tmp_path, speed, outcome, fixed_batch):
     path = tmp_path / "rows.json"
     data = admission(trial)
     data["training"].update(target_work=10000, global_batch_size=64)
@@ -151,11 +151,9 @@ def test_mock_exploration_requires_new_windows_and_verifies_rollback(trial, tmp_
         data = payload(kwargs["json"], now=now)
         data["candidate"] = {"status": "unavailable"}
         data["exploration_id"] = "trial-1"
-        data["execution"] = dict(applied_plan_id=trial.state.get("rollback_plan_id", "trial-1"),
+        data["execution"] = dict(applied_plan_id="trial-1",
                                  restored_checkpoint=trial.state["checkpoint_path"],
                                  all_workers_ready=True, generation=generation[0], trial_gpu_seconds=(now - 1000) * 8)
-        data["exploration"] = {"rollback_reservation": {
-            "id": "lease", "confirmed": True, "expires_at": 10000}}
         return response(data)
     trial.guard.post = evidence
     trial.test_clock[0] = 1240
@@ -166,14 +164,5 @@ def test_mock_exploration_requires_new_windows_and_verifies_rollback(trial, tmp_
     trial.test_clock[0] = 1300
     write_rows(path, client, [1240, 1270, 1300], generation="202", work_start=160 + 60 * speed, speed=speed)
     assert trial.inspect() == outcome
-    assert trial.state["result"]["candidate_throughput"] == speed
-    if outcome == "rollback":
-        trial.switching(400, "return-checkpoint", rollback=True)
-        trial.observing(rollback=True)
-        generation[0] = "303"
-        for start, end, work in [(1300, 1360, 400), (1360, 1420, 460)]:
-            trial.test_clock[0] = end
-            write_rows(path, client, [start, (start + end) / 2, end],
-                       generation="303", work_start=work, speed=1)
-            assert trial.inspect() == ("wait" if end == 1360 else "ROLLED_BACK")
+    assert trial.state["result"]["candidate_throughput"] == pytest.approx(speed)
     client.post.assert_not_called()

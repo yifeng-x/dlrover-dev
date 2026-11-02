@@ -48,6 +48,32 @@ class VerticalExecutionMetrics:
             "Pre-checkpoint benefit outcomes.",
             ("mode", "result", "reason"),
         )
+        # Latest evidence per stage. No plan/generation labels: histories live
+        # in Prometheus timestamps and durable exploration journals.
+        self._benefit_labels = {}
+        self._exploration_counted = set()
+        self._benefit_gauges = {}
+        for name, help_text in (
+            ("baseline_throughput", "Baseline work units per second."),
+            ("candidate_throughput", "Candidate work units per second."),
+            ("gain_ratio", "Gain relative to the selected objective baseline; may be negative."),
+            ("time_gain_seconds", "Projected training time saved, including transition costs."),
+            ("gpu_seconds_saved", "Projected GPU seconds saved; may be negative."),
+            ("valid", "One if a complete numeric benefit result is available, not a positive-gain flag."),
+            ("observed_timestamp_seconds", "Training evidence endpoint Unix time; zero if unavailable."),
+        ):
+            self._benefit_gauges[name] = metric(
+                Gauge, "benefit_" + name, help_text,
+                ("stage", "objective", "work_unit", "data_source"),
+            )
+        self.exploration_windows = metric(
+            Gauge, "exploration_windows", "Accepted independent observation windows.")
+        self.exploration_gpu_seconds = metric(
+            Gauge, "exploration_gpu_seconds", "Last accepted cumulative trial GPU seconds; not lifetime consumption.")
+        self.exploration_reported = metric(
+            Gauge, "exploration_result_reported", "One only after the adapter acknowledges the durable outcome.")
+        self.exploration_state = metric(
+            Gauge, "exploration_state", "Latest durable exploration state (one hot).", ("state",))
         self.finished = metric(
             Counter,
             "plans_finished_total",
@@ -151,6 +177,91 @@ class VerticalExecutionMetrics:
         self._set_phase(Phase.IDLE)
         self.workers.labels("target").set(0)
         self.workers.labels("param_ready").set(0)
+
+    @staticmethod
+    def _finite(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+    def _benefit_snapshot(self, stage, objective, training, values, valid, observed_at):
+        """Caller holds the metrics lock; replace stale label combinations."""
+        objective = objective if objective in ("time", "gpu_hours", "cluster_jct") else "unknown"
+        unit = training.get("unit")
+        unit = unit if unit in ("steps", "samples", "tokens") else "unknown"
+        source = training.get("data_source", "http" if training else "unknown")
+        source = source if source in ("mock", "http") else "unknown"
+        labels = (stage, objective, unit, source)
+        previous = self._benefit_labels.get(stage)
+        if previous and previous != labels:
+            for metric in self._benefit_gauges.values():
+                metric.remove(*previous)
+        self._benefit_labels[stage] = labels
+        required = ("baseline_throughput", "candidate_throughput", "gain_ratio",
+                    "time_gain_seconds", "gpu_seconds_saved")
+        valid = bool(valid and all(self._finite(values.get(k)) for k in required))
+        for key in required:
+            value = values.get(key)
+            self._benefit_gauges[key].labels(*labels).set(
+                value if self._finite(value) else float("nan"))
+        self._benefit_gauges["valid"].labels(*labels).set(int(valid))
+        self._benefit_gauges["observed_timestamp_seconds"].labels(*labels).set(
+            observed_at if self._finite(observed_at) else 0)
+
+    def record_benefit(self, guard):
+        """Record one pre-checkpoint evaluation, never a control HTTP request."""
+        result = guard.last_result
+        estimates = result.estimates if result is not None and guard.mode != "off" else {}
+        training = (guard.last_snapshot or {}).get("training", {}) if estimates else {}
+        values = dict(
+            baseline_throughput=estimates.get("current_throughput"),
+            candidate_throughput=estimates.get("candidate_throughput"),
+            time_gain_seconds=estimates.get("time_gain_seconds"),
+            gain_ratio=estimates.get("gain_ratio"),
+        )
+        hours = estimates.get("gpu_hours_saved")
+        if self._finite(hours):
+            values["gpu_seconds_saved"] = hours * 3600
+        if guard.objective in ("time", "gpu_hours"):
+            gain = estimates.get("time_gain_seconds" if guard.objective == "time" else "gpu_hours_saved")
+            baseline = estimates.get("baseline_seconds" if guard.objective == "time" else "baseline_gpu_hours")
+            if self._finite(gain) and self._finite(baseline) and baseline > 0:
+                values["gain_ratio"] = gain / baseline
+        with self._lock:
+            self._benefit_snapshot(
+                "prediction", guard.objective, training, values,
+                result is not None and result.status in ("positive", "negative") and guard.mode != "off",
+                training.get("end", {}).get("observed_at"),
+            )
+
+    def record_exploration(self, state, restored=False):
+        """Publish durable state; count each new outcome once per process.
+
+        Restoring a completed journal restores gauges without counting a new
+        event. Repeated saves (including report acknowledgements) never count.
+        """
+        if not state:
+            return
+        status = state.get("status")
+        states = ("PREPARING", "SWITCHING", "OBSERVING", "ACCEPTED", "RETAINED",
+                  "INCONCLUSIVE", "FAILED", "ROLLED_BACK", "ROLLING_BACK", "VERIFYING_ROLLBACK")
+        terminal = status in ("ACCEPTED", "RETAINED", "INCONCLUSIVE", "FAILED", "ROLLED_BACK")
+        result = state.get("result") or {}
+        training = state.get("baseline", {}).get("training", {})
+        training = {**training, **{k: result[k] for k in ("unit", "data_source") if k in result}}
+        with self._lock:
+            if terminal and state.get("id") not in self._exploration_counted:
+                self._exploration_counted.add(state.get("id"))
+                if not restored:
+                    self.explorations.labels(status.lower()).inc()
+            for item in states:
+                self.exploration_state.labels(item.lower()).set(int(status == item))
+            self.exploration_windows.set(state.get("windows", 0))
+            self.exploration_gpu_seconds.set(state.get("spent_gpu_seconds", 0))
+            self.exploration_reported.set(int(state.get("reported", False)))
+            self._benefit_snapshot(
+                "exploration", state.get("objective"), training, result,
+                terminal and state.get("windows", 0) >= 2,
+                state.get("candidate_observed_at"),
+            )
 
     def request(self, action, result, reason="none", event_request_id=None,
                 trigger_source="unknown"):

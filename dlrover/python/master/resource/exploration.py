@@ -1,6 +1,6 @@
 # Copyright 2026 The DLRover Authors. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
-"""One bounded, durable cold-start trial per job. No scheduler emulation.
+"""One bounded, durable observation-only trial per job. Never auto-rollback.
 
 State directory must be a durable shared POSIX volume with working flock.
 Interrupted mutations are fenced for reconciliation, never blindly replayed.
@@ -21,7 +21,10 @@ from dlrover.python.common.node import NodeGroupResource, NodeResource
 from dlrover.python.master.resource.benefit import number
 from dlrover.python.master.resource.benefit_log import BenefitLogger
 
+POLICY = "observe_only"
+# ROLLED_BACK is accepted only for completed legacy journals.
 TERMINAL = {"ACCEPTED", "RETAINED", "ROLLED_BACK"}
+FINISHED = TERMINAL | {"FAILED", "INCONCLUSIVE"}
 
 
 def pack(group):
@@ -94,10 +97,11 @@ class TrialStore:
 
 
 class Exploration:
-    def __init__(self, guard, env=None, clock=time.time):
+    def __init__(self, guard, env=None, clock=time.time, metrics=None):
         env = os.environ if env is None else env
         self._log = BenefitLogger("exploration")
         self.guard = guard
+        self.metrics = metrics
         self.clock = clock
         # Startup switch: only explicit true enables trials. Keep journal
         # recovery fences active even when new exploration is disabled.
@@ -130,7 +134,7 @@ class Exploration:
             state = self.store.load()
             if not state or state["status"] in TERMINAL:
                 return False, False
-            return True, state["status"] not in ("OBSERVING", "VERIFYING_ROLLBACK")
+            return True, not (state.get("policy") == POLICY and state["status"] == "OBSERVING")
         except (OSError, ValueError, KeyError, TypeError):
             return True, True
 
@@ -154,18 +158,19 @@ class Exploration:
             if self.store is None or not self.store.acquire():
                 return False
             self.state = self.store.load()
+            self._publish_metrics(restored=True)
             if self.state:
                 status = self.state["status"]
+                if status in FINISHED and not self.state.get("reported", False):
+                    self.report_result()
                 if status in TERMINAL:
-                    if not self.state.get("reported", False):
-                        self.release_reservation()
                     return (not recovering and
                             self.clock() >= self.state["cooldown_until"])
-                if status in ("OBSERVING", "VERIFYING_ROLLBACK") and recovering:
+                if status == "OBSERVING" and self.state.get("policy") == POLICY and recovering:
                     self.active = True
                     return self.enabled and self.guard.mode == "enforce" and self.valid
-                # PREPARING/SWITCHING/ROLLING_BACK may have partially mutated
-                # Kubernetes. Reconcile manually rather than repeat deletion.
+                # Partial mutations and all unfinished legacy trials need manual
+                # reconciliation. Never resume an old automatic rollback policy.
                 return False
             return not recovering and (not self.enabled or self.valid)
         except (OSError, ValueError, KeyError, TypeError):
@@ -177,6 +182,14 @@ class Exploration:
             self.store.release()
         self.active = False
 
+    def _publish_metrics(self, restored=False):
+        if self.metrics is not None:
+            try:
+                self.metrics.record_exploration(self.state, restored=restored)
+            except Exception:
+                # Observability must never change the resource decision.
+                logger.exception("Failed to publish exploration metrics")
+
     def save(self, status=None, **changes):
         next_state = copy.deepcopy(self.state)
         next_state.update(changes)
@@ -184,6 +197,7 @@ class Exploration:
             next_state["status"] = status
         self.store.save(next_state)
         self.state = next_state
+        self._publish_metrics()
         self._log.emit(
             "state_saved", 
             repeat_key=(
@@ -193,7 +207,6 @@ class Exploration:
                 self.state.get("reported")
             ),
             plan_id=self.state["id"], 
-            rollback_plan_id=self.state.get("rollback_plan_id"),
             status=self.state["status"], 
             reason=self.state.get("reason"),
             windows=self.state.get("windows"), 
@@ -229,8 +242,10 @@ class Exploration:
         snapshot = self.guard.last_snapshot
         try:
             admission = snapshot["exploration"]
+            if admission.get("policy") != POLICY:
+                return reject("observation_policy_required")
             if not all(admission.get(k) is True for k in (
-                "allowed", "checkpoint_compatible", "rollback_supported", "quiescent_checkpoint"
+                "allowed", "checkpoint_compatible", "quiescent_checkpoint"
             )):
                 return reject("admission_conditions")
             tiers = admission["gpu_tiers"]
@@ -245,39 +260,33 @@ class Exploration:
                 k: v for k, v in b.items() if k != "gpu_num"
             }:
                 return reject("resource_shape_changed")
-            rollback_seconds = number(admission, "rollback_seconds_upper", positive=True)
-            rollback_gpu = number(admission, "rollback_gpu_seconds_upper", positive=True)
             limits = snapshot["limits"]
             baseline = self.guard.last_result.estimates["baseline_seconds"]
-            if baseline <= self.duration + rollback_seconds:
+            # The configured duration is a ceiling, not a requirement for the
+            # task to outlive an entire trial plus a hypothetical rollback.
+            duration = min(self.duration, baseline)
+            if duration <= 2 * self.guard.min_window:
                 return reject("insufficient_remaining_time")
-            if limits["max_delay_seconds"] < self.duration + rollback_seconds:
+            if limits["max_delay_seconds"] < duration:
                 return reject("delay_budget")
             deadline = limits.get("deadline_at")
-            if deadline is not None and self.clock() + baseline + self.duration + rollback_seconds > deadline:
+            if deadline is not None and self.clock() + baseline + duration > deadline:
                 return reject("deadline")
             gpu_budget = self.max_gpu_hours * 3600
-            # Conservative budget includes reserved rollback capacity, not just
-            # the GPUs doing useful work during the trial.
-            trial_gpu = max(a["gpu_num"], b["gpu_num"]) * a["count"] * self.duration
-            if trial_gpu + rollback_gpu > gpu_budget:
+            trial_gpu = max(a["gpu_num"], b["gpu_num"]) * a["count"] * duration
+            if trial_gpu > gpu_budget:
                 return reject("gpu_budget")
-            reservation = admission["rollback_reservation"]
-            if (not isinstance(reservation.get("id"), str) or not reservation["id"]
-                    or reservation.get("confirmed") is not True
-                    or number(reservation, "expires_at") <= self.clock() + self.duration + rollback_seconds):
-                return reject("rollback_reservation")
             self.state = dict(
-                version=1, id=plan_id, status="PREPARING", original=a, target=b,
-                started_at=self.clock(), expires_at=self.clock() + self.duration,
-                rollback_seconds=rollback_seconds, rollback_gpu_seconds=rollback_gpu,
-                gpu_budget=gpu_budget, reservation_id=reservation["id"],
+                version=1, policy=POLICY, id=plan_id, status="PREPARING", original=a, target=b,
+                started_at=self.clock(), expires_at=self.clock() + duration,
+                gpu_budget=gpu_budget,
                 objective=self.guard.objective, baseline=copy.deepcopy(snapshot),
                 q0=self.guard.last_result.estimates["current_throughput"],
                 baseline_seconds=baseline, last_window_end=0, windows=0,
-                rollback_attempted=False, spent_gpu_seconds=0,
+                spent_gpu_seconds=0,
             )
             self.store.save(self.state)
+            self._publish_metrics()
             self.active = True
             self._log.emit(
                 "admission", 
@@ -296,31 +305,31 @@ class Exploration:
             self.active = False
             return reject("invalid_evidence_or_journal")
 
-    def authorize_mutation(self, rollback=False):
-        allowed = self._authorize_mutation(rollback)
+    def authorize_mutation(self):
+        allowed = self._authorize_mutation()
         self._log.emit(
             "mutation_authorized", 
             plan_id=self.state["id"],
-            rollback_plan_id=self.state.get("rollback_plan_id"),
-            rollback=rollback, 
             allowed=allowed,
             request_id=(self.guard.last_request or {}).get("request_id")
         )
         return allowed
 
-    def _authorize_mutation(self, rollback=False):
-        """Refresh scheduler reservation immediately before replacing workers."""
+    def _authorize_mutation(self):
+        """Refresh target feasibility and explicit admission before replacement."""
         state = self.state
-        current = unpack(state["target"] if rollback else state["original"])
-        target = unpack(state["original"] if rollback else state["target"])
+        if state.get("policy") != POLICY or state["status"] != "SWITCHING":
+            return False
+        current = unpack(state["original"])
+        target = unpack(state["target"])
         context = dict(
             id=state["id"], 
             status=state["status"],
-            reservation_id=state["reservation_id"],
+            policy=POLICY,
             checkpoint_path=state["checkpoint_path"],
             authorize_mutation=True
         )
-        self.guard._check(current, target, state.get("rollback_plan_id", state["id"]), context)
+        self.guard._check(current, target, state["id"], context)
         data, request = self.guard.last_snapshot, self.guard.last_request
         try:
             if data.get("schema_version") != 1:
@@ -334,25 +343,31 @@ class Exploration:
             scheduling = data["scheduling"]
             if scheduling.get("target_feasible") is not True or scheduling.get("constraints_satisfied") is not True:
                 return False
-            reservation = data["exploration"]["rollback_reservation"]
-            until = state["expires_at"] + (0 if rollback else state["rollback_seconds"])
-            return (reservation.get("id") == state["reservation_id"]
-                    and reservation.get("confirmed") is True
-                    and number(reservation, "expires_at") > until)
+            admission = data["exploration"]
+            return (admission.get("policy") == POLICY
+                    and admission.get("allowed") is True)
         except (KeyError, TypeError, AttributeError, ValueError):
             return False
 
-    def release_reservation(self):
-        # Idempotent notification. If unavailable, the external reservation TTL
-        # releases capacity; the terminal outcome is already durable.
+    def report_result(self):
+        """Idempotently upload durable outcomes, including incomplete observations."""
         state = self.state
         try:
+            context = dict(id=state["id"], status=state["status"],
+                           reason=state.get("reason"), policy=state.get("policy"),
+                           objective=state.get("objective"),
+                           result=state.get("result"), windows=state.get("windows", 0),
+                           candidate_observed_at=state.get("candidate_observed_at"),
+                           candidate_generation=state.get("candidate_generation"))
+            if state.get("policy") == POLICY:
+                context["report_result"] = True
+            else:
+                # Completed legacy journals may still need to release capacity.
+                # This is a notification only; it cannot execute a reverse plan.
+                context.update(release_reservation=True,
+                               reservation_id=state.get("reservation_id"))
             self.guard._check(unpack(state["original"]), unpack(state["target"]),
-                              state["id"], dict(id=state["id"], status=state["status"],
-                              reservation_id=state["reservation_id"], release_reservation=True,
-                              result=state.get("result"),
-                              candidate_observed_at=state.get("candidate_observed_at"),
-                              candidate_generation=state.get("candidate_generation")))
+                              state["id"], context)
             ack = self.guard.last_snapshot
             if (isinstance(ack, dict) and ack.get("recorded") is True
                     and ack.get("exploration_id") == state["id"]
@@ -365,16 +380,16 @@ class Exploration:
                 request_id=(self.guard.last_request or {}).get("request_id")
             )
         except Exception:
-            logger.warning("Exploration reservation release notification failed")
+            logger.warning("Exploration result notification failed")
 
-    def switching(self, checkpoint_step, checkpoint_path, rollback=False):
+    def switching(self, checkpoint_step, checkpoint_path):
         if not checkpoint_path:
             raise ValueError("Exploration requires a persistent checkpoint path")
-        self.save("ROLLING_BACK" if rollback else "SWITCHING",
+        self.save("SWITCHING",
                   checkpoint_step=checkpoint_step, checkpoint_path=checkpoint_path)
 
-    def observing(self, rollback=False):
-        self.save("VERIFYING_ROLLBACK" if rollback else "OBSERVING",
+    def observing(self):
+        self.save("OBSERVING",
                   observation_after=self.clock(), last_window_end=0, windows=0,
                   observation_generation=None, measured_lower=None)
 
@@ -392,19 +407,23 @@ class Exploration:
         return "wait"
 
     def inspect(self):
-        """Poll one observation. Return wait, rollback, or terminal status."""
+        """Poll candidate performance; never issue a resource mutation."""
         state = self.state
         now = self.clock()
+        if state.get("policy") != POLICY or state["status"] != "OBSERVING":
+            self.finish("INCONCLUSIVE", "state_requires_reconciliation")
+            return "INCONCLUSIVE"
         if now >= state["expires_at"]:
             self.finish("INCONCLUSIVE", "observation_budget_exhausted")
             return "INCONCLUSIVE"
-        rollback = state["status"] == "VERIFYING_ROLLBACK"
-        current = unpack(state["original"] if rollback else state["target"])
-        target = unpack(state["target"] if rollback else state["original"])
+        # Both sides describe the running candidate. The original resource is
+        # carried separately as the comparison baseline, not a reverse plan.
+        current = unpack(state["target"])
+        target = unpack(state["target"])
         context = dict(id=state["id"], status=state["status"],
-                       reservation_id=state["reservation_id"],
+                       policy=POLICY, original=self.guard.resource(unpack(state["original"])),
                        checkpoint_path=state["checkpoint_path"],
-                       applied_plan_id=state.get("rollback_plan_id", state["id"]),
+                       applied_plan_id=state["id"],
                        observation_after=state["observation_after"],
                        last_window_end=state["last_window_end"],
                        started_at=state["started_at"])
@@ -431,25 +450,16 @@ class Exploration:
                 return self._wait("execution_or_window_mismatch")
             if state.get("observation_generation") not in (None, start["generation"]):
                 return self._wait("observation_generation_changed")
-            if not rollback and start["generation"] == state["baseline"]["training"]["end"]["generation"]:
+            if start["generation"] == state["baseline"]["training"]["end"]["generation"]:
                 return self._wait("original_generation")
-            if rollback and start["generation"] == state.get("candidate_generation"):
-                return self._wait("candidate_generation")
             if training["unit"] == "steps" and end["work"] <= state["checkpoint_step"]:
                 return self._wait("checkpoint_not_exceeded")
             if snapshot["scheduling"].get("constraints_satisfied") is not True:
                 return self._wait("scheduler_constraints")
-            reservation = snapshot["exploration"]["rollback_reservation"]
-            if (reservation.get("id") != state["reservation_id"] or
-                    reservation.get("confirmed") is not True or
-                    number(reservation, "expires_at") <= now + state["rollback_seconds"]):
-                self.finish("INCONCLUSIVE", "rollback_reservation_lost")
-                return "INCONCLUSIVE"
             spent = number(snapshot["execution"], "trial_gpu_seconds")
             if spent < state["spent_gpu_seconds"]:
                 return self._wait("gpu_accounting_regressed")
-            required = spent + (0 if rollback else state["rollback_gpu_seconds"])
-            if required > state["gpu_budget"]:
+            if spent > state["gpu_budget"]:
                 self.finish("INCONCLUSIVE", "gpu_budget_exhausted")
                 return "INCONCLUSIVE"
             q1 = (end["work"] - start["work"]) / (end["observed_at"] - start["observed_at"])
@@ -460,72 +470,58 @@ class Exploration:
                       spent_gpu_seconds=spent, observation_generation=start["generation"],
                       measured_lower=q1)
             state = self.state
-            if state["windows"] < 2:
-                return self._wait("more_windows_required")
-            if rollback:
-                self.finish("ROLLED_BACK", "rollback_progress_verified")
-                return "ROLLED_BACK"
             remaining = training["target_work"] - end["work"]
-            if remaining <= 0:
-                self.finish("RETAINED", "training_finished")
-                return "RETAINED"
+            if state["windows"] < 2:
+                if remaining <= 0:
+                    self.finish("INCONCLUSIVE", "training_finished_before_observation")
+                    return "INCONCLUSIVE"
+                return self._wait("more_windows_required")
             elapsed = now - state["started_at"]
-            keep = remaining / q1
-            back = state["rollback_seconds"] + remaining / state["q0"]
+            keep = max(0, remaining) / q1
             g0 = state["original"]["count"] * state["original"]["gpu_num"]
             g1 = state["target"]["count"] * state["target"]["gpu_num"]
             limits = copy.deepcopy(state["baseline"]["limits"])
             limits["max_delay_seconds"] = min(limits["max_delay_seconds"], number(snapshot["limits"], "max_delay_seconds"))
             current_deadline = snapshot["limits"].get("deadline_at")
             if current_deadline is not None:
-                current_deadline = number(snapshot["limits"], "deadline_at", positive=True)
-                limits["deadline_at"] = min(limits.get("deadline_at") or current_deadline, current_deadline)
+                limits["deadline_at"] = min(limits.get("deadline_at") or current_deadline,
+                                            number(snapshot["limits"], "deadline_at", positive=True))
             keep_allowed = elapsed + keep <= state["baseline_seconds"] + limits["max_delay_seconds"]
-            back_allowed = elapsed + back <= state["baseline_seconds"] + limits["max_delay_seconds"]
             if limits.get("deadline_at") is not None:
                 keep_allowed &= now + keep <= limits["deadline_at"]
-                back_allowed &= now + back <= limits["deadline_at"]
             if state["objective"] == "time":
                 total_gain = state["baseline_seconds"] - elapsed - keep
                 denominator = state["baseline_seconds"]
-                future_gain = keep - back
             else:
                 total_gain = g0 * state["baseline_seconds"] - spent - g1 * keep
                 denominator = g0 * state["baseline_seconds"]
-                future_gain = g1 * keep - state["rollback_gpu_seconds"] - g0 * remaining / state["q0"]
-            values = dict(candidate_throughput=q1, overall_gain=total_gain,
-                          keep_seconds=keep, rollback_seconds=back,
-                          future_rollback_gain=future_gain)
-            self._log.emit(
-                "observed_benefit", 
-                plan_id=state["id"],
-                objective=state["objective"], 
-                windows=state["windows"],
-                keep_allowed=keep_allowed, 
-                rollback_allowed=back_allowed,
-                min_gain_ratio=self.guard.min_gain, 
-                **values
-            )
+            if not all(math.isfinite(v) for v in (elapsed, keep, total_gain, denominator)):
+                return self._wait("invalid_observation")
+            positive = total_gain > 0 and total_gain >= self.guard.min_gain * denominator
+            values = dict(candidate_throughput=q1, baseline_throughput=state["q0"],
+                          gain_unit="seconds" if state["objective"] == "time" else "gpu_seconds",
+                          overall_gain=total_gain, gain_ratio=total_gain / denominator,
+                          time_gain_seconds=state["baseline_seconds"] - elapsed - keep,
+                          gpu_seconds_saved=g0 * state["baseline_seconds"] - spent - g1 * keep,
+                          keep_seconds=keep, elapsed_seconds=elapsed,
+                          remaining_work=max(0, remaining), trial_gpu_seconds=spent,
+                          evaluation_status="positive" if positive and keep_allowed else "negative",
+                          constraints_satisfied=bool(keep_allowed),
+                          data_source=training.get("data_source", "http"),
+                          unit=training["unit"], windows=state["windows"],
+                          candidate_resource=self.guard.resource(unpack(state["target"])))
             self.save(result=values, candidate_generation=start["generation"],
                       candidate_observed_at=end["observed_at"])
-            budget_available = spent + state["rollback_gpu_seconds"] <= state["gpu_budget"]
-            if keep_allowed and total_gain > 0 and total_gain >= self.guard.min_gain * denominator and budget_available:
+            self._log.emit("observed_benefit", plan_id=state["id"],
+                           objective=state["objective"], keep_allowed=keep_allowed,
+                           min_gain_ratio=self.guard.min_gain, **values)
+            if not keep_allowed:
+                self.finish("INCONCLUSIVE", "constraint_violation")
+                return "INCONCLUSIVE"
+            if positive:
                 self.finish("ACCEPTED", "positive_observed_gain")
                 return "ACCEPTED"
-            if (back_allowed and budget_available and not state["rollback_attempted"]
-                    and (not keep_allowed or future_gain > 0)):
-                # Current reverse plan must still be schedulable. Evidence is
-                # supplied by the reservation service for this exact request.
-                if snapshot["scheduling"].get("target_feasible") is not True:
-                    return self._wait("rollback_target_infeasible")
-                self.save("ROLLING_BACK", rollback_attempted=True,
-                          rollback_plan_id=state["id"] + "-rollback",
-                          expires_at=now + state["rollback_seconds"])
-                return "rollback"
-            if keep_allowed and budget_available:
-                self.finish("RETAINED", "rollback_not_beneficial")
-                return "RETAINED"
-            self.finish("INCONCLUSIVE", "constraint_or_budget_violation")
-            return "INCONCLUSIVE"
+            self.finish("RETAINED", "insufficient_observed_gain")
+            return "RETAINED"
         except (KeyError, TypeError, ValueError, ArithmeticError):
             return self._wait("invalid_observation")

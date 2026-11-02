@@ -38,7 +38,7 @@ Master 每次获取重新读取文件，因此可以更新数据而无需重启�
 2. 等待当前代次恢复及预热完成，生成完全位于时间下界之后的新鲜基线数据。保留现有收益证据服务配置；该服务仍需提供候选吞吐、切换开销、调度约束及 comparable 等证据。
 3. 触发原有资源调整流程。查看 `BenefitFlow` 中 `data_source=mock`、窗口与吞吐、收益结果和 `gate_decision`。
 4. 探索时，在新 worker generation 建立后更新文件。保持目标总步数和 global batch size 一致，按实际测试时钟推进时间及 work。至少提供两个独立的新窗口；反复读取同一文件不会增加有效窗口数。每个后续窗口的起点需不早于上一窗口终点，且在 observation_after 与预热下界之后。每个窗口内至少三个点，以便推断吞吐稳定性。
-5. 验证负收益回退时，为回退后的 generation 再提供两个新窗口，并让 work 超过新的检查点步数。
+5. 验证收益不足时，确认RETAINED、负向result及2卡资源保留，无新checkpoint和反向计划；违反延迟约束则为INCONCLUSIVE且保留保护。
 6. 关闭 mock 后恢复真实 HTTP 获取，需要配置有效 SwanLab URL。
 
 mock 只替换 SwanLab 数据源，不模拟收益证据服务、资源预留、Kubernetes、checkpoint 或真实训练。enforce 模式仍可能执行实际资源调整。模拟结果仅用于验证控制流程，不能当作真实收益。收益请求及业务事件的 training 中也携带 `data_source=mock`，用于识别模拟证据。
@@ -50,4 +50,4 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
   dlrover/python/tests/test_swanlab_mock.py
 ```
 
-测试覆盖默认关闭与显式开启、文件和数据失败、label 必需、正负收益门控到执行、重复窗口拒绝、探索接受、负收益回退及回退后进度确认。收益证据 HTTP、checkpoint 和 worker 执行边界由测试模拟，其余走真实代码。
+测试覆盖默认关闭与显式开启、文件和数据失败、label 必需、正负收益门控到执行、重复窗口拒绝、探索接受、负收益保留及约束超限保护。收益证据 HTTP、checkpoint 和 worker 执行边界由测试模拟，其余走真实代码。

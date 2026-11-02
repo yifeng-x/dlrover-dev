@@ -307,31 +307,24 @@ def test_resource_lookup_error_still_emits_terminal():
     assert messages[-1]["resources"]["final"] is None
 
 
-def test_scaler_rollback_emits_linked_terminal_events(trial):
+def test_scaler_negative_observation_keeps_candidate_and_reports_result(trial):
     from dlrover.python.tests.test_vertical_exploration import begin, make_scaler, observe
     begin(trial)
     obj = make_scaler(trial)
     messages = []
-    actual = [resource_snapshot(group(8))]
     obj.events.sink = messages.append
-    obj.events.observation_provider = lambda ids: {"resources": copy.deepcopy(actual[0])}
+    obj.events.observation_provider = lambda ids: {"resources": resource_snapshot(group(8))}
     obj.events.start("trial-1", "add_gpus", exploring=True)
     obj.events.resources(group(4), group(8))
-    observe(trial, speed=.5, work=190)
-    assert observe(trial, speed=.5, start=1180, end=1240, work=220) == "rollback"
-    def execute(*args, **kwargs):
-        actual[0] = resource_snapshot(group(4))
-        obj.vertical_metrics.finish("completed")
-        trial.switching(230, "latest-return-checkpoint", rollback=True)
-        trial.observing(rollback=True)
-        return True
-    with patch.object(trial, "inspect", side_effect=["rollback", "ROLLED_BACK"]), \
-         patch.object(obj, "_execute_resource_plan", side_effect=execute), \
-         patch.object(obj._benefit_stop, "wait"), patch.object(trial, "release_reservation"):
+    observe(trial, speed=.8, work=208)
+    assert observe(trial, speed=.8, start=1180, end=1240, work=256) == "RETAINED"
+    with patch.object(trial, "inspect", return_value="RETAINED"), \
+         patch.object(obj, "_execute_resource_plan") as mutation, \
+         patch.object(trial, "report_result"):
         assert obj._observe_exploration()
+    mutation.assert_not_called()
     finished = [e for e in messages if e["event_type"] == "finished"]
-    assert [e["plan_id"] for e in finished] == ["trial-1", "trial-1-rollback"]
-    assert finished[0]["resources"]["final"] is None
-    assert finished[1]["parent_plan_id"] == "trial-1"
-    assert finished[1]["resources"]["final"]["total_gpus"] == 4
-    assert finished[1]["execution_status"] == "completed"
+    assert [e["plan_id"] for e in finished] == ["trial-1"]
+    assert finished[0]["resources"]["final"]["total_gpus"] == 8
+    assert finished[0]["exploration"]["evaluation_status"] == "negative"
+    assert finished[0]["recovery_status"] == "verified_by_exploration"

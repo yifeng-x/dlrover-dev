@@ -1,8 +1,8 @@
 # 垂直弹性收益评估整体流程说明
 
-整理日期：2026-10-29。本文根据当前仓库实现说明资源调整前的收益评估、SwanLab 数据获取、受控探索及回退流程。文中的配置值是代码默认值，不代表线上任务的实际配置。
+整理日期：2026-10-30。本文根据当前仓库实现说明资源调整前的收益评估、SwanLab 数据获取、只观测探索流程。文中的配置值是代码默认值，不代表线上任务的实际配置。逐事件说明与完整日志分支见 [BenefitFlow 完整流程](vertical-elastic-benefitflow-reference-cn.md)。
 
-当前流程先生成资源计划，在通知训练保存 checkpoint 前评估收益。有可信候选性能时进行事前预测；明确缺少候选性能时，可以通过受控探索实测新配置，再决定保留或回退。收益门禁默认关闭，探索也默认关闭。
+当前流程先生成资源计划，在通知训练保存 checkpoint 前评估收益。有可信候选性能时进行事前预测；明确缺少候选性能时，可以通过受控探索实测新配置，记录正收益或收益不足，保留候选配置。收益门禁默认关闭，探索也默认关闭。
 
 ## 1. 整体流程
 
@@ -24,27 +24,24 @@ flowchart TD
     J -->|enforce：明确缺少候选吞吐| X{探索开启且满足准入条件？}
     J -->|enforce：其他负收益或未知| Z
     X -->|否| Z
-    X -->|是| Y[持久化原配置、基线、预算与预留信息]
+    X -->|是| Y[持久化原配置、基线、预算与策略信息]
     Y --> K
     K --> K1[通知训练保存 checkpoint]
     K1 --> K2[等待 checkpoint 就绪]
-    K2 --> K3[探索模式再次确认回退资源预留]
+    K2 --> K3[探索模式再次确认目标调度授权]
     K3 --> K4[替换 worker、调整参数、完成 rendezvous]
     K4 --> K5[跟踪训练恢复与进度]
     K5 --> L{是否为受控探索？}
     L -->|否| M[完成本次执行，不进入收益轮询]
     L -->|是| N[周期查询训练和执行证据，接受至少两个独立稳定窗口]
-    N --> O[计算整体收益与未来回退收益]
+    N --> O[计算整体实测预测收益]
     O --> P{探索决策}
     P -->|整体收益达标| Q[ACCEPTED：保留新配置]
-    P -->|继续执行更合适| R[RETAINED：保留但未验证正收益]
-    P -->|回退更优或继续违反约束，且回退可行| S[保存最新 checkpoint，回退原配置]
+    P -->|收益不足但约束满足| R[RETAINED：保留但未验证正收益]
     P -->|证据、预算或约束不满足| T[INCONCLUSIVE / FAILED]
-    S --> U[验证回退后的训练推进：ROLLED_BACK]
-    Q --> V[持久化结果、回传证据并通知释放预留]
+    Q --> V[持久化结果并回传证据]
     R --> V
-    U --> V
-    T --> V
+    T --> W[保留保护状态，核对资源、checkpoint与journal]
 ```
 
 图中展示已配置独立 SwanLab 客户端的路径。没有配置 scalar URL 且没有开启 mock 时，训练窗口由收益证据服务的完整快照提供。采集或校验失败会得到 `unknown`，不会按缺失值为零继续计算。
@@ -56,6 +53,8 @@ flowchart TD
 计划为空、目标 GPU 数无效或与当前相同时，不进入后续资源替换。有效计划进入 `_check_resource_benefit()`，通过后才执行 `_execute_resource_plan()`，通知训练保存 checkpoint。
 
 因此，收益门禁拒绝发生在 checkpoint 通知之前，当前计划不会因为收益评估失败而先替换 worker。普通路径不会在该计划内持续轮询等待训练窗口变稳；`enforce` 下证据不足会结束本次计划，后续需要新的调整触发。
+
+拒绝会将执行阶段和指标记录为 `SKIPPED`，保持原 Worker 训练；仅进入 `REPLACING_WORKERS` 后设置的 `_replacement_started` 标记与 `FAILED` 同时成立时，才触发“Vertical replacement failed”的提前停止分支。其他训练故障停止规则继续生效。
 
 收益门禁的三个模式：
 
@@ -80,9 +79,8 @@ Master 从 scalar 接口拉取已经存在的历史采样点，在本地选取�
 | 普通调整前 | 有效计划生成后、checkpoint 通知前 | 一次收益评估中先查询 SwanLab，再请求证据服务 |
 | 普通调整完成后 | 执行完成与恢复跟踪阶段 | 普通路径不自动进入持续收益评估循环 |
 | 受控探索 | 切换完成进入 `OBSERVING` 后 | 每轮观测后默认等待 10 秒再查询；实际周期还包含请求耗时 |
-| 回退验证 | 回退完成进入 `VERIFYING_ROLLBACK` 后 | 继续查询，验证原配置的新代次训练已经推进 |
 | 替换前资源变更授权 | checkpoint 就绪后、资源变更前 | 只请求证据服务，不查询 SwanLab |
-| 探索终态释放预留 | 探索结束后 | 只请求证据服务，不查询 SwanLab |
+| 探索终态回传结果 | 探索结束后 | 只请求证据服务，不查询 SwanLab |
 | 门禁关闭 | `DLROVER_BENEFIT_MODE=off` | 该收益路径不查询 SwanLab |
 
 ### 3.2 查询身份与指标
@@ -257,7 +255,7 @@ H1 = (960 + 8 × 1720) / 3600 ≈ 4.09 GPU·小时
 
 ## 6. 资源调整执行过程
 
-门禁放行后进入保存 checkpoint 阶段，等待训练上报完成。探索模式会在替换前持久化 checkpoint 和切换状态，并重新确认回退预留。
+门禁放行后进入保存 checkpoint 阶段，等待训练上报完成。探索模式会在替换前持久化 checkpoint 和切换状态，并重新确认目标调度授权。
 
 随后等待旧 worker 退出、提交资源计划、等待目标 worker 参数调整就绪，完成 rendezvous 协调。代码记录执行完成并启动恢复跟踪；执行完成不等于训练已经稳定恢复，恢复还需后续进度确认。
 
@@ -265,60 +263,41 @@ H1 = (960 + 8 × 1720) / 3600 ≈ 4.09 GPU·小时
 
 ## 7. 候选性能未知时的受控探索
 
-### 7.1 准入
+### 7.1 准入与预算
 
-只有同时满足以下条件才可能探索：
+仅enforce、time/gpu_hours、探索开启、明确candidate_unavailable且当前worker健康时申请探索。服务须显式返回policy=observe_only、allowed/checkpoint_compatible/quiescent_checkpoint=true；只允许GPU相邻档位变化，其他资源形状不变。无需回退能力、回退预算或预留。
 
-- 门禁模式为 `enforce`，且 `DLROVER_BENEFIT_EXPLORE=true`。
-- 候选明确返回 `{"status":"unavailable"}`；其他缺字段、超时或无效证据不触发探索。
-- 当前 worker 全部健康，数量与 GPU 配置一致，目标是合法相邻 GPU 档位，其他资源配置符合检查。
-- 支持停稳 checkpoint、跨档位恢复和一次回退。
-- 外部调度服务已经真实建立回退资源预留，且有效期足够。
-- 时间、卡时、延迟与 deadline 预算覆盖探索和回退。
-- 配置可靠的共享持久化状态目录，支持文件锁与原子写入。
+共享持久POSIX目录保证文件锁与原子保存；每个job_uid最多一次探索。有效时长D=min(trial_seconds,Tbase)，必须>2×min_window，max_delay≥D，deadline若存在需≥now+Tbase+D，max(G0,G1)×D≤GPU秒预算。D包含checkpoint、切换、恢复、预热和观测，不是纯采样时间。
 
-每个 job UID 最多一次探索和一次回退。默认探索预算为 600 秒，涵盖 checkpoint、切换、恢复、预热与观测；卡时预算必须显式配置。预留资源占用也需计入预算，DLRover 不会凭接口的 `confirmed=true` 自行创建预留。
+### 7.2 切换与观测
 
-### 7.2 调整后的观测
+保存checkpoint后持久化SWITCHING，替换前重新核验目标可调度、约束与observe_only授权。控制切换完成后进入OBSERVING，持续校验真实applied_plan_id、恢复checkpoint、worker readiness、新generation、单位/目标/batch和累计GPU秒。
 
-每轮观测校验实际生效计划、全部 worker readiness、加载的 checkpoint、generation、训练目标与 batch 语义，以及回退预留和资源消耗。
+观测请求current/target均为候选配置，原资源在exploration.original。进度超过checkpoint，窗口不早于observation_after和上一窗口末端；至少接受两个独立完整窗口，候选保守吞吐q1取最小值。每个SwanLab窗口内部的稳定子窗口与探索的两个完整窗口是不同层次，重复文件不能凑数。
 
-观测进度必须超过 checkpoint step，使用调整后的新代次，窗口不得早于开始观测时间或上一窗口终点。至少接受两个独立完整窗口，取已接受窗口吞吐的最小值作为候选保守吞吐。
+### 7.3 记录整体收益
 
-这里有两层窗口要求：每个 SwanLab 窗口内部默认包含两个稳定子窗口；探索至少接受两个这样的完整窗口。10 秒轮询并不意味着每轮都能生成新证据。
-
-### 7.3 整体收益与未来回退收益
-
-探索开始保存原吞吐 q0 和原配置预计剩余时间 Tbase。设 E 为已耗时间，Wnow 为当前剩余 step，S 为探索累计 GPU·秒，Db/Cb 为回退耗时及资源占用上界：
+保存原吞吐q0和基线剩余时间Tbase。令E为已耗时间，R为当前剩余工作，S为累计GPU秒，G0/G1为原/候选总GPU数：
 
 ```text
-继续新配置的未来时间 K = Wnow / q1
-回退并完成的未来时间 B = Db + Wnow / q0
-
+K = max(0,R)/q1
 整体时间收益 = Tbase - E - K
-未来回退时间收益 = K - B
-
-整体资源收益 = G0 × Tbase - S - G1 × K
-未来回退资源收益 = G1 × K - Cb - G0 × Wnow / q0
+整体资源收益 = G0*Tbase - S - G1*K  （GPU秒）
 ```
 
-资源目标下探索结果的单位为 GPU·秒，转换为 GPU·小时需除以 3600。S 由证据服务提供，应包含切换、训练和预留资源，不能从 GPU 利用率推算。
+result保存吞吐、整体收益及比例、保持预计时间、elapsed、remaining、累计卡秒、evaluation_status、constraints_satisfied、窗口数和候选资源；另存candidate_generation/observed_at。仍是实测吞吐外推收益，不是整个作业实际收益结算。
 
-整体收益回答此次探索从开始算是否划算；未来回退收益回答从现在起回退是否更划算。整体收益为负不意味着必须回退，已经发生的开销不会因为回退而消失。
-
-### 7.4 决策顺序
+### 7.4 决策与保护
 
 | 条件 | 结果 |
 | --- | --- |
-| 继续执行符合约束、整体收益达标且预算满足 | `ACCEPTED`，保留新配置 |
-| 未达到上述条件，回退更划算或继续违反约束，且回退可行 | 发起一次回退 |
-| 继续可行且预算满足，回退没有优势 | `RETAINED`，保留但不声明验证了正收益 |
-| 观测超时、预留失效、预算或约束无法满足 | `INCONCLUSIVE`，不盲目回退 |
-| checkpoint、切换等执行失败 | 可进入 `FAILED` |
+| 两窗口有效、满足延迟/deadline、整体正收益达到阈值 | ACCEPTED/positive_observed_gain，保留候选 |
+| 两窗口有效、满足约束但收益不足 | RETAINED/insufficient_observed_gain，保留候选，evaluation_status=negative |
+| 有效结果违反延迟/deadline | INCONCLUSIVE/constraint_violation，保存负向结果并保护后续调整 |
+| 时间或卡秒耗尽、训练完成前不足两窗口 | INCONCLUSIVE，保留保护，不冒充有效正收益 |
+| checkpoint或切换执行失败 | FAILED，保留保护 |
 
-回退使用新的独立计划 ID，通知当前训练保存最新 checkpoint，不直接加载探索前的旧 checkpoint。回退完成后进入 `VERIFYING_ROLLBACK`，同样接受至少两个有效窗口、确认新代次训练推进后才标记 `ROLLED_BACK`。
-
-失败或无法判定的状态会阻止后续自动调整；没有可信进度或有效预留时不会强制删除 worker 来猜测性回退。
+以上均不自动回退，不生成反向计划；异常不代表训练健康，需要核对现场。限额采用基线和当前更严格值。详细协议和升级兼容见[HTTP契约](vertical-elastic-benefit-http-cn.md)。
 
 ## 8. 配置与默认值
 
@@ -349,9 +328,9 @@ H1 = (960 + 8 × 1720) / 3600 ≈ 4.09 GPU·小时
 
 普通评估记录结构化日志、事件及 `dlrover_master_vertical_benefit_evaluations_total` 计数。最近请求和结果位于 guard 的进程内状态，不是持久化收益账本。
 
-探索将原配置、基线、预算、checkpoint、窗口及结果写入持久化 journal，并使用文件锁保护。终态请求回传实测性能和结果，通知证据服务保存证据、释放预留；服务确认需匹配请求及探索 ID。通知失败保留本地结果，后续进入或重启时重试，预留服务还需通过 TTL 保证最终释放。
+探索结果持久化到journal。ACCEPTED/RETAINED/INCONCLUSIVE/FAILED均尝试通过report_result幂等回传；确认需匹配request_id/exploration_id且recorded=true，失败在下次进入或重启时重试。证据不足的result可能为空，不能作为有效候选收益。
 
-Master 重启可恢复 `OBSERVING` 或 `VERIFYING_ROLLBACK` 的观测；中断于 `PREPARING`、`SWITCHING`、`ROLLING_BACK` 时，不能证明资源副作用是否完成，不自动重放替换，需要核对真实资源及 checkpoint 状态。
+仅新策略OBSERVING可恢复观测；PREPARING/SWITCHING和旧策略未完成状态均不自动重放，FAILED/INCONCLUSIVE保留保护。旧版已完成ROLLED_BACK仍可识别，必要时发送兼容预留释放通知，但不执行任何新回退。
 
 当前计算是预计剩余训练收益，以及探索中计入已发生开销的预测收益。尚未提供跨重启、覆盖完整作业生命周期的实际收益结算账本。普通扩缩容执行成功，不等于已经证明获得正收益；`RETAINED` 也不应计为成功降本。
 
@@ -362,7 +341,7 @@ Master 重启可恢复 `OBSERVING` 或 `VERIFYING_ROLLBACK` 的观测；中断�
 | [job_resource_scaler.py](../../dlrover/python/master/node/job_resource_scaler.py) | `_try_execute_optimization`、`_check_resource_benefit`、`_execute_resource_plan`、`_observe_exploration` |
 | [benefit.py](../../dlrover/python/master/resource/benefit.py) | `BenefitGuard` 请求编排、`evaluate` 收益计算与约束校验 |
 | [swanlab.py](../../dlrover/python/master/resource/swanlab.py) | `fetch` 查询 scalar、`window` 筛选并验证稳定窗口 |
-| [exploration.py](../../dlrover/python/master/resource/exploration.py) | `prepare` 准入、`inspect` 观测决策、状态持久化和预留释放 |
+| [exploration.py](../../dlrover/python/master/resource/exploration.py) | `prepare` 准入、`inspect` 观测决策、状态持久化和结果回传 |
 | [vertical_metrics.py](../../dlrover/python/master/monitor/vertical_metrics.py) | 执行与恢复跟踪、`training_observation_status` |
 | [rdzv_manager.py](../../dlrover/python/master/elastic_training/rdzv_manager.py) | 训练 generation 与时间边界 |
 | [training_metrics.py](../../dlrover/python/common/training_metrics.py) | 训练端同批上报字段辅助函数 |

@@ -33,10 +33,8 @@ def admission(obj, before=4, after=8):
     data = payload(req)
     data["candidate"] = {"status": "unavailable"}
     data["exploration"] = {
-        "allowed": True, "checkpoint_compatible": True, "rollback_supported": True,
+        "policy": "observe_only", "allowed": True, "checkpoint_compatible": True,
         "quiescent_checkpoint": True, "gpu_tiers": [1, 2, 4, 8],
-        "rollback_seconds_upper": 300, "rollback_gpu_seconds_upper": 2400,
-        "rollback_reservation": {"id": "lease", "confirmed": True, "expires_at": 10000},
     }
     obj.guard.last_request = req
     obj.guard.last_snapshot = data
@@ -52,7 +50,7 @@ def begin(obj, before=4, after=8):
     obj.observing()
 
 
-def observe(obj, speed=2, generation="g2", rollback=False, start=1120, end=1180, work=280):
+def observe(obj, speed=2, generation="g2", start=1120, end=1180, work=280):
     def http(url, **kwargs):
         req = kwargs["json"]
         data = payload(req, now=obj.test_clock[0])
@@ -61,13 +59,11 @@ def observe(obj, speed=2, generation="g2", rollback=False, start=1120, end=1180,
         data["training"]["end"] = dict(generation=generation, observed_at=end, work=work)
         data["exploration_id"] = "trial-1"
         data["execution"] = dict(
-            applied_plan_id=obj.state.get("rollback_plan_id", "trial-1"),
+            applied_plan_id="trial-1",
             restored_checkpoint=obj.state["checkpoint_path"], all_workers_ready=True,
             generation=generation, trial_gpu_seconds=(end-1000)*8,
         )
-        data["exploration"] = {"rollback_reservation": {
-            "id": "lease", "confirmed": True, "expires_at": 10000,
-        }}
+        data["exploration"] = {"policy": "observe_only", "allowed": True}
         response = MagicMock(status_code=200)
         response.__enter__.return_value = response
         response.json.return_value = data
@@ -141,7 +137,7 @@ def test_only_explicit_unavailable_enters(trial):
     assert not trial.prepare(group(4), group(8), "p")
 
 
-@pytest.mark.parametrize("field,value", [("allowed", False), ("rollback_supported", False),
+@pytest.mark.parametrize("field,value", [("allowed", False), ("policy", "automatic_rollback"),
     ("checkpoint_compatible", False), ("quiescent_checkpoint", False),
     ("gpu_tiers", [1, 4, 6, 8])])
 def test_admission_fails_closed(trial, field, value):
@@ -158,7 +154,7 @@ def test_budget_and_deadline_prevent_trial(trial):
     data["limits"]["deadline_at"] = 5000
     assert not trial.prepare(group(4), group(8), "p")
     data["limits"]["deadline_at"] = None
-    data["exploration"]["rollback_reservation"]["expires_at"] = 1800
+    data["limits"]["max_delay_seconds"] = 599
     assert not trial.prepare(group(4), group(8), "p")
 
 
@@ -210,8 +206,6 @@ def test_exploration_observes_real_scalar_contract(trial):
             applied_plan_id="trial-1", restored_checkpoint="checkpoint-original",
             all_workers_ready=True, generation="202", trial_gpu_seconds=(now - 1000) * 8,
         )
-        data["exploration"] = {"rollback_reservation": {
-            "id": "lease", "confirmed": True, "expires_at": 10000}}
         return response(data)
 
     client = SwanLabTrainingMetrics(ENV, post)
@@ -225,17 +219,17 @@ def test_exploration_observes_real_scalar_contract(trial):
     assert trial.state["result"]["candidate_throughput"] == 2
 
 
-def test_negative_measurement_rolls_back_once_and_verifies_new_checkpoint(trial):
+def test_negative_measurement_retains_candidate_without_rollback(trial):
     begin(trial)
-    assert observe(trial, speed=.5, work=190) == "wait"
-    assert observe(trial, speed=.5, start=1180, end=1240, work=220) == "rollback"
-    assert trial.state["rollback_attempted"] is True
-    trial.switching(230, "checkpoint-latest", rollback=True)
-    trial.test_clock[0] = 1300
-    trial.observing(rollback=True)
-    assert observe(trial, speed=1, generation="g3", start=1300, end=1360, work=290) == "wait"
-    assert observe(trial, speed=1, generation="g3", start=1360, end=1420, work=350) == "ROLLED_BACK"
-    assert trial.state["checkpoint_path"] == "checkpoint-latest"
+    assert observe(trial, speed=.8, work=208) == "wait"
+    assert observe(trial, speed=.8, start=1180, end=1240, work=256) == "RETAINED"
+    assert trial.state["result"]["evaluation_status"] == "negative"
+    assert trial.state["result"]["overall_gain"] < 0
+    assert "rollback_plan_id" not in trial.state
+    assert "reservation_id" not in trial.state
+    request = trial.guard.last_request
+    assert request["current"] == request["target"]
+    assert request["exploration"]["original"] != request["current"]
 
 
 def test_sunk_cost_does_not_force_harmful_rollback(trial):
@@ -255,9 +249,8 @@ def test_sunk_cost_does_not_force_harmful_rollback(trial):
     with patch(__name__ + ".payload", side_effect=shorter_payload):
         assert observe(trial, speed=.8, work=208) == "wait"
         assert observe(trial, speed=.8, start=1180, end=1240, work=256) == "RETAINED"
-    assert trial.state["rollback_attempted"] is False
     assert trial.state["result"]["overall_gain"] < 0
-    assert trial.state["result"]["future_rollback_gain"] < 0
+    assert trial.state["result"]["evaluation_status"] == "negative"
 
 
 def test_old_generation_and_mixed_generations_not_accepted(trial):
@@ -317,11 +310,12 @@ def test_missing_checkpoint_or_journal_failure_prevents_switch(trial):
         trial.switching(10, "")
 
 
-def test_reservation_is_refreshed_before_mutation(trial):
+def test_target_feasibility_is_refreshed_before_mutation(trial):
     begin(trial)
-    observe(trial)
+    observe(trial)  # Installs a provider that echoes the request identity.
+    trial.switching(160, "checkpoint-original")
     assert trial.authorize_mutation() is True
-    trial.state["reservation_id"] = "other"
+    trial.state["policy"] = "automatic_rollback"
     assert trial.authorize_mutation() is False
 
 
@@ -398,26 +392,20 @@ def test_full_switch_keeps_latest_checkpoint_and_waits_for_observation(trial):
     assert trial.state["checkpoint_path"] == "new-checkpoint"
 
 
-def test_rollback_execution_uses_exact_saved_resource_and_new_plan(trial):
+@pytest.mark.parametrize("speed,work,outcome", [(2, 400, "ACCEPTED"), (.8, 256, "RETAINED")])
+def test_observation_completion_never_executes_reverse_plan(trial, speed, work, outcome):
     begin(trial)
     scaler = make_scaler(trial)
-    observe(trial, speed=.5, work=190)
-    assert observe(trial, speed=.5, start=1180, end=1240, work=220) == "rollback"
-    def execute(plan, *args, **kwargs):
-        assert kwargs["rollback"] is True
-        assert plan.node_group_resources["worker"].node_resource.gpu_num == 4
-        assert scaler.get_phase_info()["plan_id"] == "trial-1-rollback"
-        # The real executor is independently tested for checkpoint capture.
-        trial.switching(230, "latest-return-checkpoint", rollback=True)
-        trial.observing(rollback=True)
-        return True
-    with patch.object(trial, "inspect", side_effect=["rollback", "ROLLED_BACK"]), \
-         patch.object(scaler, "_execute_resource_plan", side_effect=execute) as mutation, \
-         patch.object(scaler._benefit_stop, "wait"), \
-         patch.object(trial, "release_reservation"):
+    observe(trial, speed=speed, work=160 + 60 * speed)
+    assert observe(trial, speed=speed, start=1180, end=1240, work=work) == outcome
+    with patch.object(trial, "inspect", return_value=outcome), \
+         patch.object(scaler, "_execute_resource_plan") as mutation, \
+         patch.object(trial, "report_result") as report:
         assert scaler._observe_exploration()
-    assert mutation.call_count == 1
-    assert trial.state["checkpoint_path"] == "latest-return-checkpoint"
+    mutation.assert_not_called()
+    report.assert_called_once()
+    assert scaler._job_resource.node_group_resources["worker"].node_resource.gpu_num == 8
+    assert scaler.get_phase_info()["plan_id"] == "trial-1"
 
 
 def test_stale_untagged_framework_reports_rejected_during_trial(trial):
@@ -433,7 +421,7 @@ def test_stale_untagged_framework_reports_rejected_during_trial(trial):
     assert scaler._save_ckpt_step == 200
 
 
-def test_failed_rollback_is_terminal_not_retried(trial):
+def test_legacy_rollback_action_is_fenced_without_mutation(trial):
     begin(trial)
     scaler = make_scaler(trial)
     observe(trial, speed=.5, work=190)
@@ -441,7 +429,7 @@ def test_failed_rollback_is_terminal_not_retried(trial):
     with patch.object(trial, "inspect", return_value="rollback"), \
          patch.object(scaler, "_execute_resource_plan", return_value=False) as mutation:
         assert not scaler._observe_exploration()
-    assert mutation.call_count == 1
+    mutation.assert_not_called()
     assert trial.store.load()["status"] == "FAILED"
 
 
@@ -474,13 +462,13 @@ def test_result_upload_ack_is_durable_and_idempotent(trial):
         request = kwargs["json"]
         requests.append(request)
         assert request["exploration"]["result"]["candidate_throughput"] == 2
-        assert request["exploration"]["release_reservation"] is True
+        assert request["exploration"]["report_result"] is True
         response = MagicMock(status_code=200)
         response.__enter__.return_value = response
         response.json.return_value = dict(recorded=True, request_id=request["request_id"], exploration_id="trial-1")
         return response
     trial.guard.post = http
-    trial.release_reservation()
+    trial.report_result()
     assert trial.store.load()["reported"] is True
     trial.leave()
     trial.enter(recovering=True)
@@ -492,3 +480,100 @@ def test_resource_budget_exhaustion_does_not_wait_for_second_window(trial):
     trial.state["gpu_budget"] = 1
     assert observe(trial) == "INCONCLUSIVE"
     assert trial.state["reason"] == "gpu_budget_exhausted"
+
+
+@pytest.mark.parametrize("status", ["OBSERVING", "ROLLING_BACK", "VERIFYING_ROLLBACK"])
+def test_unfinished_legacy_policy_cannot_resume(trial, status):
+    begin(trial)
+    trial.save(status, policy="automatic_rollback")
+    assert trial.startup_fence() == (True, True)
+    trial.leave()
+    assert not trial.enter(recovering=True)
+
+
+def test_short_task_caps_observation_budget_without_rollback_reserve(trial):
+    data = admission(trial, before=1, after=2)
+    data["training"]["target_work"] = 1044
+    trial.duration = 1800
+    trial.guard.last_result = evaluate(data, trial.guard.last_request, 1000)
+    assert trial.prepare(group(1), group(2), "trial-1")
+    assert trial.state["expires_at"] == 1884
+
+
+def test_constraint_violation_records_negative_without_rollback(trial):
+    begin(trial)
+    assert observe(trial, speed=.5, work=190) == "wait"
+    assert observe(trial, speed=.5, start=1180, end=1240, work=220) == "INCONCLUSIVE"
+    assert trial.state["reason"] == "constraint_violation"
+    assert trial.state["result"]["evaluation_status"] == "negative"
+    assert trial.state["result"]["constraints_satisfied"] is False
+    assert "rollback_plan_id" not in trial.state
+
+
+@pytest.mark.parametrize("status", ["ACCEPTED", "RETAINED", "INCONCLUSIVE", "FAILED"])
+def test_all_outcomes_retry_reporting_without_swanlab_dependency(trial, status):
+    begin(trial)
+    trial.finish(status, "test")
+    metrics = MagicMock()
+    metrics.fetch.side_effect = AssertionError("Result upload must not fetch training metrics")
+    trial.guard.training_metrics = metrics
+    requests = []
+
+    def http(url, **kwargs):
+        request = kwargs["json"]
+        requests.append(request)
+        assert request["exploration"]["report_result"] is True
+        assert request["exploration"]["status"] == status
+        response = MagicMock(status_code=200)
+        response.__enter__.return_value = response
+        response.json.return_value = dict(recorded=len(requests) > 1,
+            request_id=request["request_id"], exploration_id="trial-1")
+        return response
+
+    trial.guard.post = http
+    trial.report_result()
+    assert not trial.state.get("reported")
+    trial.leave()
+    trial.enter(recovering=True)
+    assert trial.store.load()["reported"] is True
+    assert len(requests) == 2
+    metrics.fetch.assert_not_called()
+    if status in ("FAILED", "INCONCLUSIVE"):
+        assert trial.startup_fence() == (True, True)
+
+
+def test_two_windows_insufficient_time_rejects_before_mutation(trial):
+    admission(trial)
+    trial.duration = 2 * trial.guard.min_window
+    assert not trial.prepare(group(4), group(8), "trial-1")
+    assert trial.store.load() is None
+
+
+def test_gpu_objective_records_negative_when_faster_but_more_expensive(trial):
+    begin(trial)
+    trial.state["objective"] = "gpu_hours"
+    assert observe(trial) == "wait"
+    assert observe(trial, start=1180, end=1240, work=400) == "RETAINED"
+    assert trial.state["result"]["overall_gain"] == -960
+    assert trial.state["result"]["evaluation_status"] == "negative"
+
+
+def test_completed_legacy_journal_only_sends_release_notification(trial):
+    begin(trial)
+    trial.save("ROLLED_BACK", policy="automatic_rollback", cooldown_until=0, reservation_id="old-lease")
+    requests = []
+    def http(url, **kwargs):
+        request = kwargs["json"]
+        requests.append(request)
+        assert request["exploration"]["release_reservation"] is True
+        assert request["exploration"]["reservation_id"] == "old-lease"
+        response = MagicMock(status_code=200)
+        response.__enter__.return_value = response
+        response.json.return_value = dict(recorded=True,
+            request_id=request["request_id"], exploration_id="trial-1")
+        return response
+    trial.guard.post = http
+    trial.leave()
+    assert trial.enter()
+    assert trial.state["reported"] is True
+    assert len(requests) == 1

@@ -317,161 +317,105 @@ H1 = [gpu_seconds_upper + 目标总卡数 × (T1 - lost_seconds_upper)] / 3600
 ## 可观测与回归
 
 每次评估输出 plan ID、mode、result、reason 和估计值的结构化日志内容；不记录 HTTP token 或原始响应。
-Prometheus 新增 `dlrover_master_vertical_benefit_evaluations_total{mode,result,reason}`，复用现有 Master 标签。
+Prometheus提供收益评估/探索终态计数及最新吞吐、收益、有效性、探索状态Gauge，复用现有Master标签，详见[收益Prometheus指标](vertical-elastic-benefit-prometheus-cn.md)。
 最新请求及结果保存在 guard.last_request / guard.last_result（进程内，非持久化账本）。
 强制拒绝在通知 checkpoint 之前结束计划，记录 skipped/benefit_unknown 或 skipped/benefit_negative。
-未开启探索时，被门禁拒绝的计划不会替换 worker。受控探索的准入与回退见下文。
+未开启探索时，被门禁拒绝的计划不会替换 worker。受控探索的准入与观测见下文。
 
 针对性测试覆盖时间正收益但卡时负收益、缩容队列收益、重放、deadline、非法/缺失数据、HTTP 超时、身份校验、三种运行模式及 checkpoint 前拦截。
 
 
-## 可选：无候选性能时的受控探索
+## 可选：无候选性能时的只观测探索
 
-仅 `enforce` 下开启；默认关闭。首期支持 `time` / `gpu_hours` 自动探索。
-`cluster_jct` 仍要求事前候选性能与队列预测，不对未知的集群影响进行试错。
-每个 job_uid 最多一次探索、一次回退，不引入新服务或通用工作流框架。
+策略固定为 `observe_only`：执行一次候选配置切换，采集至少两个独立稳定窗口，记录实测吞吐与预计收益。收益不足也保留候选配置，不生成反向计划，不再次保存 checkpoint 回退。普通收益门禁的事前拒绝逻辑不变；探索默认关闭，每个 job_uid 最多一次。
 
-### 新增配置
+### 配置与准入
 
-| 环境变量 | 默认值 | 说明 |
+仅 `enforce`、`time/gpu_hours`、候选明确 `{"status":"unavailable"}` 时允许申请探索。HTTP 错误、基线无效或缺字段不属于探索许可。Master 配置：
+
+| 环境变量 | 默认值 | 含义 |
 | --- | --- | --- |
-| DLROVER_BENEFIT_EXPLORE | false | 是否启用探索，建议只注入白名单作业 |
-| DLROVER_BENEFIT_STATE_DIR | 空 | 必填，挂载持久化共享 POSIX 卷的绝对路径；必须支持跨进程/Pod flock 与原子 rename |
-| DLROVER_BENEFIT_TRIAL_SECONDS | 600 | 从准入到完成观测的总预算，含 checkpoint、替换、恢复和预热 |
-| DLROVER_BENEFIT_TRIAL_POLL_SECONDS | 10 | HTTP 观测轮询间隔 |
-| DLROVER_BENEFIT_TRIAL_GPU_HOURS | 0 | 必须显式设置的探索总卡时预算，包含预留回退资源和回退开销 |
-| DLROVER_BENEFIT_TRIAL_COOLDOWN_SECONDS | 1800 | 探索终态后的资源调整冷却时间 |
+| DLROVER_BENEFIT_EXPLORE | false | 必须显式设 true |
+| DLROVER_BENEFIT_STATE_DIR | 空 | 共享持久 POSIX 目录，支持 flock、原子 rename、fsync |
+| DLROVER_BENEFIT_TRIAL_SECONDS | 600 | 从准入起总时间上限，包含 checkpoint、切换、恢复和观测 |
+| DLROVER_BENEFIT_TRIAL_POLL_SECONDS | 10 | 观测轮询间隔 |
+| DLROVER_BENEFIT_TRIAL_GPU_HOURS | 0 | 必须显式设置的总卡时预算 |
+| DLROVER_BENEFIT_TRIAL_COOLDOWN_SECONDS | 1800 | 完成后冷却；不意味着允许第二次探索 |
 
-状态目录不能用 Pod emptyDir，也不能通过删除 journal 或取消挂载来绕过未完成计划。
-使用文件锁是部署前提，不声称支持不具备可靠 POSIX 锁语义的对象存储或任意 NFS 配置。
-
-### 开关控制
-
-在 DLRover Master 容器中设置 `DLROVER_BENEFIT_EXPLORE`，默认 `false`。
-只有 `true`（忽略大小写及首尾空格）允许探索；其他值均按关闭处理。
-开关在 Master 初始化时读取，不支持运行中热更新。
-
-```yaml
-env:
-  - name: DLROVER_BENEFIT_MODE
-    value: "enforce"
-  - name: DLROVER_BENEFIT_EXPLORE
-    value: "true"
-  - name: DLROVER_BENEFIT_STATE_DIR
-    value: "/var/lib/dlrover/benefit"  # 挂载持久化共享卷
-  - name: DLROVER_BENEFIT_TRIAL_GPU_HOURS
-    value: "10"  # 示例值，按作业配置预算
-```
-
-上述配置需配合前文 HTTP 接口配置及准入条件使用。关闭探索时，将
-`DLROVER_BENEFIT_EXPLORE` 改为 `"false"` 并在 Master 下次启动时生效。
-
-| 收益门禁模式 | 探索开关 | 行为 |
-| --- | --- | --- |
-| off | 任意 | 不执行收益门禁，不进入受控探索 |
-| shadow | 任意 | 记录预测结果，不因预测拒绝调整，不进入受控探索 |
-| enforce | false / 未设置 | 缺少候选吞吐时拒绝调整；有候选吞吐时按收益门禁判断 |
-| enforce | true | 明确缺少候选吞吐且通过全部探索准入条件时，允许受控探索 |
-
-关闭开关不会自动回退已有探索或清除其状态。若重启时存在未完成探索，
-仍保留状态保护并阻止新的自动调整；关闭状态下不自动恢复探索观测。
-应完成当前探索后关闭；对遗留未完成状态，需核对实际资源与 checkpoint 后处理，
-或恢复原配置继续可恢复的观测阶段。
-
-### 准入响应扩展
-
-只有明确返回 `candidate: {"status": "unavailable"}` 才可能进入探索。
-字段缺失、HTTP 故障、过期数据、跨代次或其他验证错误都不触发探索。
-原有 training、transition、scheduling、limits 仍需完整且可信。
-另外提供：
+准入响应在完整收益快照上增加：
 
 ```json
 {
   "candidate": {"status": "unavailable"},
   "exploration": {
+    "policy": "observe_only",
     "allowed": true,
     "checkpoint_compatible": true,
-    "rollback_supported": true,
     "quiescent_checkpoint": true,
-    "gpu_tiers": [1, 2, 4, 8],
-    "rollback_seconds_upper": 300,
-    "rollback_gpu_seconds_upper": 2400,
-    "rollback_reservation": {
-      "id": "scheduler-reservation-123",
-      "confirmed": true,
-      "expires_at": 1790010000
-    }
+    "gpu_tiers": [1, 2]
   }
 }
 ```
 
-调度适配服务必须真正建立预留，并提供其 ID 和到期时间；代码不会凭布尔字段创建预留。
-没有真实预留能力时不要返回 confirmed=true，自动探索应保持关闭。
-预留覆盖去程、观测以及一次回退；资源占用核算包含预留资源。
-本地还检查相邻合法 GPU 档位、worker 全部 Running 且数量和 GPU 配置一致、CPU/内存等其他配置未变。
-quiescent_checkpoint 表示框架在 checkpoint 边界停止更新，且最新 checkpoint 可跨档位恢复；不支持该协议的框架不能探索。
-当前任务剩余时间必须大于探索及回退预算，允许延后时间和 deadline 余量也必须覆盖两者。
+`policy` 必须显式返回，以防旧服务按自动回退策略准入。GPU 仅允许相邻档位，其他资源形状不变。无需 `rollback_supported`、`rollback_seconds_upper`、`rollback_gpu_seconds_upper` 或 `rollback_reservation`。服务不能在收到探索请求时暗中建立回退预留。
 
-### 执行、观测与反馈
+设基线剩余时间为 T0，有效探索时长 D=min(trial_seconds,T0)。D 必须大于 2×min_window，max_delay_seconds≥D；若设置 deadline，则需 deadline≥now+T0+D。准入 GPU 秒检查为 max(原单worker卡数,候选单worker卡数)×worker数×D≤gpu_hours×3600。以上只是准入检查，不能保证在预算内获得两轮有效窗口；真实切换过慢仍会超时。
 
-状态为 PREPARING → SWITCHING → OBSERVING，然后进入 ACCEPTED / RETAINED，
-或者 ROLLING_BACK → VERIFYING_ROLLBACK → ROLLED_BACK。
-FAILED / INCONCLUSIVE 会封禁后续自动伸缩，等待对账处置。
+### 替换前授权
 
-Master 在同一个伸缩线程中持锁直到观测或回退终结；共享文件锁进一步防止另一个 Master 同时执行。
-进入替换 worker 前先持久化 checkpoint 和 SWITCHING 状态，再重新向调度接口确认预留。
-HTTP 请求新增 exploration，包含 id、status、reservation_id、checkpoint_path、applied_plan_id。
-授权资源变更请求带 authorize_mutation=true；服务需回传身份、最新 observed_at、exploration_id、调度约束和有效预留。
-正常观测请求中 current 为正在测试的配置，target 为原配置，便于检查回退可行性。
+保存真实 checkpoint 后持久化 SWITCHING，发送 `exploration.authorize_mutation=true`，上下文包含 policy、id、status、checkpoint_path；请求 current/target 为原配置/候选配置。服务必须回显 schema_version=1、request_id、job、current、target、exploration_id，提供新鲜 observed_at、scheduling.target_feasible=true、constraints_satisfied=true，以及 exploration.policy=observe_only、allowed=true。
 
-观测响应沿用 training 时间窗口，并新增：
+控制请求不依赖新 SwanLab 窗口，训练此时可能已暂停。授权失败不提交后续 worker 替换，记录 exploration_authorization_denied；仍需核对已开始的 checkpoint 协议。
+
+### 观测、结果与约束
+
+切换控制完成后进入 OBSERVING。此时请求 current 和 target **都为候选配置**，原资源位于 exploration.original，不再表达反向调度意图。上下文另含 applied_plan_id、checkpoint_path、observation_after、last_window_end、started_at、id、policy。
+
+响应保留完整快照，增加 exploration_id 和真实 execution：
 
 ```json
 {
-  "exploration_id": "探索计划ID",
+  "exploration_id": "本次探索ID",
   "execution": {
-    "applied_plan_id": "当前实际生效的计划ID",
-    "restored_checkpoint": "实际加载的checkpoint路径",
+    "applied_plan_id": "本次探索ID",
+    "restored_checkpoint": "实际恢复的checkpoint路径",
     "all_workers_ready": true,
-    "generation": "恢复代次",
-    "trial_gpu_seconds": 2400
-  },
-  "exploration": {
-    "rollback_reservation": {
-      "id": "scheduler-reservation-123",
-      "confirmed": true,
-      "expires_at": 1790010000
-    }
+    "generation": "实际新代次",
+    "trial_gpu_seconds": 1200
   }
 }
 ```
 
-trial_gpu_seconds 从探索开始累计，包含切换、实际训练和预留资源，必须由分配记录计算，不能用 GPU 利用率换算。
-适配服务从真实框架/调度事件验证 applied_plan_id、恢复 checkpoint、全部 worker readiness 和训练代次，不能简单回显这些字段。
-至少两个不重叠的稳态窗口，使用其中较低吞吐作为保守测量；重复、旧代次、跨代次、预热前数据均不满足观测条件。
-窗口必须发生在控制完成之后；稳态及可比性仍由适配服务结合原始框架指标验证。
+trial_gpu_seconds 是从探索开始的真实累计资源占用，不能由利用率推算。execution 与 training generation 必须一致且不同于原代次；训练单位、目标、batch 语义须与基线一致，step 超过真实 checkpoint，窗口不早于恢复/观测下界和上一窗口终点。至少两个非重叠完整窗口，取吞吐最小值 q1。重复文件不能增加窗口数。
 
-评估同时记录两笔账：
+设已耗时间 E、当前剩余工作 R、累计 GPU 秒 S、原总GPU数 G0、候选总GPU数 G1：
 
-1. 从探索开始算整体预测收益，扣除已经发生的时间与实际资源开销。
-2. 从当前进度算保持或回退的未来代价，不以已经发生的开销强迫回退。
+```text
+keep_seconds = max(0,R)/q1
+时间收益 = T0 - E - keep_seconds
+卡时目标收益 = G0*T0 - S - G1*keep_seconds  （单位GPU秒）
+```
 
-整体收益达标则 ACCEPTED。退回更划算或当前配置突破约束、且回退满足时限和预算时，才回退一次。
-整体收益不足但回退更差时为 RETAINED，明确记录为未验证正收益，不能算作成功降本。
-回退重新生成独立 plan ID，并通知当前 worker 保存最新 checkpoint；不加载探索前的旧 checkpoint。
-框架 ready 回报必须携带精确 plan ID。回退也必须验证新代次的训练推进。
-若训练无法保存新 checkpoint，不自动强制删除 worker；记录 FAILED，等待恢复处置。
+使用基线和当前 limits 中更严格的延迟/deadline。结果处理：
 
-终态 HTTP 请求携带 release_reservation=true、result（实测候选吞吐、整体收益、保持/回退估计）、candidate_observed_at 与 candidate_generation。
-服务按探索 ID 幂等保存证据并释放预留，返回 request_id、exploration_id、recorded=true。
-失败时保留本地结果；后续进入或重启时重发终态通知，预留服务必须保证 TTL 到期释放，不能依赖一次通知。
-该回传可作为后续 `candidate.evidence=trial` 的数据来源；不包含完整跨作业收益数据库。
+| 条件 | 状态与行为 |
+| --- | --- |
+| 两窗口有效、约束满足且整体正收益达到最小比例 | ACCEPTED / positive_observed_gain，继续候选配置 |
+| 两窗口有效、约束满足但收益不足 | RETAINED / insufficient_observed_gain，继续候选配置，evaluation_status=negative |
+| 有效测量但延迟/deadline违反 | INCONCLUSIVE / constraint_violation，保存实测负向结果，阻止后续自动调整 |
+| 观测时间/卡秒耗尽、完成训练前不足两窗口 | INCONCLUSIVE，阻止后续自动调整；不声明获得有效正收益 |
+| checkpoint/执行失败 | FAILED，保留保护 |
 
-### 重启与失败处置
+所有分支均不自动回退。INCONCLUSIVE/FAILED 不保证训练健康，也不停止现有进程；需要核对真实执行状态。RETAINED 表示完成观测，不表示获得正收益。正收益仍是基于实测吞吐的剩余时间预测，不是完整作业实际收益结算。
 
-状态文件原子写入并 fsync，原配置、基线、预算、checkpoint、回退次数和结果一并保存。
-Master 重启可继续 OBSERVING / VERIFYING_ROLLBACK，先重新核实真实执行状态，再允许回退或确认完成。
-PREPARING / SWITCHING / ROLLING_BACK 中断时无法证明 Kubernetes 副作用是否完成，不自动重放删除/创建。
-此时阻止初始 worker 自动拉起并禁用自动 relaunch，需运维核对现存 Pod、checkpoint、预留和训练进度后处理 journal，并重启 Master。
-观测失败/超时不等于可以安全回退：没有可信进度或有效回退资源时进入 INCONCLUSIVE，停止自动调整；原训练进程不被强制终止。
-上述失败状态、结构化日志和现有 inflight 指标应配置告警；新增 `dlrover_master_vertical_explorations_total{result}` 记录正常观测终态。
+### 终态回传
+
+ACCEPTED、RETAINED、INCONCLUSIVE、FAILED 均调用 `report_result`，发送 exploration.report_result=true、policy、id、status、reason、objective、result、windows、candidate_observed_at、candidate_generation。result 在有效测量时包含 candidate_throughput、baseline_throughput、overall_gain、gain_unit、gain_ratio、time_gain_seconds、gpu_seconds_saved、keep_seconds、elapsed_seconds、remaining_work、trial_gpu_seconds、evaluation_status、constraints_satisfied、unit、data_source、windows、candidate_resource；证据不足时 result 可为 null，不得作为已验证候选收益入库。
+
+服务按探索 ID 幂等记录，返回匹配 request_id、exploration_id 和 recorded=true，Master 才将 reported=true 持久化。回传不获取 SwanLab 数据，不因训练已结束而失效；失败保留本地结果，在下次进入/重启尝试回传，不提供后台无限重试。结果可作为后续 candidate.evidence=trial 的数据来源；本实现没有新增候选数据库或自动生成历史候选模型。
+
+### 重启兼容
+
+新策略仅 OBSERVING 可恢复观测，不重置到期时间。PREPARING/SWITCHING 中断、FAILED/INCONCLUSIVE 保持保护，不能自动重放资源修改。关闭探索开关也不清除 journal。
+
+无 policy 或旧策略的未完成 journal（包括 OBSERVING、ROLLING_BACK、VERIFYING_ROLLBACK）要求人工核对，不自动继续旧回退。已完成的旧 ACCEPTED/RETAINED/ROLLED_BACK 仍可识别；未回传者仅发送兼容 release_reservation 通知来结清旧预留，绝不触发反向计划。升级时保留 journal 和现场，核对 Pod、checkpoint、旧服务账本，不通过删除 journal 绕过保护。

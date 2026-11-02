@@ -216,17 +216,18 @@ class VerticalElasticEvents:
         context["_exploration_decision"] = decision
         self._observe(context)
         context["exploration"] = dict(
-            status=decision, reason_code=state.get("reason"),
-            evaluation_status=("positive" if decision == "ACCEPTED" else
+            status=decision, reason_code=state.get("reason"), policy=state.get("policy"),
+            evaluation_status=((state.get("result") or {}).get("evaluation_status") or
+                               ("positive" if decision == "ACCEPTED" else
                                "unknown" if decision in ("INCONCLUSIVE", "FAILED") else
-                               "not_accepted"),
+                               "not_accepted")),
             estimates=copy.deepcopy(state.get("result")),
             gain_unit="seconds" if state["objective"] == "time" else "gpu_seconds",
             estimate_kind="observed_throughput_projection",
             spent_gpu_seconds=state.get("spent_gpu_seconds"),
             candidate_generation=state.get("candidate_generation"),
         )
-        if decision in ("ACCEPTED", "ROLLED_BACK"):
+        if decision in ("ACCEPTED", "RETAINED", "ROLLED_BACK"):
             # This is scalar-window verification, distinct from native progress reports.
             context["recovery_status"] = "verified_by_exploration"
         self._emit(context, "exploration_decided")

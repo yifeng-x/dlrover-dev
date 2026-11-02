@@ -1,0 +1,91 @@
+# All paths are relative to this configuration file. Copy it before editing.
+context: REPLACE_KUBECTL_CONTEXT
+namespace: elastic-training
+job_name: benefit-mock
+manifests_dir: /tmp/benefit-k8s-manifests
+gpu_resource: nvidia.com/gpu
+master_container: main
+worker_container: main
+task_id: "123"
+total_steps: 3760  # Also supports the documented 1044-step matrix.
+timeout_seconds: 1800
+poll_seconds: 5
+reject_observe_seconds: 30
+# Must match an actual cumulative optimizer step, NOT epoch/total/max_steps.
+# Change this to the format printed by your training framework.
+step_regex: '["\x27]?global_step["\x27]?\s*[:=]\s*(\d+)'
+
+# Applied in this exact order. Omitted entries are NOT implicitly applied.
+# Namespace/RBAC/PVC can be omitted when they already exist.
+infrastructure:
+  - 00-namespace.yaml
+  - 00-rbac.yaml
+  - 00-storage.yaml
+  - 00-benefit-env.yaml
+  - 00-fixture-scenario.yaml
+  - 00-fixture-code.yaml
+  - 00-fixture-service.yaml
+
+# Replace any documented input template with a custom file.
+# Scenario overrides are applied to the benefit environment / fixture templates.
+templates: {}
+# templates:
+#   02-job.yaml: ./my-elasticjob.yaml
+#   00-storage.yaml: ./my-storage.yaml
+#   00-benefit-env.yaml: ./my-benefit-env.yaml
+#   01-manual-idle.yaml: ./my-idle.yaml
+#   03-trigger.yaml: ./my-trigger.yaml
+
+# For a non-Swift entry point, supply the complete worker args list.
+# Available placeholders: {initial_gpus}, {accumulation}, {run_id}.
+# Literal braces in shell/JSON must be doubled as {{ and }}.
+# worker_args:
+#   - 'exec dlrover-run --nproc_per_node={initial_gpus} train.py --output_dir /training/output/{run_id}'
+
+env: {}  # Additional Master settings; scenario fault injections take precedence.
+# adapter_url: http://real-execution-adapter:8080/benefit/snapshot
+# hooks use argv arrays (no shell evaluation). Read BENEFIT_TEST_CONTEXT JSON.
+hooks: {}
+# hooks:
+#   prepare_adapter: [python3, ./adapter_hooks.py, prepare]
+#   verify_adapter: [python3, ./adapter_hooks.py, verify]
+#   drive_fault: [python3, ./adapter_hooks.py, fault]
+
+# Lists REPLACE the defaults; maps merge one level. [] means apply no infrastructure.
+cases:
+  G01:
+    infrastructure:
+      - 00-benefit-env.yaml
+      - 00-fixture-scenario.yaml
+      - 00-fixture-code.yaml
+      - 00-fixture-service.yaml
+  G02:
+    infrastructure:
+      - 00-benefit-env.yaml
+      - 00-fixture-scenario.yaml
+  G05:
+    infrastructure:
+      - 00-benefit-env.yaml
+      - 00-fixture-scenario.yaml
+    # templates:
+    #   02-job.yaml: ./my-shrink-job.yaml
+  E01:
+    infrastructure: [00-benefit-env.yaml]
+  E02:
+    infrastructure: [00-benefit-env.yaml]
+  E03:
+    infrastructure: [00-benefit-env.yaml]
+  E04:
+    infrastructure: [00-benefit-env.yaml]
+  E05:
+    infrastructure: [00-benefit-env.yaml]
+  E06:
+    infrastructure: [00-benefit-env.yaml]
+  E07:
+    infrastructure: [00-benefit-env.yaml]
+  E08:
+    infrastructure: [00-benefit-env.yaml]
+  E09:
+    infrastructure: [00-benefit-env.yaml]
+  E10:
+    infrastructure: [00-benefit-env.yaml]
