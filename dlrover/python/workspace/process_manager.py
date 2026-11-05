@@ -89,8 +89,18 @@ class WorkspaceProcessManager:
         command: str,
         launch_id: str,
         wait_seconds: int = 5,
+        role_task=None,
     ) -> int:
         with self.store.locked():
+            from dlrover.python.workspace.role_runtime import (
+                read_index,
+                write_json,
+                INDEX,
+            )
+
+            task = read_index(self.state_dir)
+            if task and task.get("active"):
+                raise RuntimeError("an adapted role task owns this workspace")
             state = self._load_state_or_compat()
             state = self._refresh_state(state)
             if self._is_active(state):
@@ -104,6 +114,14 @@ class WorkspaceProcessManager:
                 )
                 return 2
 
+            if role_task is not None:
+                from dlrover.python.workspace.role_runtime import exchange
+
+                if exchange(role_task, "status")["state"] != "PREPARING":
+                    raise RuntimeError("task no longer accepts role launches")
+                write_json(os.path.join(self.state_dir, INDEX), role_task)
+            elif task:
+                os.unlink(os.path.join(self.state_dir, INDEX))
             self._create_log_file()
             env = os.environ.copy()
             env["DLROVER_WORKSPACE_LAUNCH_ID"] = launch_id
@@ -154,6 +172,11 @@ class WorkspaceProcessManager:
                 self.store.save(state)
                 self._write_compat_files(state)
             except Exception as e:
+                if role_task is not None and not state.pid:
+                    role_task.update(
+                        active=False, state="FAILED", reason=str(e)
+                    )
+                    write_json(os.path.join(self.state_dir, INDEX), role_task)
                 logger.warning(
                     "Failed to launch workspace training log_dir=%s "
                     "launch_id=%s log_file=%s command=%s.",

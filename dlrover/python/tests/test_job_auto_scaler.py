@@ -156,6 +156,31 @@ class JobAutoScalerTest(unittest.TestCase):
 
 
 class AllreduceAutoScalerTest(unittest.TestCase):
+    def test_disabled_autoscaling_does_not_mark_started(self):
+        scaler = AllreduceTrainingAutoScaler.__new__(
+            AllreduceTrainingAutoScaler
+        )
+        scaler._autoscaling_started = False
+        with mock.patch.object(
+            _dlrover_context, "auto_worker_enabled", False
+        ), mock.patch.object(
+            _dlrover_context, "runtime_elastic_dimension", "horizontal"
+        ), mock.patch(
+            "dlrover.python.master.node.job_auto_scaler.threading.Thread"
+        ) as thread:
+            scaler.start_auto_scaling()
+            self.assertFalse(scaler._autoscaling_started)
+            thread.assert_not_called()
+            # Enabling scaling must still start exactly one background loop.
+            with mock.patch.object(
+                _dlrover_context, "auto_worker_enabled", True
+            ):
+                scaler.start_auto_scaling()
+                scaler.start_auto_scaling()
+            self.assertTrue(scaler._autoscaling_started)
+            thread.assert_called_once()
+            thread.return_value.start.assert_called_once()
+
     def setUp(self) -> None:
         mock_k8s_client()
         self.job_context = get_job_context()

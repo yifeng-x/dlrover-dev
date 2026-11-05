@@ -62,6 +62,7 @@ class WorkspacePod:
     node_name: str = ""
     run_mode: str = ""
     exit_policy: str = "retain"
+    uid: str = ""
 
 
 @dataclass
@@ -144,6 +145,7 @@ class WorkspaceLauncher:
                 continue
             pods.append(
                 WorkspacePod(
+                    uid=getattr(item.metadata, "uid", "") or "",
                     name=item.metadata.name,
                     namespace=item.metadata.namespace,
                     rank=rank,
@@ -340,6 +342,11 @@ class WorkspaceLauncher:
             str(grace_period),
             "--kill-timeout",
             str(kill_timeout),
+            *(
+                ("--task-ranks", ",".join(map(str, ranks)))
+                if ranks is not None
+                else ()
+            ),
             show_cli_log=show_cli_log,
             state_dir=state_dir,
         )
@@ -367,10 +374,12 @@ class WorkspaceLauncher:
         output_callback: Optional[Callable[[WorkspacePod, str], None]] = None,
         show_cli_log: bool = False,
         state_dir: str = DEFAULT_STATE_DIR,
+        role: Optional[str] = None,
     ):
         if follow:
             return self.follow_logs(
                 ranks=ranks,
+                role=role,
                 log_dir=log_dir,
                 tail=tail,
                 max_workers=max_workers,
@@ -386,6 +395,7 @@ class WorkspaceLauncher:
             "logs",
             "--tail",
             str(int(tail)),
+            *(("--role", role) if role else ()),
             show_cli_log=show_cli_log,
             state_dir=state_dir,
         )
@@ -404,6 +414,7 @@ class WorkspaceLauncher:
         output_callback: Optional[Callable[[WorkspacePod, str], None]] = None,
         show_cli_log: bool = False,
         state_dir: str = DEFAULT_STATE_DIR,
+        role: Optional[str] = None,
     ):
         pods = self.list_worker_pods(ranks)
 
@@ -413,6 +424,7 @@ class WorkspaceLauncher:
             "--tail",
             str(int(tail)),
             "--follow",
+            *(("--role", role) if role else ()),
             show_cli_log=show_cli_log,
             state_dir=state_dir,
         )
@@ -542,6 +554,38 @@ class WorkspaceLauncher:
 
         return sorted(results, key=lambda item: item.pod.rank)
 
+    def _exec_checked(self, pod, shell):
+        response = None
+        try:
+            response = stream(
+                self._core.connect_get_namespaced_pod_exec,
+                pod.name,
+                pod.namespace,
+                command=["/bin/bash", "-lc", shell],
+                container=self.container,
+                stderr=True,
+                stdin=False,
+                stdout=True,
+                tty=False,
+                _preload_content=False,
+            )
+            chunks = []
+            deadline = time.monotonic() + 120
+            while response.is_open() and time.monotonic() < deadline:
+                response.update(timeout=1)
+                if response.peek_stdout():
+                    chunks.append(response.read_stdout())
+                if response.peek_stderr():
+                    chunks.append(response.read_stderr())
+            if response.is_open():
+                return ExecResult(pod, False, "agentctl execution timed out")
+            return ExecResult(pod, response.returncode == 0, "".join(chunks))
+        except Exception as error:
+            return ExecResult(pod, False, str(error))
+        finally:
+            if response is not None:
+                response.close()
+
     def _exec(self, pod: WorkspacePod, shell: str):
         """
             Execute the shell command on the pod and return the output.
@@ -559,7 +603,11 @@ class WorkspaceLauncher:
                 stdout=True,
                 tty=False,
             )
-            return ExecResult(pod=pod, ok=True, output=output or "")
+            return ExecResult(
+                pod=pod,
+                ok="[workspace-role-stop:failed]" not in (output or ""),
+                output=output or "",
+            )
         except Exception as e:
             logger.warning(
                 "Workspace pod exec failed pod=%s namespace=%s rank=%s "
@@ -617,6 +665,8 @@ class WorkspaceLauncher:
         stop_event: threading.Event,
     ):
         resp = None
+        role_stop_output = ""
+        role_stop_failed = False
         try:
             resp = stream(
                 self._core.connect_get_namespaced_pod_exec,
@@ -634,13 +684,17 @@ class WorkspaceLauncher:
                 resp.update(timeout=1)
                 if resp.peek_stdout():
                     output = resp.read_stdout()
+                    role_stop_output = (role_stop_output + output)[-256:]
+                    role_stop_failed |= (
+                        "[workspace-role-stop:failed]" in role_stop_output
+                    )
                     if output_callback:
                         output_callback(pod, output)
                 if resp.peek_stderr():
                     output = resp.read_stderr()
                     if output_callback:
                         output_callback(pod, output)
-            return ExecResult(pod=pod, ok=True, output="")
+            return ExecResult(pod=pod, ok=not role_stop_failed, output="")
         except Exception as e:
             logger.warning(
                 "Workspace streaming pod exec failed pod=%s namespace=%s "

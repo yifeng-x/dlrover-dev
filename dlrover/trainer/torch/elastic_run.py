@@ -429,6 +429,11 @@ def _elastic_config_from_args(
 
     _merge_elastic_config_from_master(elastic_config)
 
+    if os.getenv("DLROVER_WORKSPACE_ROLE_TASK") == "1":
+        elastic_config.max_restarts = 0
+        elastic_config.auto_config = False
+        elastic_config.auto_tunning = False
+        elastic_config.exclude_straggler = False
     elastic_config.auto_configure_params()
     elastic_config.update_precheck_args()
     elastic_config.rdzv_backend = "dlrover-master"

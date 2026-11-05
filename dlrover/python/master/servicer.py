@@ -121,6 +121,13 @@ class MasterServicer(ABC):
         self._elastic_ps_service: ElasticPsService = elastic_ps_service
         self._sync_service: SyncService = sync_service
         self._lock = threading.Lock()
+        from dlrover.python.master.node.workspace_task import (
+            WorkspaceTaskCoordinator,
+        )
+
+        self._workspace_tasks = WorkspaceTaskCoordinator()
+        if job_manager is not None:
+            job_manager.workspace_tasks = self._workspace_tasks
         self._version = 0
         self._start_training_time = 0
         self._start_autoscale = False
@@ -171,7 +178,97 @@ class MasterServicer(ABC):
         if not req_message:
             return response
         message = None
-        if isinstance(req_message, comm.TaskRequest):
+        if isinstance(req_message, comm.WorkspaceTaskRequest):
+            try:
+                from dlrover.python.master.node.workspace_state import (
+                    is_workspace_node,
+                )
+
+                node = _job_ctx.job_node(node_type, node_id)
+                if (
+                    node_type != NodeType.WORKER
+                    or not node
+                    or not is_workspace_node(node)
+                ):
+                    raise ValueError(
+                        "workspace task RPC requires a workspace worker"
+                    )
+                if (
+                    req_message.operation == "heartbeat"
+                    and req_message.epoch == self._workspace_tasks.epoch
+                    and self._workspace_tasks.task
+                    and req_message.run_id
+                    == self._workspace_tasks.task["run_id"]
+                ):
+                    if req_message.payload.get("rank") != node.rank_index:
+                        raise ValueError(
+                            "task rank differs from authenticated worker identity"
+                        )
+                    metadata = node.config_resource.kwargs
+                    self._workspace_tasks.observe_pod(
+                        node.rank_index,
+                        metadata.get("workspace_pod_uid", ""),
+                        metadata.get("workspace_pod_ip", ""),
+                        node.status == "Running",
+                    )
+                if req_message.operation == "register":
+                    from dlrover.python.common.constants import (
+                        ElasticDimension,
+                    )
+
+                    workers = {
+                        n.rank_index: n
+                        for n in _job_ctx.job_nodes_by_type(
+                            NodeType.WORKER
+                        ).values()
+                        if not n.is_released
+                    }
+                    members = req_message.payload["members"]
+                    if set(workers) != {m["rank"] for m in members}:
+                        raise ValueError(
+                            "task membership differs from current workspace workers"
+                        )
+                    for member in members:
+                        worker = workers[member["rank"]]
+                        metadata = worker.config_resource.kwargs
+                        if (
+                            not is_workspace_node(worker)
+                            or worker.status != "Running"
+                            or metadata.get("workspace_pod_uid")
+                            != member["uid"]
+                            or metadata.get("workspace_pod_ip") != member["ip"]
+                        ):
+                            raise ValueError(
+                                "workspace Pod identity changed before registration"
+                            )
+                    job_args = getattr(self._job_manager, "_job_args", None)
+                    if (
+                        job_args
+                        and job_args.runtime_elastic_dimension
+                        == ElasticDimension.VERTICAL
+                    ):
+                        raise ValueError(
+                            "adapted role tasks require a workspace without vertical elasticity"
+                        )
+                    autoscaler = getattr(
+                        self._job_manager, "_job_autoscaler", None
+                    )
+                    if autoscaler is not None and getattr(
+                        autoscaler, "_autoscaling_started", False
+                    ):
+                        raise ValueError(
+                            "stop active autoscaling before launching a role task"
+                        )
+                result = self._workspace_tasks.exchange(
+                    req_message.operation,
+                    req_message.run_id,
+                    req_message.epoch,
+                    req_message.payload,
+                )
+            except (ValueError, KeyError, TypeError) as error:
+                result = {"error": str(error)}
+            message = comm.WorkspaceTaskResponse(payload=result)
+        elif isinstance(req_message, comm.TaskRequest):
             message = self._get_task(node_type, node_id, req_message)
         elif isinstance(req_message, comm.ShardCheckpointRequest):
             message = self._get_shard_checkpoint(req_message)
@@ -247,7 +344,7 @@ class MasterServicer(ABC):
         if message:
             response.data = message.serialize()
         return response
-    
+
     def get_vertical_elastic_phase(self, req_message):
         phase_info = self._job_manager.get_vertical_elastic_phase()
         return comm.VerticalElasticPhaseInfo(
@@ -579,11 +676,11 @@ class MasterServicer(ABC):
 
         response.success = success
         return response
-    
+
     def request_job_suspend(self, message: comm.RequestJobSuspend):
         self._job_manager.request_job_suspend(message.suspend, message.reason)
         return True
-    
+
     def set_save_ckpt_status(self, node_id, message: comm.SaveCheckpointReady = None):
         if message is None:
             message = node_id
@@ -700,7 +797,7 @@ class MasterServicer(ABC):
             self._job_metric_collector.collect_runtime_stats(
                 self._perf_monitor, nodes
             )
-    
+
     def _collect_runtime_resource_usage(self):
         if self._job_metric_collector and self._job_manager:
             nodes = self._job_manager.get_running_workers()
@@ -1040,12 +1137,12 @@ class MasterServicer(ABC):
                     else "dimension_mismatch"
                 )
                 metrics.request(message.scale_action, "rejected", reason, trigger_source="rpc")
-            
+
             logger.warning(
                 "DIMENSION_MISMATCH: reject incompatible elastic request"
             )
             return False
-        
+
         job_args = self._job_manager._job_args
         for field, expected in (
             ("job_uuid", job_args.job_uuid),
@@ -1060,7 +1157,7 @@ class MasterServicer(ABC):
                     "Reject elastic request: %s does not match job", field
                 )
                 return False
-        
+
         return bool(
             self._job_manager.start_resource_scaling(message.scale_action, trigger_source="rpc")
         )

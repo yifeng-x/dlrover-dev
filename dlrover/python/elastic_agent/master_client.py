@@ -86,6 +86,22 @@ class MasterClient(Singleton, ABC):
         """Abstraction of get function."""
         pass
 
+    def workspace_task(self, operation, run_id="", epoch="", payload=None):
+        request = comm.WorkspaceTaskRequest(
+            operation, run_id, epoch, payload or {}
+        )
+        response = self._get_once(request, timeout=5)
+        if not isinstance(response, comm.WorkspaceTaskResponse):
+            raise RuntimeError("Master does not support workspace role tasks")
+        if response.payload.get("error"):
+            raise RuntimeError(response.payload["error"])
+        return response.payload
+
+    def _get_once(self, message, timeout):
+        raise RuntimeError(
+            "workspace role tasks require HTTP or gRPC transport"
+        )
+
     def kv_store_set(self, key, value):
         message = comm.KeyValuePair(key, value)
         message.op = KeyValueOps.SET
@@ -428,7 +444,7 @@ class MasterClient(Singleton, ABC):
         except Exception:
             logger.warning("Fail to query the number of waiting nodes.")
             return 0
-    
+
     def get_vertical_elastic_phase(self):
         request=comm.VerticalElasticPhaseRequest()
         try:
@@ -444,7 +460,7 @@ class MasterClient(Singleton, ABC):
         except Exception:
             logger.warning("Fail to get resouce from brain")
             return comm.VerticalElasticPhaseInfo()
-    
+
     def get_gpus_from_brain_resource_plan(self):
         request=comm.BrainOptGpusRequest()
         try:
@@ -677,7 +693,7 @@ class MasterClient(Singleton, ABC):
             action_content=action.to_json(),
         )
         self._report(message)
-    
+
     def set_save_ckpt_status(
         self,
         ckpt_save_ready,
@@ -696,7 +712,7 @@ class MasterClient(Singleton, ABC):
             checkpoint_path=checkpoint_path,
         )
         self._report(message)
-    
+
     def request_job_suspend(self, suspend, reason=""):
         message = comm.RequestJobSuspend(suspend=suspend, reason=reason)
         self._report(message)
@@ -776,17 +792,21 @@ try:
 
         @retry()
         def _get(self, message: comm.Message):
+            return self._get_once(message, self._timeout)
+
+        def _get_once(self, message, timeout):
             request = elastic_training_pb2.Message()
             request.node_id = self._node_id
             request.node_type = self._node_type
             request.data = message.serialize()
             response = self._stub.get(
                 request,
-                timeout=self._timeout,
+                timeout=timeout,
                 metadata=self._gen_request_meta(),
             )
             res_message = comm.deserialize_message(response.data)
             return res_message
+
 
 except ImportError:
     logger.warning("Protobuf is not installed.")
@@ -843,6 +863,17 @@ class HttpMasterClient(MasterClient):
                 response.content
             )
             return comm.deserialize_message(response_data.data)
+
+    def _get_once(self, message, timeout):
+        with requests.post(
+            self._get_http_request_url("/get"),
+            json=self._gen_request(message).to_json(),
+            headers=self._get_headers(),
+            timeout=timeout,
+        ) as response:
+            response.raise_for_status()
+            result = comm.deserialize_message(response.content)
+            return comm.deserialize_message(result.data)
 
     def _gen_request(self, message: comm.Message):
         request = BaseRequest()

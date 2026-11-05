@@ -288,7 +288,7 @@ class DistributedJobManager(JobManager):
         self._adjust_worker_for_estimator()
         self._init_nodes()
         self._init_job_auto_scaler()
-        
+
         if self._job_args.runtime_elastic_dimension == ElasticDimension.VERTICAL:
             self._init_job_resource_scaler()
 
@@ -462,10 +462,10 @@ class DistributedJobManager(JobManager):
             step=step,
             checkpoint_path=checkpoint_path,
         )
-        
+
     def get_vertical_elastic_phase(self):
         return self._job_resource_scaler.get_phase_info()
-    
+
     def set_param_tunning_ready(
         self,
         param_tunning_ready: bool,
@@ -842,6 +842,9 @@ class DistributedJobManager(JobManager):
         )
 
     def _should_skip_no_heartbeat_relaunch(self, node: Node) -> bool:
+        tasks = getattr(self, "workspace_tasks", None)
+        if tasks is not None and tasks.active and is_workspace_node(node):
+            return True
         return self._workspace_training_state.should_skip_no_heartbeat_relaunch(
             node
         )
@@ -1175,6 +1178,15 @@ class DistributedJobManager(JobManager):
             if cur_node.has_group():
                 self._job_context.update_job_node_by_group(cur_node)
 
+        tasks = getattr(self, "workspace_tasks", None)
+        if tasks is not None and tasks.active and node_type == NodeType.WORKER:
+            metadata = event.node.config_resource.kwargs
+            tasks.observe_pod(
+                event.node.rank_index,
+                metadata.get("workspace_pod_uid", ""),
+                metadata.get("workspace_pod_ip", ""),
+                node_status == NodeStatus.RUNNING,
+            )
         # For the given node id, check whether it meets
         # the state change condition
         if event.event_type == "exit":
@@ -1286,6 +1298,9 @@ class DistributedJobManager(JobManager):
             f"Check node group {node_group} "
             f"already relaunched: {self._relaunched_groups}"
         )
+        tasks = getattr(self, "workspace_tasks", None)
+        if tasks is not None and tasks.active:
+            return False
         if node_group in self._relaunched_groups:
             logger.debug(
                 f"Skip node group {node_group} due to "
@@ -1319,6 +1334,10 @@ class DistributedJobManager(JobManager):
     def _should_relaunch(
         self, node: Node, status_change_flow: NodeStateFlow
     ) -> object:
+        tasks = getattr(self, "workspace_tasks", None)
+        if tasks is not None and tasks.active and is_workspace_node(node):
+            tasks.fail("workspace Pod failed or changed")
+            return False
         if is_releasing_workspace_node(node):
             node.relaunchable = False
             logger.info(
@@ -1326,7 +1345,7 @@ class DistributedJobManager(JobManager):
                 node.name,
             )
             return False
-        
+
         if self.is_vertical_replacement_node(node):
             node.relaunchable = False
             logger.info(
@@ -1438,6 +1457,11 @@ class DistributedJobManager(JobManager):
         return should_relaunch
 
     def _relaunch_node(self, node: Node):
+        tasks = getattr(self, "workspace_tasks", None)
+        if tasks is not None and tasks.active and is_workspace_node(node):
+            tasks.fail("workspace worker requested independent relaunch")
+            return
+
         # Record the host IP of a nodecheck-failed node before relaunching,
         # so that the relaunch pod (and later pods) get scheduled away from
         # it via node affinity in the scaler.
@@ -1636,7 +1660,7 @@ class DistributedJobManager(JobManager):
         scaler = getattr(self, "_job_resource_scaler", None)
         if scaler is not None:
             scaler.stop()
-        
+
         self.vertical_metrics.stop_recovery()
         if not self._stopped:
             self._enable_relaunch_node = False
@@ -1696,7 +1720,7 @@ class DistributedJobManager(JobManager):
             return
         self._job_context.request_suspend()
         logger.info(f"Request job suspend, reason: {reason}")
-        
+
 
     def update_node_service_addr(self, node_type, node_id, service_addr):
         node = self._job_context.job_node(node_type, node_id)
@@ -1804,14 +1828,17 @@ class DistributedJobManager(JobManager):
 
     def start_auto_scaling(self):
         """Start auto scaling nodes to improve the training throughput."""
+        tasks = getattr(self, "workspace_tasks", None)
+        if tasks is not None and tasks.active:
+            return
         if self._workspace_training_state.releasing:
             logger.info("Skip autoscaling for release workspace job.")
             return
-        
+
         if self._job_args.runtime_elastic_dimension == ElasticDimension.VERTICAL:
             logger.info("Skip horizontal autoscaling for vertical job.")
             return
-        
+
         self._job_autoscaler.start_auto_scaling()
 
     def start_resource_scaling(self, scale_action: WorkerResourceScaleAction.NOT_ADJUST, trigger_source="unknown"):
@@ -2006,7 +2033,7 @@ class DistributedJobManager(JobManager):
                         node_type,
                     )
                     return
-                
+
                 logger.info(
                     f"Node {node_id}({node_type}) reported status to {event_type}."
                 )

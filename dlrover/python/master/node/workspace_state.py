@@ -56,6 +56,11 @@ def sync_workspace_node_metadata(target_node, source_node) -> bool:
     labels[_RUN_MODE_KEY] = run_mode
     exit_policy = get_workspace_exit_policy(source_node)
     labels[_EXIT_POLICY_KEY] = exit_policy
+    for key in ("workspace_pod_uid", "workspace_pod_ip"):
+        if key in source_node.config_resource.kwargs:
+            target_node.config_resource.kwargs[key] = (
+                source_node.config_resource.kwargs[key]
+            )
     return True
 
 

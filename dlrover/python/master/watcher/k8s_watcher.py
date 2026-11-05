@@ -180,6 +180,13 @@ def _convert_pod_yaml_to_node(pod):
                 break
     resource.kwargs["pod_labels"] = labels or {}
     resource.kwargs["pod_annotations"] = metadata.annotations or {}
+    if str(labels.get("dlrover.io/run-mode", "")).lower() == "workspace":
+        resource.kwargs["workspace_pod_uid"] = (
+            getattr(metadata, "uid", "") or ""
+        )
+        resource.kwargs["workspace_pod_ip"] = (
+            getattr(pod.status, "pod_ip", "") or ""
+        )
     host_name = pod.spec.node_name
     host_ip = pod.status.host_ip
 
@@ -574,5 +581,3 @@ class K8sElasticJobWatcher(object):
         threading.Thread(
             target=self.watch, name="job-watcher", daemon=True
         ).start()
-
-

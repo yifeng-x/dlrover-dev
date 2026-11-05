@@ -70,18 +70,55 @@ def build_parser():
     _add_cli_log_args(logs)
     logs.add_argument("--tail", type=int, default=100)
     logs.add_argument("--follow", "-f", action="store_true")
+    logs.add_argument("--role", choices=("trainer", "rollout"))
+    stop.add_argument("--task-ranks", default=None)
+    task = subparsers.add_parser("role-task")
+    task.add_argument("--action", required=True)
+    task.add_argument("--payload-b64", required=True)
     return parser
 
 
 def main(argv=None):
     previous_logger_disabled = logger.disabled
     manager = None
+    task = None
     try:
         args = build_parser().parse_args(argv)
         _configure_cli_logging(
             _normalize_cli_log_enabled(getattr(args, "cli_log", None))
         )
         manager = WorkspaceProcessManager(args.log_dir, state_dir=args.state_dir)
+        from dlrover.python.workspace import role_control, role_runtime
+
+        if args.command == "role-task":
+            import json
+
+            result = role_control.control(
+                args.action,
+                json.loads(_decode_command(args.payload_b64)),
+                manager,
+            )
+            print("WORKSPACE_TASK=" + json.dumps(result))
+            return 0
+        task = role_runtime.read_index(args.state_dir)
+        if task and args.command in ("status", "stop", "logs"):
+            if args.command == "status":
+                _emit_command_output(role_control.status(task))
+                return 0
+            if args.command == "stop":
+                ranks = (
+                    [int(r) for r in args.task_ranks.split(",")]
+                    if args.task_ranks
+                    else None
+                )
+                return role_control.stop(
+                    task,
+                    ranks,
+                    args.grace_period,
+                    args.kill_timeout,
+                    args.state_dir,
+                )
+            return role_control.logs(task, args.role, args.tail, args.follow)
         if args.command == "launch":
             return manager.launch(
                 command=_decode_command(args.cmd_b64),
@@ -103,6 +140,9 @@ def main(argv=None):
         if args.command == "logs":
             return manager.logs(tail=args.tail, follow=args.follow)
     except Exception as e:
+        if task and getattr(args, "command", "") == "stop":
+            print("[workspace-role-stop:failed]", flush=True)
+        print("workspace agentctl: %s" % e, file=sys.stderr)
         logger.error(
             "workspace agentctl failed command=%s log_dir=%s launch_id=%s.",
             args.command,

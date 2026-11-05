@@ -712,3 +712,16 @@ class TaskType(object):
     PREDICTION = "PREDICTION"
     WAIT = "WAIT"
     TRAIN_END_CALLBACK = "TRAIN_END_CALLBACK"
+
+
+@dataclass
+class WorkspaceTaskRequest(Message):
+    operation: str = "status"
+    run_id: str = ""
+    epoch: str = ""
+    payload: dict = field(default_factory=dict)
+
+
+@dataclass
+class WorkspaceTaskResponse(Message):
+    payload: dict = field(default_factory=dict)

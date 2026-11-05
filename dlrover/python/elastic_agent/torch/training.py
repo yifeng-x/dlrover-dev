@@ -1147,6 +1147,8 @@ class ElasticTrainingAgent(LocalElasticAgent):
         return workers
 
     def _initialize_workers(self, worker_group, max_errors=3):
+        if os.getenv("DLROVER_WORKSPACE_ROLE_TASK") == "1":
+            max_errors = 1
         logger.info(
             f"Start initializing training({self.__class__.__name__}) workers."
         )
@@ -1448,6 +1450,10 @@ class ElasticTrainingAgent(LocalElasticAgent):
                         return_values=run_result.return_values,
                     )
 
+                if os.getenv("DLROVER_WORKSPACE_ROLE_TASK") == "1":
+                    self._stop_workers(self._worker_group)
+                    return run_result
+
                 logger.error(f"The worker fails with {run_result.failures}")
                 self._save_ckpt_to_storage()
 
@@ -1517,6 +1523,9 @@ class ElasticTrainingAgent(LocalElasticAgent):
                     return run_result
 
             elif state == WorkerState.HEALTHY:
+                if os.getenv("DLROVER_WORKSPACE_ROLE_TASK") == "1":
+                    # The task coordinator owns recovery and membership.
+                    continue
                 if self._maybe_suspend_to_zero():
                     return RunResult(state=WorkerState.SUCCEEDED)
 
@@ -1700,7 +1709,7 @@ class ElasticTrainingAgent(LocalElasticAgent):
             return "", 0
         checkpoint_dir, step = saver.get_latest_success_save_dir()
         return checkpoint_dir, step
-    
+
 
     def set_save_ckpt_status(
         self,
@@ -1719,7 +1728,7 @@ class ElasticTrainingAgent(LocalElasticAgent):
             step=step,
             checkpoint_path=checkpoint_path,
         )
-    
+
     def request_job_suspend(self, suspend, reason=""):
         return self._client.request_job_suspend(suspend=suspend, reason=reason)
 

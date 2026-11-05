@@ -308,14 +308,15 @@ class AllreduceTrainingAutoScaler(JobAutoScaler):
         if _dlrover_context.runtime_elastic_dimension == ElasticDimension.VERTICAL:
             return
         
+        if not _dlrover_context.auto_worker_enabled:
+            return
         if not self._autoscaling_started:
             self._autoscaling_started = True
-            if _dlrover_context.auto_worker_enabled:
-                threading.Thread(
-                    target=self._periodic_adjust_worker,
-                    name="allreduce-autoscaler",
-                    daemon=True,
-                ).start()
+            threading.Thread(
+                target=self._periodic_adjust_worker,
+                name="allreduce-autoscaler",
+                daemon=True,
+            ).start()
 
     def stop_auto_scaling(self):
         self._autoscaling_started = False

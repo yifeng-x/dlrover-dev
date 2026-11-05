@@ -6,45 +6,169 @@
 
 ## 1. 整体流程
 
+### 1.1 架构图
+
 ```mermaid
-flowchart TD
-    A[收到垂直扩缩容请求] --> B[检查开关、并发锁、冷却时间与优化次数]
-    B --> C[生成计划并获取当前与目标资源配置]
-    C --> D{计划有效且 GPU 数发生变化？}
-    D -->|否| Z[结束本次计划]
-    D -->|是| E{收益门禁模式}
-    E -->|off：默认| K[执行资源调整]
-    E -->|shadow / enforce| F[获取当前训练代次和恢复上下文]
-    F --> G[查询 SwanLab 历史指标并选择稳定窗口]
-    G --> H[请求收益证据服务]
-    H --> I[计算预计时间、卡时或集群收益]
-    I --> J{门禁决策}
-    J -->|shadow：配置有效时记录后放行| K
-    J -->|enforce：正收益| K
-    J -->|enforce：明确缺少候选吞吐| X{探索开启且满足准入条件？}
-    J -->|enforce：其他负收益或未知| Z
-    X -->|否| Z
-    X -->|是| Y[持久化原配置、基线、预算与策略信息]
-    Y --> K
-    K --> K1[通知训练保存 checkpoint]
-    K1 --> K2[等待 checkpoint 就绪]
-    K2 --> K3[探索模式再次确认目标调度授权]
-    K3 --> K4[替换 worker、调整参数、完成 rendezvous]
-    K4 --> K5[跟踪训练恢复与进度]
-    K5 --> L{是否为受控探索？}
-    L -->|否| M[完成本次执行，不进入收益轮询]
-    L -->|是| N[周期查询训练和执行证据，接受至少两个独立稳定窗口]
-    N --> O[计算整体实测预测收益]
-    O --> P{探索决策}
-    P -->|整体收益达标| Q[ACCEPTED：保留新配置]
-    P -->|收益不足但约束满足| R[RETAINED：保留但未验证正收益]
-    P -->|证据、预算或约束不满足| T[INCONCLUSIVE / FAILED]
-    Q --> V[持久化结果并回传证据]
-    R --> V
-    T --> W[保留保护状态，核对资源、checkpoint与journal]
+flowchart TB
+    REQ(["垂直弹性扩缩容请求"])
+
+    subgraph CONTROL["① 弹性决策控制层"]
+        direction LR
+        CHECK["前置检查<br/>开关 / 并发锁 / 冷却时间 / 次数"]
+        PLAN["扩缩容计划生成<br/>当前资源 → 目标资源"]
+        GATE{"收益门禁<br/>off / shadow / enforce"}
+        DECISION{"执行决策"}
+        CHECK --> PLAN --> GATE
+    end
+
+    subgraph BENEFIT["② 收益评估层"]
+        direction LR
+        CONTEXT["训练上下文<br/>Generation / Checkpoint"]
+        METRIC["SwanLab 指标查询<br/>历史稳定窗口"]
+        ESTIMATE["收益预测服务<br/>时间 / GPU卡时 / 集群收益"]
+        CONTEXT --> METRIC --> ESTIMATE
+    end
+
+    subgraph EXPLORE["③ 受控探索管理层"]
+        direction LR
+        ADMIT{"探索准入<br/>预算 / 约束 / 授权"}
+        JOURNAL[("探索状态持久化<br/>原配置 / 基线 / 预算 / 策略")]
+        ADMIT -->|通过| JOURNAL
+    end
+
+    subgraph EXEC["④ 资源调整执行层"]
+        direction LR
+        CKPT["Checkpoint<br/>保存并确认就绪"]
+        AUTH["目标资源与<br/>调度授权校验"]
+        RESIZE["Worker 替换<br/>资源与训练参数调整"]
+        RECOVER["Rendezvous<br/>训练恢复与进度跟踪"]
+        CKPT --> AUTH --> RESIZE --> RECOVER
+    end
+
+    subgraph VERIFY["⑤ 实测收益验证层"]
+        direction LR
+        OBSERVE["周期采集证据<br/>至少两个独立稳定窗口"]
+        CALC["整体收益计算<br/>包含切换与恢复开销"]
+        VERDICT{"探索结果判定"}
+        OBSERVE --> CALC --> VERDICT
+    end
+
+    subgraph RESULT["⑥ 状态管理与反馈层"]
+        direction LR
+        ACCEPT["ACCEPTED<br/>验证收益达标"]
+        RETAIN["RETAINED<br/>保留但未验证正收益"]
+        PROTECT["INCONCLUSIVE / FAILED<br/>保护状态与人工核查"]
+        DONE["常规执行完成"]
+        OUTPUT[("状态与证据持久化<br/>事件 / 日志 / 结果反馈")]
+        ACCEPT --> OUTPUT
+        RETAIN --> OUTPUT
+        PROTECT --> OUTPUT
+        DONE --> OUTPUT
+    end
+
+    REQ --> CHECK
+
+    GATE -->|off：直接放行| DECISION
+    GATE -->|shadow / enforce| CONTEXT
+    ESTIMATE --> DECISION
+
+    DECISION -->|允许执行| CKPT
+    DECISION -->|缺少候选吞吐且允许探索| ADMIT
+    DECISION -->|拒绝 / 无效| STOP(["结束本次计划"])
+
+    ADMIT -->|拒绝| STOP
+    JOURNAL --> CKPT
+
+    RECOVER -->|常规扩缩容| DONE
+    RECOVER -->|受控探索| OBSERVE
+
+    VERDICT -->|正收益达标| ACCEPT
+    VERDICT -->|收益不足但约束满足| RETAIN
+    VERDICT -->|证据、预算或约束异常| PROTECT
+
+    classDef control fill:#E8F1FF,stroke:#4472C4,color:#17365D
+    classDef benefit fill:#E7F4EA,stroke:#3F8F58,color:#20522D
+    classDef explore fill:#FFF1D9,stroke:#D89A2B,color:#764B08
+    classDef exec fill:#E9EEFF,stroke:#6476C8,color:#293A84
+    classDef verify fill:#F0E7FC,stroke:#9264C4,color:#563183
+    classDef success fill:#DDF4E4,stroke:#349854,color:#225A34
+    classDef warn fill:#FFF0DD,stroke:#D48A2A,color:#81500B
+    classDef error fill:#FCE7E7,stroke:#CB6262,color:#832F2F
+
+    class CHECK,PLAN,GATE,DECISION control
+    class CONTEXT,METRIC,ESTIMATE benefit
+    class ADMIT,JOURNAL explore
+    class CKPT,AUTH,RESIZE,RECOVER exec
+    class OBSERVE,CALC,VERDICT verify
+    class ACCEPT,OUTPUT success
+    class RETAIN,DONE warn
+    class PROTECT error
 ```
 
 图中展示已配置独立 SwanLab 客户端的路径。没有配置 scalar URL 且没有开启 mock 时，训练窗口由收益证据服务的完整快照提供。采集或校验失败会得到 `unknown`，不会按缺失值为零继续计算。
+
+### 1.2 核心决策流程图
+
+相比总体架构图，这张图突出三个关键业务分支：off 直接执行、shadow 观察放行、enforce 收益约束与受控探索。
+
+```mermaid
+flowchart TD
+    START(["触发垂直扩缩容"])
+
+    START --> PRE["前置校验与扩缩容计划"]
+    PRE --> VALID{"计划有效且 GPU 数变化？"}
+
+    VALID -->|否| END(["结束"])
+    VALID -->|是| MODE{"收益门禁模式"}
+
+    MODE -->|off| NORMAL["常规执行"]
+    MODE -->|shadow| EVAL["获取历史稳定窗口与收益证据"]
+    MODE -->|enforce| EVAL
+
+    EVAL --> CALC["预测时间、卡时与集群收益"]
+    CALC --> POLICY{"门禁模式与评估结果"}
+
+    POLICY -->|shadow：配置有效| LOG["记录评估结果"]
+    LOG --> NORMAL
+
+    POLICY -->|enforce：正收益| NORMAL
+    POLICY -->|enforce：明确缺少候选吞吐| EXP{"满足探索准入条件？"}
+    POLICY -->|enforce：负收益或其他未知| END
+
+    EXP -->|否| END
+    EXP -->|是| SAVE[("持久化探索上下文")]
+    SAVE --> EXEC
+
+    NORMAL --> EXEC["Checkpoint → 调度校验<br/>Worker调整 → Rendezvous"]
+
+    EXEC --> OK{"执行与训练恢复成功？"}
+    OK -->|否| PROTECT["进入异常保护与恢复处理"]
+    OK -->|是| IS_EXP{"是否受控探索？"}
+
+    IS_EXP -->|否| DONE(["常规执行完成"])
+    IS_EXP -->|是| OBS["采集至少两个独立稳定窗口"]
+
+    OBS --> PROFIT["计算整体实测收益"]
+    PROFIT --> RESULT{"收益验证结果"}
+
+    RESULT -->|正收益达标| ACCEPT["ACCEPTED"]
+    RESULT -->|收益不足且约束满足| RETAIN["RETAINED"]
+    RESULT -->|证据、预算或约束异常| PROTECT
+
+    ACCEPT --> PERSIST[("持久化结果并反馈")]
+    RETAIN --> PERSIST
+    PROTECT --> PERSIST
+
+    classDef action fill:#E7F0FF,stroke:#5C83C3,color:#1C4270
+    classDef decision fill:#FFF0D7,stroke:#C99337,color:#6B470A
+    classDef success fill:#E1F5E6,stroke:#4D9E65,color:#236339
+    classDef failure fill:#FBE5E5,stroke:#C66B6B,color:#813333
+
+    class PRE,EVAL,CALC,NORMAL,EXEC,OBS,PROFIT,LOG,SAVE action
+    class VALID,MODE,POLICY,EXP,OK,IS_EXP,RESULT decision
+    class ACCEPT,RETAIN,DONE,PERSIST success
+    class PROTECT failure
+```
 
 ## 2. 资源计划何时进入收益评估
 

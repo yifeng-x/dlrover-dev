@@ -119,6 +119,18 @@ def build_parser():
         "--log-dir", default=DEFAULT_LOG_DIR,
         help="Pod directory for timestamped training logs (default: %(default)s).",
     )
+    launch.add_argument("--framework", default=None)
+    launch.add_argument(
+        "--deployment-mode", choices=("auto", "colocate", "disaggregated")
+    )
+    launch.add_argument(
+        "--rollout-management", choices=("external", "managed")
+    )
+    for role in ("trainer", "rollout"):
+        launch.add_argument("--" + role + "-ranks")
+        launch.add_argument("--" + role + "-devices")
+    launch.add_argument("--rollout-ready-timeout", type=float)
+    launch.add_argument("--dry-run", action="store_true")
     launch.add_argument("--foreground", action="store_true")
     launch.add_argument("--max-workers", type=int, default=32)
 
@@ -138,6 +150,7 @@ def build_parser():
         "--log-dir", default=DEFAULT_LOG_DIR,
         help="Pod training log directory (default: %(default)s).",
     )
+    logs.add_argument("--role", choices=("trainer", "rollout"))
     logs.add_argument("--tail", type=int, default=100)
     logs.add_argument("--max-workers", type=int, default=32)
     logs.add_argument("--follow", "-f", action="store_true")
@@ -287,6 +300,7 @@ class _StopProgressReporter:
 
 def main(argv=None):
     previous_logger_disabled = logger.disabled
+    args = None
     try:
         argv = sys.argv[1:] if argv is None else list(argv)
         cli_log_enabled = _scan_cli_log_enabled(argv)
@@ -339,6 +353,46 @@ def main(argv=None):
                 )
             )
         if args.command == "launch":
+            from dlrover.python.workspace.role_plan import (
+                enabled,
+                build_plan,
+                integer_list,
+            )
+
+            if enabled(args):
+                if args.ranks is not None:
+                    ranks = integer_list(args.ranks, "ranks")
+                if release_policy:
+                    raise ValueError(
+                        "adapted release requires validated task cleanup barrier support"
+                    )
+                if args.network_mode != NETWORK_MODE_NONE:
+                    WorkspaceNetworkPlanner(launcher)._resolve_network_ranks(
+                        args.network_mode, ranks
+                    )
+                pods = launcher.list_worker_pods(ranks)
+                if ranks is not None:
+                    WorkspaceNetworkPlanner(launcher)._validate_selected_ranks(
+                        ranks, pods
+                    )
+                explicit = any(
+                    a == "--dlrover-run-args"
+                    or a.startswith("--dlrover-run-args=")
+                    for a in argv
+                )
+                plan = build_plan(args, pods, explicit)
+                if args.dry_run:
+                    print(plan.describe())
+                    return 0
+                from dlrover.python.workspace.role_launcher import launch
+
+                result = launch(launcher, plan, args)
+                print("Task %s: %s" % (plan.run_id, result["state"]))
+                return 0
+            if args.dry_run:
+                raise ValueError(
+                    "--dry-run requires explicit framework adaptation options"
+                )
             ready_pods = None
             if release_policy:
                 ready_pods = launcher.wait_for_running_pods(
@@ -397,9 +451,10 @@ def main(argv=None):
                         tail=args.tail,
                         max_workers=args.max_workers,
                         follow=True,
+                        **({"role": args.role} if args.role else {}),
                         output_callback=_emit_stream,
                         show_cli_log=cli_log_enabled,
-                    )
+                    ),
                 )
             return _emit_results(
                 args.command,
@@ -408,11 +463,13 @@ def main(argv=None):
                     log_dir=args.log_dir,
                     state_dir=args.state_dir,
                     tail=args.tail,
+                    **({"role": args.role} if args.role else {}),
                     max_workers=args.max_workers,
                     show_cli_log=cli_log_enabled,
-                )
+                ),
             )
     except Exception as e:
+        print("workspace: %s" % e, file=sys.stderr)
         _log_cli_error(args, e)
         return 1
     finally:
