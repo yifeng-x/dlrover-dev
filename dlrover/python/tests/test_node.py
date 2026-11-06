@@ -101,6 +101,13 @@ class NodeTest(unittest.TestCase):
     def test_node_event(self):
         node = Node("worker", 0)
         event = NodeEvent(NodeEventType.NODE_CHECK_FAILED, node)
+        self.assertEqual(event.event_message, "")
+        finished = NodeEvent(
+            NodeEventType.WORKSPACE_TRAINING_FINISHED,
+            node,
+            event_message="run-123",
+        )
+        self.assertEqual(finished.event_message, "run-123")
         self.assertTrue(event.is_node_check_event())
         self.assertFalse(event.is_pre_check_event())
 

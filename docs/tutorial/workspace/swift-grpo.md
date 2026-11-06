@@ -61,7 +61,7 @@ dlrover-workspace stop
 - 同一 workspace 只允许一个活动适配任务。所有 worker（包括不承担角色的 worker）都登记占用，防止与旧命令并发启动。
 - 启动 CLI 等待任务进入 RUNNING 或结束；进入 RUNNING 后无需 CLI 存活。RUNNING 的条件是每个训练 worker 完成首个 optimizer step，不是仅端口开放。
 - 服务启动和训练初始化各使用 `--rollout-ready-timeout`，默认 600 秒；控制失联宽限为 60 秒，trainer 完成窗口为 60 秒。
-- Master 通过现有 RPC 聚合状态。Pod UID/IP 变化、角色失败、服务探针失效或启动超时触发整任务停止。
+- Master 通过现有 RPC 聚合状态。Pod UID/IP 变化、角色失败、服务探针持续失效或启动超时触发整任务停止。已就绪 rollout 的 HTTP 探测允许 60 秒连续失败宽限，成功后重置；期间继续控制心跳。进程退出和监听端口归属丢失仍立即失败。停止原因包含最后一次 HTTP 探测异常。
 - Pod 内独立 guardian 在监管进程意外退出时清理角色。正常结束或失败均先清理 trainer，再清理 managed rollout。
 - 只有任务清理屏障完成才释放任务占用。清理失败、控制结果不确定时保留占用；再次 stop 会重试孤儿角色清理。不能删除状态文件来绕过占用检查。
 - Master 重启使旧代次失效；不透明恢复训练。新任务必须重新检查所有 worker 的进程和占用。永久丢失 Pod、无法证明清理完成时需要运维核对，不能报告成功。

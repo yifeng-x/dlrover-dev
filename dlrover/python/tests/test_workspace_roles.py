@@ -416,6 +416,26 @@ class CoordinatorTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_health_probe_grace_and_recovery(self):
+        monitor = role_runtime.HealthMonitor(grace=60)
+        probe = mock.Mock(side_effect=TimeoutError("probe timed out"))
+        with mock.patch.object(role_runtime.time, "monotonic") as clock:
+            clock.return_value = 0
+            self.assertFalse(monitor.check("rollout", probe, {}, True))
+            clock.return_value = 59
+            self.assertFalse(monitor.check("rollout", probe, {}, True))
+            probe.side_effect = None
+            self.assertTrue(monitor.check("rollout", probe, {}, True))
+            probe.side_effect = TimeoutError("probe timed out")
+            clock.return_value = 60
+            self.assertFalse(monitor.check("rollout", probe, {}, True))
+            clock.return_value = 120
+            with self.assertRaisesRegex(RuntimeError, "TimeoutError: probe timed out"):
+                monitor.check("rollout", probe, {}, True)
+            self.assertFalse(monitor.check("other endpoint", probe, {}, True))
+            self.assertFalse(monitor.check("starting", probe, {}, False))
+            self.assertNotIn("starting", monitor.failures)
+
     def test_stop_refuses_partial_scope(self):
         data = {
             "plan": {"roles": [{"rank": 0}, {"rank": 2}]},

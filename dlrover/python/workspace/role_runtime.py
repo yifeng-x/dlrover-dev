@@ -31,6 +31,30 @@ from dlrover.python.workspace.state import (
 INDEX = "role-task.json"
 
 
+class HealthMonitor:
+    """Tolerate transient probe failures without blocking control heartbeats."""
+
+    def __init__(self, grace=60):
+        self.grace = grace
+        self.failures = {}
+
+    def check(self, key, probe, endpoint, required):
+        try:
+            probe(endpoint)
+        except Exception as exc:
+            if required:
+                now = time.monotonic()
+                since = self.failures.setdefault(key, now)
+                if now - since >= self.grace:
+                    raise RuntimeError(
+                        "%s health lost for %.0fs: %s: %s"
+                        % (key, now - since, type(exc).__name__, exc)
+                    ) from exc
+            return False
+        self.failures.pop(key, None)
+        return True
+
+
 def write_json(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -204,6 +228,7 @@ def run(state_dir):
     }
     result = {"state": "PREPARING"}
     external_endpoints, external_ready, probe_index = [], set(), 0
+    health = HealthMonitor()
     if plan["management"] == "external" and any(
         r["name"] == "trainer" for r in own
     ):
@@ -304,18 +329,18 @@ def run(state_dir):
                     if name == "rollout":
                         if rc is not None:
                             raise RuntimeError("rollout exited: %s" % rc)
-                        try:
-                            if not owns_listener(
-                                launch_ids[name], role["endpoint"]["port"]
-                            ):
+                        if not owns_listener(
+                            launch_ids[name], role["endpoint"]["port"]
+                        ):
+                            if statuses[name]["state"] == "READY":
                                 raise RuntimeError(
                                     "rollout listener is not owned by this task"
                                 )
-                            adapter.readiness(role["endpoint"])
+                        elif health.check(
+                            "rollout", adapter.readiness, role["endpoint"],
+                            required=statuses[name]["state"] == "READY",
+                        ):
                             statuses[name]["state"] = "READY"
-                        except Exception:
-                            if statuses[name]["state"] == "READY":
-                                raise RuntimeError("rollout health lost")
                     else:
                         report["initialized"] = all(
                             (root / "initialized" / ("rank-%s" % i)).exists()
@@ -338,13 +363,15 @@ def run(state_dir):
             )
             if external_endpoints:
                 # One probe per lease tick keeps control RPCs bounded.
-                try:
-                    adapter.readiness(external_endpoints[probe_index])
+                if health.check(
+                    "external rollout %s" % probe_index,
+                    adapter.readiness,
+                    external_endpoints[probe_index],
+                    required=state in ("TRAINER_STARTING", "RUNNING"),
+                ):
                     external_ready.add(probe_index)
-                except Exception:
+                else:
                     external_ready.discard(probe_index)
-                    if state in ("TRAINER_STARTING", "RUNNING"):
-                        raise RuntimeError("external rollout health lost")
                 probe_index = (probe_index + 1) % len(external_endpoints)
                 report["services_ready"] = len(external_ready) == len(
                     external_endpoints

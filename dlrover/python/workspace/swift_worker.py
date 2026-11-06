@@ -5,6 +5,7 @@
 
 import os
 import runpy
+from functools import wraps
 from pathlib import Path
 
 
@@ -32,6 +33,8 @@ def install_callback():
 
     original = Trainer.__init__
 
+    # Swift inspects this signature to select processing_class vs tokenizer.
+    @wraps(original)
     def init(self, *args, **kwargs):
         original(self, *args, **kwargs)
         self.add_callback(FirstStep())

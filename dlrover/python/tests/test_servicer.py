@@ -703,6 +703,21 @@ class MasterServicerFunctionalTest(unittest.TestCase):
         )
         self.assertTrue(self.servicer._report_node_diagnosis_data(request))
 
+    def test_reported_node_event_preserves_run_id(self):
+        request = comm.NodeEvent(
+            event_type=NodeEventType.WORKSPACE_TRAINING_FINISHED,
+            event_message="run-123",
+            node=comm.NodeMeta(type=NodeType.WORKER, id=0, rank=0),
+        )
+        with mock.patch.object(
+            self.job_manager, "process_reported_node_event"
+        ) as process:
+            self.assertTrue(self.servicer._deal_with_reported_node_event(request))
+        event = process.call_args.args[0]
+        self.assertEqual(event.event_type, request.event_type)
+        self.assertEqual(event.event_message, "run-123")
+        self.assertEqual(event.node.id, 0)
+
     def test_deal_with_reported_node_event(self):
         request = comm.NodeEvent(node=comm.NodeMeta())
         task_id = 1

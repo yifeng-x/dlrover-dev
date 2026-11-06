@@ -462,9 +462,10 @@ class Node(object):
 class NodeEvent(object):
     """NodeEvent is the event to change the status of a Node"""
 
-    def __init__(self, event_type, node):
+    def __init__(self, event_type, node, event_message=""):
         self.event_type = event_type
         self.node: Node = node
+        self.event_message = event_message
 
     def is_node_check_event(self):
         return (

@@ -872,7 +872,9 @@ class MasterServicer(ABC):
             node_id=message.node.id,
             rank_index=message.node.rank,
         )
-        event = NodeEvent(message.event_type, node)
+        event = NodeEvent(
+            message.event_type, node, event_message=message.event_message
+        )
 
         # let rdzv manager deal with rendezvous issue
         if event.is_node_check_event():

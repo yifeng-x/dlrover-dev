@@ -1,6 +1,7 @@
 # Copyright 2026 The DLRover Authors. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
+import inspect
 import os
 from pathlib import Path
 import tempfile
@@ -15,6 +16,45 @@ from dlrover.python.workspace import swift_worker
 
 
 class SwiftRuntimeTests(unittest.TestCase):
+    def test_callback_preserves_trainer_parameter_detection(self):
+        def modern_init(self, model=None, *, processing_class=None):
+            self.processor = processing_class
+            self.callbacks = []
+
+        def legacy_init(self, model=None, *, tokenizer=None):
+            self.processor = tokenizer
+            self.callbacks = []
+
+        for original in (modern_init, legacy_init):
+            with self.subTest(original=original.__name__):
+                trainer = type(
+                    "Trainer",
+                    (),
+                    {
+                        "__init__": original,
+                        "add_callback": lambda self, cb: self.callbacks.append(cb),
+                    },
+                )
+                module = ModuleType("transformers")
+                module.Trainer = trainer
+                module.TrainerCallback = object
+                with mock.patch.dict("sys.modules", {"transformers": module}):
+                    swift_worker.install_callback()
+                    swift_worker.install_callback()
+                    parameters = inspect.signature(trainer.__init__).parameters
+                    key = (
+                        "processing_class"
+                        if "processing_class" in parameters
+                        else "tokenizer"
+                    )
+                    processor = object()
+                    instance = trainer(**{key: processor})
+                self.assertEqual(
+                    inspect.signature(trainer.__init__), inspect.signature(original)
+                )
+                self.assertIs(instance.processor, processor)
+                self.assertEqual(len(instance.callbacks), 1)
+
     def test_exact_role_schema_without_argument_post_init(self):
         @dataclass
         class Trainer:
