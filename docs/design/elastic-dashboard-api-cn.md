@@ -1,6 +1,6 @@
 # 弹性收益 React 看板接口与数据缺口
 
-本文对应 `web/elastic-dashboard`，整理于 2026-11-06。**`/api/v1/elastic/*` 已由独立服务 `dlrover.dashboard.elastic` 实现，不是每个 Master 内嵌的 REST API。** 已实现 MySQL 事件持久化、日志导入、收益聚合和查询，以及无状态 K8s Deployment；部署及采集接入见[服务说明](../../dlrover/dashboard/elastic/README.md)。JCT 基线账本、连续趋势与真实中断采集仍待补齐。
+本文对应 `web/elastic-dashboard`，整理于 2026-11-06。**`/api/v1/elastic/*` 已由独立服务 `dlrover.dashboard.elastic` 实现，不是每个 Master 内嵌的 REST API。** 已实现 MySQL 事件持久化、接口补录、收益聚合和查询，以及无状态 K8s Deployment；部署及采集接入见[服务说明](../../dlrover/dashboard/elastic/README.md)。JCT 基线账本、连续趋势与真实中断采集仍待补齐。
 
 ## 1. 架构与现状
 

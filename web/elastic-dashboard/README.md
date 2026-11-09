@@ -26,6 +26,6 @@ npm run preview
 
 `npm test` 中的跨语言协议测试需要 PATH 中存在 Python 3，仅使用 Python 标准库，不需要安装额外 Python 依赖。
 
-构建输出 `dist/`。接口的可执行类型校验位于 `src/model.ts`，示例数据位于 `src/demo.ts`。后续接入无需改动展示组件。后端入口为 `python -m dlrover.dashboard.elastic --db /持久目录/events.sqlite3 serve`。尚未自动部署、执行资源调整或实现完整 JCT 收益结算。缺少生命周期显示“未知”，不完整统计显示“已记录次数”。
+构建输出 `dist/`。接口的可执行类型校验位于 `src/model.ts`，示例数据位于 `src/demo.ts`。后续接入无需改动展示组件。后端入口为 `python -m dlrover.dashboard.elastic --host 0.0.0.0 --port 8080`。尚未自动部署、执行资源调整或实现完整 JCT 收益结算。缺少生命周期显示“未知”，不完整统计显示“已记录次数”。
 
 生产聚合服务使用 MySQL，并通过 K8s ClusterIP Service 暴露；部署方法见 [MySQL + Kubernetes](../../deploy/elastic-dashboard/README.md)。聚合服务为内部接口，无需 read/ingest token；前端通过平台同源代理访问。

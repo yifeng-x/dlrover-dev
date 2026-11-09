@@ -1,5 +1,16 @@
 # Copyright 2026 The DLRover Authors. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Local SQLite event ledger. Never share this database over NFS."""
 
 import json
@@ -11,7 +22,8 @@ from pathlib import Path
 
 def finite(value):
     return (
-        isinstance(value, (int, float)) and not isinstance(value, bool)
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
         and math.isfinite(value)
     )
 
@@ -34,11 +46,21 @@ def event_values(event):
     at = event.get("occurred_at")
     if not finite(at) or at < 0 or not isinstance(event.get("job"), dict):
         raise ValueError("Invalid event timestamp/job")
-    for key in ("plan_id", "request_id", "phase", "action", "trigger_source",
-                "execution_status", "recovery_status", "reason_code"):
+    for key in (
+        "plan_id",
+        "request_id",
+        "phase",
+        "action",
+        "trigger_source",
+        "execution_status",
+        "recovery_status",
+        "reason_code",
+    ):
         if event.get(key) is not None:
             text(event[key], key)
-    payload = json.dumps(event, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    payload = json.dumps(
+        event, sort_keys=True, ensure_ascii=False, allow_nan=False
+    )
     if len(payload.encode("utf-8")) > 1024 * 1024:
         raise ValueError("Event exceeds 1 MiB")
     return event_id, at, payload
@@ -50,15 +72,20 @@ def lifecycle_values(job):
     status = job.get("status", "unknown")
     if status not in ("running", "completed", "failed", "unknown"):
         raise ValueError("Invalid lifecycle status")
-    submitted, completed, observed = (job.get(k) for k in (
-        "submitted_at", "completed_at", "lifecycle_observed_at"))
+    submitted, completed, observed = (
+        job.get(k)
+        for k in ("submitted_at", "completed_at", "lifecycle_observed_at")
+    )
     for value in (submitted, completed, observed):
         if value is not None and (not finite(value) or value < 0):
             raise ValueError("Invalid lifecycle timestamp")
     if observed is None:
         raise ValueError("lifecycle_observed_at is required")
-    if completed is not None and (status != "completed" or
-                                  submitted is not None and completed < submitted):
+    if completed is not None and (
+        status != "completed"
+        or submitted is not None
+        and completed < submitted
+    ):
         raise ValueError("Invalid completed lifecycle")
     return status, submitted, completed, observed
 
@@ -119,7 +146,9 @@ class EventStore:
         event_id, at, payload = event_values(event)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            old = db.execute("SELECT payload FROM events WHERE event_id=?", (event_id,)).fetchone()
+            old = db.execute(
+                "SELECT payload FROM events WHERE event_id=?", (event_id,)
+            ).fetchone()
             if old:
                 if old["payload"] != payload:
                     raise ValueError("Conflicting event_id")
@@ -137,12 +166,18 @@ class EventStore:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             uid = self._job(db, job)
-            old = db.execute("SELECT * FROM jobs WHERE uid=?", (uid,)).fetchone()
+            old = db.execute(
+                "SELECT * FROM jobs WHERE uid=?", (uid,)
+            ).fetchone()
             if old["lifecycle_observed_at"] is not None:
                 if observed < old["lifecycle_observed_at"]:
                     return False
                 if observed == old["lifecycle_observed_at"]:
-                    if (status, submitted, completed) != (old["status"], old["submitted_at"], old["completed_at"]):
+                    if (status, submitted, completed) != (
+                        old["status"],
+                        old["submitted_at"],
+                        old["completed_at"],
+                    ):
                         raise ValueError("Conflicting lifecycle snapshot")
                     return False
             db.execute(
@@ -154,11 +189,16 @@ class EventStore:
 
     def jobs(self):
         with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM jobs ORDER BY name,uid")]
+            return [
+                dict(row)
+                for row in db.execute("SELECT * FROM jobs ORDER BY name,uid")
+            ]
 
     def read(self, uid):
         with self.connect() as db:
-            job = db.execute("SELECT * FROM jobs WHERE uid=?", (uid,)).fetchone()
+            job = db.execute(
+                "SELECT * FROM jobs WHERE uid=?", (uid,)
+            ).fetchone()
             if not job:
                 raise KeyError(uid)
             rows = db.execute(
@@ -166,7 +206,9 @@ class EventStore:
                 (uid,),
             ).fetchall()
             if len(rows) > 10000:
-                raise ValueError("Job exceeds 10000 events; pagination is required")
+                raise ValueError(
+                    "Job exceeds 10000 events; pagination is required"
+                )
             return dict(job), [json.loads(row[0]) for row in rows]
 
     def health(self):
@@ -178,7 +220,8 @@ class EventStore:
 def create_store(storage="mysql", path=None, environ=None):
     if storage == "mysql":
         from .mysql_store import MySQLEventStore
+
         return MySQLEventStore.from_env(environ)
     if storage == "sqlite" and path:
         return EventStore(path)
-    raise ValueError("SQLite requires --db; storage must be mysql or sqlite")
+    raise ValueError("SQLite requires a path; storage must be mysql or sqlite")

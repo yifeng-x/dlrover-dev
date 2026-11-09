@@ -1,11 +1,22 @@
 # Copyright 2026 The DLRover Authors. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import io
 import json
 import threading
 from pathlib import Path
-from urllib.error import HTTPError
 from unittest.mock import MagicMock
+from urllib.error import HTTPError
 
 import pytest
 
@@ -15,18 +26,35 @@ from dlrover.python.master.monitor.vertical_events import VerticalElasticEvents
 
 def test_http_sink_retries_same_id_after_transient_failure(monkeypatch):
     response = MagicMock()
-    response.__enter__.return_value.read.return_value = b'{"recorded":true,"inserted":false}'
-    send = MagicMock(side_effect=[HTTPError("url", 503, "unavailable", {}, io.BytesIO()), response])
+    response.__enter__.return_value.read.return_value = (
+        b'{"recorded":true,"inserted":false}'
+    )
+    send = MagicMock(
+        side_effect=[
+            HTTPError("url", 503, "unavailable", {}, io.BytesIO()),
+            response,
+        ]
+    )
     monkeypatch.setattr("dlrover.dashboard.elastic.client.urlopen", send)
     sink = HTTPEventSink("http://api:8080/api/v1/elastic/events")
     sink({"event_id": "same-id"})
     assert send.call_count == 2
-    assert all(not call.args[0].has_header("Authorization") for call in send.call_args_list)
-    assert all(json.loads(call.args[0].data)["event_id"] == "same-id" for call in send.call_args_list)
+    assert all(
+        not call.args[0].has_header("Authorization")
+        for call in send.call_args_list
+    )
+    assert all(
+        json.loads(call.args[0].data)["event_id"] == "same-id"
+        for call in send.call_args_list
+    )
 
 
 def test_http_sink_does_not_retry_invalid_record(monkeypatch):
-    send = MagicMock(side_effect=HTTPError("private-url", 422, "sensitive", {}, io.BytesIO()))
+    send = MagicMock(
+        side_effect=HTTPError(
+            "private-url", 422, "sensitive", {}, io.BytesIO()
+        )
+    )
     monkeypatch.setattr("dlrover.dashboard.elastic.client.urlopen", send)
     with pytest.raises(RuntimeError, match="rejected"):
         HTTPEventSink("http://api/api/v1/elastic/events")({"event_id": "id"})
@@ -34,7 +62,9 @@ def test_http_sink_does_not_retry_invalid_record(monkeypatch):
 
 
 def test_master_http_sink_keeps_existing_logs(monkeypatch):
-    monkeypatch.setenv("DLROVER_ELASTIC_EVENT_URL", "http://api/api/v1/elastic/events")
+    monkeypatch.setenv(
+        "DLROVER_ELASTIC_EVENT_URL", "http://api/api/v1/elastic/events"
+    )
     emitter = VerticalElasticEvents(job={"job_uid": "job"})
     seen = []
     emitter._log = seen.append
@@ -55,21 +85,36 @@ def test_manifest_internal_service_and_precreated_schema():
     pod = deployment["spec"]["template"]["spec"]
     container = pod["containers"][0]
     assert deployment["spec"]["replicas"] == 2
-    assert "mysql" in container["args"]
     assert container["livenessProbe"]["httpGet"]["path"] == "/healthz"
     assert container["readinessProbe"]["httpGet"]["path"] == "/readyz"
-    assert container["securityContext"]["readOnlyRootFilesystem"]
-    assert not pod.get("volumes")  # No local event DB/PVC in stateless API Pods.
-    assert container["envFrom"] == [{"configMapRef": {"name": "elastic-dashboard-config"}}]
+    assert container["command"][:2] == ["/bin/bash", "-c"]
+    script = container["command"][2]
+    assert "exec python -m dlrover.dashboard.elastic" in script
+    assert "--host 0.0.0.0 --port 8080" in script
+    assert "args" not in container
+    assert not pod.get(
+        "volumes"
+    )  # No local event DB/PVC in stateless API Pods.
+    assert container["envFrom"] == [
+        {"configMapRef": {"name": "elastic-dashboard-config"}}
+    ]
     config = yaml.safe_load((root / "configmap.yaml").read_text())["data"]
-    assert "DLROVER_MYSQL_USER" in config and "DLROVER_MYSQL_PASSWORD" in config
+    assert (
+        "DLROVER_MYSQL_USER" in config and "DLROVER_MYSQL_PASSWORD" in config
+    )
     assert not any("TOKEN" in key for key in config)
     service = yaml.safe_load((root / "service.yaml").read_text())
     assert service["spec"]["type"] == "ClusterIP"
 
 
-def test_master_does_not_wait_for_stalled_http_and_queue_is_bounded(monkeypatch):
-    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+def test_master_does_not_wait_for_stalled_http_and_queue_is_bounded(
+    monkeypatch,
+):
+    entered, release, finished = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
     drained = threading.Event()
     delivered = []
 
@@ -81,7 +126,9 @@ def test_master_does_not_wait_for_stalled_http_and_queue_is_bounded(monkeypatch)
             drained.set()
 
     monkeypatch.setattr(HTTPEventSink, "send_payload", stalled_send)
-    monkeypatch.setenv("DLROVER_ELASTIC_EVENT_URL", "http://api/api/v1/elastic/events")
+    monkeypatch.setenv(
+        "DLROVER_ELASTIC_EVENT_URL", "http://api/api/v1/elastic/events"
+    )
     emitter = VerticalElasticEvents(job={"job_uid": "job"})
     logged = []
     emitter._log = logged.append
@@ -92,7 +139,9 @@ def test_master_does_not_wait_for_stalled_http_and_queue_is_bounded(monkeypatch)
 
         def control_work():
             for i in range(100):
-                emitter.request(str(i), "add_gpus", "accepted", "test", "manual")
+                emitter.request(
+                    str(i), "add_gpus", "accepted", "test", "manual"
+                )
             finished.set()
 
         caller = threading.Thread(target=control_work, daemon=True)
@@ -108,7 +157,9 @@ def test_master_does_not_wait_for_stalled_http_and_queue_is_bounded(monkeypatch)
     assert drained.wait(2)
 
 
-def test_async_delivery_continues_after_failure_and_snapshots_payload(monkeypatch):
+def test_async_delivery_continues_after_failure_and_snapshots_payload(
+    monkeypatch,
+):
     failed, recovered = threading.Event(), threading.Event()
     received = []
 

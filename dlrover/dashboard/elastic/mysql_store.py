@@ -1,12 +1,27 @@
 # Copyright 2026 The DLRover Authors. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
-"""MySQL ledger: per-request transactions, shared safely by multiple API Pods."""
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""MySQL event ledger using a shared engine and isolated transactions."""
 
 import json
-import os
 from contextlib import contextmanager
-from pathlib import Path
 
+from sqlalchemy import select
+from sqlalchemy.dialects.mysql import insert
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+from .db import Database
+from .models import Base, ElasticEvent, ElasticJob
 from .store import StoreUnavailable, event_values, lifecycle_values, text
 
 
@@ -18,147 +33,139 @@ def identity(value, name):
 
 
 class MySQLEventStore:
-    def __init__(self, config):
-        try:
-            import pymysql
-        except ImportError as exc:
-            raise RuntimeError("Install elastic dashboard requirements for MySQL") from exc
-        self.driver = pymysql
-        self._config = dict(config)
+    def __init__(self, database):
+        self.database = database
 
     @classmethod
     def from_env(cls, environ=None):
-        env = os.environ if environ is None else environ
-        def required(name):
-            value = env.get("DLROVER_MYSQL_" + name)
-            if not value:
-                raise ValueError("Missing DLROVER_MYSQL_" + name)
-            return value
-        config = dict(host=required("HOST"), user=required("USER"),
-                      password=required("PASSWORD"), database=required("DATABASE"),
-                      port=int(env.get("DLROVER_MYSQL_PORT", "3306")),
-                      connect_timeout=3, read_timeout=5, write_timeout=5,
-                      charset="utf8mb4", autocommit=False,
-                      init_command="SET SESSION innodb_lock_wait_timeout=3")
-        if not 1 <= config["port"] <= 65535:
-            raise ValueError("Invalid MySQL port")
-        ca = env.get("DLROVER_MYSQL_SSL_CA")
-        if ca:
-            config.update(ssl_ca=ca, ssl_verify_cert=True, ssl_verify_identity=True)
-        return cls(config)
+        return cls(Database.from_env(environ))
 
     @contextmanager
     def connect(self):
-        connection = None
         try:
-            connection = self.driver.connect(
-                **self._config, cursorclass=self.driver.cursors.DictCursor)
-            yield connection
-            connection.commit()
-        except (self.driver.MySQLError, OSError):
-            if connection:
-                try:
-                    connection.rollback()
-                except self.driver.MySQLError:
-                    pass
-            # Do not expose connection strings, credentials or SQL in API/logs.
+            with self.database.get_db_session() as session:
+                with session.begin():
+                    yield session
+        except (SQLAlchemyError, OSError):
+            # Session contexts roll back and return connections to the pool.
             raise StoreUnavailable("MySQL is unavailable") from None
-        except BaseException:
-            if connection:
-                connection.rollback()
-            raise
-        finally:
-            if connection:
-                try:
-                    connection.close()
-                except self.driver.MySQLError:
-                    pass
+
+    def close(self):
+        self.database.close()
 
     def initialize(self):
-        sql = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
-        sql = "\n".join(line for line in sql.splitlines() if not line.startswith("--"))
-        with self.connect() as db, db.cursor() as cursor:
-            for statement in sql.split(";"):
-                if statement.strip():
-                    cursor.execute(statement)
+        """Explicit test/setup helper; never called on service startup."""
+        try:
+            Base.metadata.create_all(self.database.engine)
+        except (SQLAlchemyError, OSError):
+            raise StoreUnavailable("MySQL is unavailable") from None
 
     @staticmethod
-    def _job(cursor, job):
+    def _job(session, job):
         uid = identity(job.get("job_uid"), "job_uid")
         cluster = identity(job.get("cluster") or "default", "cluster")
         namespace = identity(job.get("namespace") or "default", "namespace")
         name = text(job.get("job_name") or uid, "job_name")
-        # The upsert obtains the job row lock even on the first concurrent event.
-        cursor.execute(
-            "INSERT INTO elastic_jobs(uid,name,cluster,namespace) VALUES(%s,%s,%s,%s) "
-            "ON DUPLICATE KEY UPDATE uid=elastic_jobs.uid", (uid, name, cluster, namespace))
-        cursor.execute("SELECT * FROM elastic_jobs WHERE uid=%s FOR UPDATE", (uid,))
-        old = cursor.fetchone()
-        if (old["cluster"], old["namespace"]) != (cluster, namespace):
+        # Atomic create-or-lock, including concurrent first events for a job.
+        statement = insert(ElasticJob).values(
+            uid=uid,
+            name=name,
+            cluster=cluster,
+            namespace=namespace,
+        )
+        session.execute(statement.on_duplicate_key_update(uid=ElasticJob.uid))
+        old = session.scalars(
+            select(ElasticJob).where(ElasticJob.uid == uid).with_for_update()
+        ).one()
+        if (old.cluster, old.namespace) != (cluster, namespace):
             raise ValueError("Job UID collision across cluster/namespace")
         if name != uid:
-            cursor.execute("UPDATE elastic_jobs SET name=%s WHERE uid=%s", (name, uid))
+            old.name = name
         return uid, old
 
     def append(self, event):
         event_id, at, payload = event_values(event)
         identity(event_id, "event_id")
-        with self.connect() as db, db.cursor() as cursor:
-            uid, _ = self._job(cursor, event["job"])
+        with self.connect() as session:
+            uid, _ = self._job(session, event["job"])
             try:
-                cursor.execute(
-                    "INSERT INTO elastic_events(event_id,job_uid,occurred_at,payload) VALUES(%s,%s,%s,%s)",
-                    (event_id, uid, at, payload))
-            except self.driver.IntegrityError as exc:
-                if exc.args[0] != 1062:
+                # A duplicate rolls back only this insert; the job lock remains
+                # held by the outer transaction while comparing the payload.
+                with session.begin_nested():
+                    session.add(
+                        ElasticEvent(
+                            event_id=event_id,
+                            job_uid=uid,
+                            occurred_at=at,
+                            payload=payload,
+                        )
+                    )
+                    # Force INSERT inside the savepoint so duplicates are
+                    # handled here instead of during outer transaction commit.
+                    session.flush()
+            except IntegrityError as exc:
+                if not exc.orig.args or exc.orig.args[0] != 1062:
                     raise
-                cursor.execute("SELECT payload FROM elastic_events WHERE event_id=%s FOR UPDATE", (event_id,))
-                old = cursor.fetchone()
-                if not old or old["payload"] != payload:
+                old = session.scalars(
+                    select(ElasticEvent)
+                    .where(ElasticEvent.event_id == event_id)
+                    .with_for_update()
+                ).first()
+                if old is None or old.payload != payload:
                     raise ValueError("Conflicting event_id") from None
                 return False
         return True
 
     def register(self, job):
         status, submitted, completed, observed = lifecycle_values(job)
-        with self.connect() as db, db.cursor() as cursor:
-            uid, old = self._job(cursor, job)
-            previous = old["lifecycle_observed_at"]
+        with self.connect() as session:
+            uid, old = self._job(session, job)
+            previous = old.lifecycle_observed_at
             if previous is not None:
                 if observed < previous:
                     return False
                 if observed == previous:
-                    if (status, submitted, completed) != (old["status"], old["submitted_at"], old["completed_at"]):
+                    if (status, submitted, completed) != (
+                        old.status,
+                        old.submitted_at,
+                        old.completed_at,
+                    ):
                         raise ValueError("Conflicting lifecycle snapshot")
                     return False
-            cursor.execute(
-                "UPDATE elastic_jobs SET status=%s,submitted_at=%s,completed_at=%s,"
-                "lifecycle_observed_at=%s WHERE uid=%s",
-                (status, submitted, completed, observed, uid))
+            old.status = status
+            old.submitted_at = submitted
+            old.completed_at = completed
+            old.lifecycle_observed_at = observed
         return True
 
     def jobs(self):
-        with self.connect() as db, db.cursor() as cursor:
-            cursor.execute("SELECT * FROM elastic_jobs ORDER BY name,uid")
-            return list(cursor.fetchall())
+        with self.connect() as session:
+            jobs = session.scalars(
+                select(ElasticJob).order_by(
+                    ElasticJob.name,
+                    ElasticJob.uid,
+                )
+            )
+            return [job.to_dict() for job in jobs]
 
     def read(self, uid):
-        with self.connect() as db, db.cursor() as cursor:
-            cursor.execute("SELECT * FROM elastic_jobs WHERE uid=%s", (uid,))
-            job = cursor.fetchone()
-            if not job:
+        with self.connect() as session:
+            job = session.get(ElasticJob, uid)
+            if job is None:
                 raise KeyError(uid)
-            cursor.execute(
-                "SELECT payload FROM elastic_events WHERE job_uid=%s ORDER BY occurred_at,seq LIMIT 10001", (uid,))
-            rows = cursor.fetchall()
-            if len(rows) > 10000:
-                raise ValueError("Job exceeds 10000 events; pagination is required")
-            return job, [json.loads(row["payload"]) for row in rows]
+            payloads = session.scalars(
+                select(ElasticEvent.payload)
+                .where(ElasticEvent.job_uid == uid)
+                .order_by(ElasticEvent.occurred_at, ElasticEvent.seq)
+                .limit(10001)
+            ).all()
+            if len(payloads) > 10000:
+                raise ValueError(
+                    "Job exceeds 10000 events; pagination is required"
+                )
+            return job.to_dict(), [json.loads(payload) for payload in payloads]
 
     def health(self):
-        with self.connect() as db, db.cursor() as cursor:
-            # Verify connectivity and schema, not just a TCP connection.
-            cursor.execute("SELECT uid FROM elastic_jobs LIMIT 1")
-            cursor.fetchall()
-            cursor.execute("SELECT seq FROM elastic_events LIMIT 1")
-            cursor.fetchall()
+        with self.connect() as session:
+            session.execute(select(ElasticJob.uid).limit(1)).all()
+            session.execute(select(ElasticEvent.seq).limit(1)).all()

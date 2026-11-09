@@ -1,5 +1,16 @@
 # Copyright 2026 The DLRover Authors. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Opt-in Master -> API event sink. Original logs remain the replay source."""
 
 import json
@@ -13,30 +24,46 @@ from urllib.request import Request, urlopen
 class HTTPEventSink:
     def __init__(self, url, timeout=1):
         parsed = urlparse(url)
-        if (parsed.scheme not in ("http", "https") or not parsed.hostname
-                or parsed.username or parsed.password or parsed.query or parsed.fragment
-                or parsed.path != "/api/v1/elastic/events"):
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path != "/api/v1/elastic/events"
+        ):
             raise ValueError("Configure an events endpoint")
         self.url, self.timeout = url, timeout
 
     def __call__(self, event):
-        payload = json.dumps(event, allow_nan=False, ensure_ascii=False).encode("utf-8")
+        payload = json.dumps(
+            event, allow_nan=False, ensure_ascii=False
+        ).encode("utf-8")
         self.send_payload(payload)
 
     def send_payload(self, payload):
-        request = Request(self.url, data=payload, headers={
-            "Content-Type": "application/json"})
+        request = Request(
+            self.url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
         # Reuse the event ID on retry: a timeout may follow a committed write.
         for attempt in range(2):
             try:
                 with urlopen(request, timeout=self.timeout) as response:
                     body = response.read(4097)
-                    if len(body) > 4096 or json.loads(body).get("recorded") is not True:
+                    if (
+                        len(body) > 4096
+                        or json.loads(body).get("recorded") is not True
+                    ):
                         raise ValueError("Invalid event acknowledgement")
                 return
             except HTTPError as exc:
                 if attempt or exc.code not in (408, 429, 500, 502, 503, 504):
-                    raise RuntimeError("Event service rejected delivery") from None
+                    raise RuntimeError(
+                        "Event service rejected delivery"
+                    ) from None
             except (URLError, TimeoutError, OSError):
                 if attempt:
                     raise RuntimeError("Event service unavailable") from None
@@ -58,11 +85,14 @@ class AsyncHTTPEventSink:
         self.dropped = 0
         self.failed = 0
         self._worker = threading.Thread(
-            target=self._run, name="elastic-event-delivery", daemon=True)
+            target=self._run, name="elastic-event-delivery", daemon=True
+        )
         self._worker.start()
 
     def __call__(self, event):
-        payload = json.dumps(event, allow_nan=False, ensure_ascii=False).encode("utf-8")
+        payload = json.dumps(
+            event, allow_nan=False, ensure_ascii=False
+        ).encode("utf-8")
         if len(payload) > 1024 * 1024:
             self.dropped += 1
             return

@@ -3,7 +3,6 @@ kind: ConfigMap
 metadata:
   name: elastic-dashboard-config
 data:
-  DLROVER_ELASTIC_STORAGE: mysql
   DLROVER_MYSQL_HOST: mysql.database.svc.cluster.local
   DLROVER_MYSQL_PORT: "3306"
   DLROVER_MYSQL_DATABASE: dlrover_dashboard

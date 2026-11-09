@@ -23,7 +23,7 @@ install_requires = [
 
 extra_require = {
     "dashboard": ["tornado"],
-    "elastic-dashboard": ["PyMySQL[rsa]==1.2.3"],
+    "elastic-dashboard": ["PyMySQL[rsa]==1.2.3", "SQLAlchemy>=2.0,<2.1"],
     "k8s": ["kubernetes", "tornado", "grpcio"],
     "ray": ["ray[default]", "omegaconf", "pydantic"],
     "tensorflow": ["tensorflow"],

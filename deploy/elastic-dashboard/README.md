@@ -16,6 +16,14 @@ docker push YOUR_REGISTRY/dlrover/elastic-dashboard:0.1.0
 
 ## 部署与接入
 
+启动入口直接写在 `deployment.yaml` 的 `/bin/bash -c` 多行 `command` 中：
+
+```bash
+python -m dlrover.dashboard.elastic --host 0.0.0.0 --port 8080
+```
+
+日志通过 `tee` 同时输出到容器标准输出和 `/data/logs/elastic-dashboard/elastic-dashboard.log`（容器本地文件）。命令使用 `exec` 保留 Python 退出码并直接接收 SIGTERM。
+
 以下使用已有 `dlrover` namespace：
 
 ```bash
@@ -38,6 +46,6 @@ DLROVER_ELASTIC_EVENT_URL=http://elastic-dashboard.dlrover.svc.cluster.local:808
 
 Master 先记录事件日志，再非阻塞入队；单个后台守护线程负责 HTTP，每次 I/O timeout 为 1 秒，最多尝试两次。队列最多 32 条、单条最多 1 MiB；网络失败、队列满或超限只影响 HTTP 投递，日志仍保留。即使 DNS/网络调用挂起，也不会让控制线程等待网络、无限增加线程或阻止 Master 退出。退出时不等待队列清空，缺失事件需从日志补导。
 
-Brain、Master 的启动、健康检查和扩缩容决策不依赖聚合服务就绪。聚合服务的 `/readyz` 检查 MySQL 和表，失败仅摘除聚合 Pod；`/healthz` 不依赖数据库。不要将此服务加入其他组件的启动等待或健康探针。未配置事件 URL 时不创建 HTTP 发送线程。
+Brain、Master 的启动、健康检查和扩缩容决策不依赖聚合服务就绪。MySQL 使用 SQLAlchemy 连接池（每 Pod 20 个常驻、最多 10 个溢出连接，等待上限 3 秒）。聚合服务的 `/readyz` 检查 MySQL 和表，失败仅摘除聚合 Pod；`/healthz` 不依赖数据库。不要将此服务加入其他组件的启动等待或健康探针。未配置事件 URL 时不创建 HTTP 发送线程。
 
 接口与数据缺口见 [接口文档](../../docs/design/elastic-dashboard-api-cn.md)，本地调试、补导和测试见 [开发说明](../../dlrover/dashboard/elastic/README.md)。

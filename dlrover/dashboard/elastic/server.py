@@ -1,5 +1,16 @@
 # Copyright 2026 The DLRover Authors. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Small standalone API. Put user/tenant authorization in the same-origin gateway."""
 
 import json
@@ -30,7 +41,9 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def send_json(self, status, body):
-        payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode(
+            "utf-8"
+        )
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -55,16 +68,28 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/v1/elastic/jobs":
                 return self.send_json(200, self.server.service.jobs())
             if path == "/api/v1/elastic/jct-statistics":
-                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
-                if any(key not in ("cluster", "namespace") or len(values) != 1
-                       or not values[0] or len(values[0]) > 512
-                       for key, values in query.items()):
+                query = parse_qs(
+                    urlsplit(self.path).query, keep_blank_values=True
+                )
+                if any(
+                    key not in ("cluster", "namespace")
+                    or len(values) != 1
+                    or not values[0]
+                    or len(values[0]) > 512
+                    for key, values in query.items()
+                ):
                     return self.send_json(422, {"code": "INVALID_FILTER"})
-                return self.send_json(200, self.server.service.jct_statistics(
-                    **{key: values[0] for key, values in query.items()}))
+                return self.send_json(
+                    200,
+                    self.server.service.jct_statistics(
+                        **{key: values[0] for key, values in query.items()}
+                    ),
+                )
             prefix, suffix = "/api/v1/elastic/jobs/", "/dashboard"
             if path.startswith(prefix) and path.endswith(suffix):
-                uid = unquote(path[len(prefix):-len(suffix)], errors="strict")
+                uid = unquote(
+                    path[len(prefix) : -len(suffix)], errors="strict"
+                )
                 if not uid or len(uid) > 512:
                     return self.send_json(422, {"code": "INVALID_JOB_UID"})
                 return self.send_json(200, self.server.service.dashboard(uid))
@@ -77,7 +102,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         # Internal component endpoint for Master and platform collectors.
         path = urlsplit(self.path).path
-        if path not in ("/api/v1/elastic/events", "/api/v1/elastic/job-snapshots"):
+        if path not in (
+            "/api/v1/elastic/events",
+            "/api/v1/elastic/job-snapshots",
+        ):
             return self.send_json(404, {"code": "NOT_FOUND"})
         try:
             if self.headers.get("Transfer-Encoding"):
@@ -91,7 +119,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Incomplete body")
             value = json.loads(raw)
             store = self.server.service.store
-            inserted = store.append(value) if path.endswith("/events") else store.register(value)
+            inserted = (
+                store.append(value)
+                if path.endswith("/events")
+                else store.register(value)
+            )
             self.send_json(200, {"recorded": True, "inserted": inserted})
         except (ValueError, TypeError, UnicodeError):
             self.send_json(422, {"code": "INVALID_RECORD"})

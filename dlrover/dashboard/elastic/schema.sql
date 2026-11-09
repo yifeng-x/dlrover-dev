@@ -1,4 +1,4 @@
--- MySQL 8.x / InnoDB. Run once using `python -m dlrover.dashboard.elastic init-db`.
+-- MySQL 8.x / InnoDB. Execute in the target database before deploying the API.
 -- Application queries need SELECT, INSERT, UPDATE, not DDL privileges.
 CREATE TABLE IF NOT EXISTS elastic_jobs (
     uid VARCHAR(512) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
