@@ -262,6 +262,8 @@ class VerticalExecutionMetrics:
                 terminal and state.get("windows", 0) >= 2,
                 state.get("candidate_observed_at"),
             )
+        if self.events:
+            self.events.exploration_updated(state)
 
     def request(self, action, result, reason="none", event_request_id=None,
                 trigger_source="unknown"):

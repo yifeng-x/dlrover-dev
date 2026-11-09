@@ -1,6 +1,6 @@
 # 弹性收益 React 看板接口与数据缺口
 
-本文对应 `web/elastic-dashboard`，整理于 2026-11-06。**以下 `/api/v1/elastic/*` 是本次前端实现的待对接契约，不是当前 Master 已提供的 REST API。** 本次交付为 React 页面、客户端协议校验、演示数据和本文；未实现聚合后端或新增训练采集。
+本文对应 `web/elastic-dashboard`，整理于 2026-11-06。**`/api/v1/elastic/*` 已由独立服务 `dlrover.dashboard.elastic` 实现，不是每个 Master 内嵌的 REST API。** 已实现 MySQL 事件持久化、日志导入、收益聚合和查询，以及无状态 K8s Deployment；部署及采集接入见[服务说明](../../dlrover/dashboard/elastic/README.md)。JCT 基线账本、连续趋势与真实中断采集仍待补齐。
 
 ## 1. 架构与现状
 
@@ -11,7 +11,7 @@ VerticalElasticEvent / BenefitFlow → 事件存储 ─┤
 平台作业生命周期 / 冻结基线账本 ────────┘
 ```
 
-页面默认演示模式，顶部始终显示“示例数据”；切换真实 API 后不回退到 mock。真实 API 服务尚需开发。聚合服务负责认证授权、租户隔离、数据关联、历史查询、非有限值转换；前端不直连证据服务、不暴露 HTTP token、不发起资源调整。
+页面默认演示模式，顶部始终显示“示例数据”；切换真实 API 后不回退到 mock。也可使用 `?mode=api` 直接进入真实数据模式。聚合服务提供数据关联、历史查询、非有限值转换，内部接口不使用服务令牌；用户鉴权与租户隔离由平台网关或隔离实例负责；前端不直连证据服务、不暴露 HTTP token、不发起资源调整。
 
 代码依据：
 
@@ -30,7 +30,7 @@ VerticalElasticEvent / BenefitFlow → 事件存储 ─┤
 - job UID 是 API 路由键。后端需保证 UID 在其服务范围唯一；多集群若存在 UID 冲突须扩展组合路由。不能用 SwanLab task_id 当作 job_uid。
 - HTTP 401/403：认证或权限失败；404：作业不可见或不存在；422：参数错误；503：上游不可用。建议错误体 `{ "code": "UPSTREAM_UNAVAILABLE", "message": "...", "request_id": "..." }`。当前前端显示 HTTP 状态，不将服务异常降级成示例。
 - 部分数据缺失但作业可用返回 200，相关字段 null 并填 `missing_data`。协议不合法、响应非 JSON 或返回 UID 错误时前端拒绝展示。
-- 本地 Vite `/api` 代理到 `127.0.0.1:8080`；生产需反向代理及鉴权。Cookie 采用同源凭据，后端逐作业鉴权，不信任浏览器传入的 namespace。
+- 本地 Vite `/api` 代理到 `127.0.0.1:8080`；生产需反向代理及鉴权。Cookie 采用同源凭据，生产网关须逐作业鉴权并过滤作业列表；当前聚合服务为内部接口，作业列表包含该数据库全部作业。
 
 ## 3. 作业列表
 
@@ -45,7 +45,7 @@ VerticalElasticEvent / BenefitFlow → 事件存储 ─┤
 }
 ```
 
-`status`：`running | completed | failed`；completed 只代表成功完成训练，不能把被取消、失败或 Master stopped 直接映射成 completed。当前版本一次返回当前用户可见列表，无分页。
+`status`：`running | completed | failed | unknown`；completed 只代表成功完成训练，不能把被取消、失败或 Master stopped 直接映射成 completed。缺少平台生命周期时返回 unknown，不推测运行/完成。当前服务一次返回数据库全部作业，无分页；用户可见范围由网关或实例隔离保证。
 
 ## 4. 作业看板
 
@@ -73,12 +73,15 @@ VerticalElasticEvent / BenefitFlow → 事件存储 ─┤
 | --- | --- | --- |
 | submitted_at | number / null | 平台提交时间；若采用 CR creationTimestamp 必须统一说明排队起点 |
 | completed_at | number / null | 成功完成训练的时间；运行中 null |
+| actual_seconds | number / null | 服务端计算的成功任务 JCT；失败、未完成或时间无效返回 null |
+| elapsed_seconds | number / null | 运行中为 generated_at - submitted_at；成功后固定为实际 JCT；其余 null |
+| measurement_status | completed / running / unavailable | JCT 数据可用状态，不替代 job.status |
 | baseline_seconds | number / null | 不调整的完整 JCT，正数，**不是**剩余时间 T0 |
 | baseline_frozen_at | number / null | 冻结基线的时间；没有冻结记录不展示比较收益 |
 | baseline_source | estimate / control_run / unavailable | 估算、对照任务或不可用 |
 | baseline_description | string | 原配置吞吐估算 / 同配置对照作业等来源描述 |
 
-计算规则（前端已实现）：
+计算规则（服务端统一计算，前端兼容旧接口）：
 
 ```text
 actual_jct = completed_at - submitted_at（仅 completed 作业且时间顺序合法）
@@ -88,7 +91,9 @@ jct_gain_ratio = jct_gain / baseline_seconds
 
 建议基线账本额外持久化 `baseline_id / rule_version / source_event_id / remaining_work / q0 / target_work / comparable_config_hash / control_job_uid`；这些是后端审计扩展，不属于当前页面必填字段。估算基线应按冻结时刻同口径构造：`baseline_jct = frozen_at - submitted_at + baseline_remaining_seconds`。若 T0 来自较早窗口，必须统一时间锚点，不能把时间差重复计入。多次调整选择明确、固定的任务基线，不能把每个事件的收益求和称为任务 JCT 改善。
 
-当前实现没有完整 JCT 基线账本和事后结算服务。结构化事件可能保留了预测剩余时间，但这不足以自动证明全生命周期反事实。估算改善不宣称为已验证的因果收益。
+实际 JCT 和运行中耗时已实现，单位均为秒，起点为平台提交时间，包含排队时间；运行中耗时随页面刷新更新，成功完成后不再增长。时间必须非负且不晚于 generated_at；缺失、倒置或未来时间不生成有效统计。新字段为 schema_version=1 的增量扩展，前端兼容旧响应。
+
+当前实现没有完整 JCT 基线账本和事后收益结算服务。结构化事件可能保留了预测剩余时间，但这不足以自动证明全生命周期反事实。估算改善不宣称为已验证的因果收益。
 
 ### 4.2 Evaluation
 
@@ -100,7 +105,7 @@ jct_gain_ratio = jct_gain / baseline_seconds
 | data_source | mock / http / unknown | http 不自动代表非合成数据 |
 | valid | boolean | 完整有限数值结果，不代表正收益或满足约束 |
 | observed_at | number / null | 训练窗口末端，不是 scrape 时间；原指标 0 转 null |
-| max_age_seconds | number | 有效年龄配置，不能默认填任意 UI 常数 |
+| max_age_seconds | number / null | 有效年龄配置；旧日志或 Prometheus 回退缺少配置时 null，前端显示阈值未知 |
 | time_gain_seconds | number / null | 当前任务预计节省秒数，可负 |
 | gpu_seconds_saved | number / null | 当前任务预计节省 GPU 秒，可负 |
 | gain_ratio | number / null | 比例 0.05=5%，按 objective 命名 |
@@ -137,7 +142,7 @@ jct_gain_ratio = jct_gain / baseline_seconds
 { "attempted": 2, "succeeded": 1, "failed": 1, "complete": true }
 ```
 
-前三项为非负整数或 null。attempted 是实际进入执行的计划数，排除 rejected/skipped 及仅提交未执行的请求；succeeded 表示执行完成，不暗示恢复或收益达标；进行中的计划可计入 attempted。complete 表示全生命周期记录是否完整，不能仅凭 Prometheus 抓取成功置 true。数据不够时 null，而不是用空列表推出 0。
+前三项为非负整数或 null。当前服务 complete 固定为 false，数值是已记录事件的下界，前端标注“已记录调整尝试”；没有事件记录时返回 null。attempted 是实际进入执行的计划数，排除 rejected/skipped 及仅提交未执行的请求；succeeded 表示执行完成，不暗示恢复或收益达标；进行中的计划可计入 attempted。complete 表示全生命周期记录是否完整，不能仅凭 Prometheus 抓取成功置 true。数据不够时 null，而不是用空列表推出 0。
 
 ### 4.4 Series
 
@@ -206,10 +211,10 @@ jct_gain_ratio = jct_gain / baseline_seconds
 
 | 优先级 | 页面能力 | 当前已有 | 仍缺什么 / 建议实现 |
 | --- | --- | --- | --- |
-| P0 | API 接入 | Master `/metrics`、日志、journal | 本文两个聚合查询接口、鉴权、跨源关联、错误处理 |
+| P0 | API 接入 | 两个 GET 接口、内部采集端 POST、MySQL 聚合已实现 | 生产网关用户/租户授权、部署与上游采集配置 |
 | P0 | 作业列表及提交/完成时间 | ElasticJob metadata、内嵌 commonv1.JobStatus 与 Phase | 平台生命周期同步、成功完成语义、排队起点统一及历史保留；不是现成 dashboard 字段 |
 | P0 | JCT 基线/事后收益 | 预测 `baseline_seconds` 是剩余时间；探索保存 q0/T0 | 不可变基线账本、全生命周期转换、规则版本、可比性、完成后结算 |
-| P0 | 持久化事件及准确次数 | VerticalElasticEvent 带事件 ID、计划、阶段、资源及状态 | 日志消费、去重、排序、按计划聚合、重启恢复、覆盖率及持久历史；Counter 不能替代总账 |
+| P0 | 持久化事件及准确次数 | MySQL 事务落盘、跨 Pod 写入去重、排序、计划聚合、重启保留已实现 | 可靠采集投递、覆盖率和历史分页；当前仅报告已记录下界 |
 | P0 | 实际 GPU 曲线 | 事件 resource_observation/final；计划 gpus_per_worker Gauge | 持续实际分配 GPU 总数时序，定义分配/就绪资源口径；计划 Gauge 会清理且不是实际卡数 |
 | P0 | 连续训练吞吐 | SwanLab global_step、采样时间，固定 batch 模式 train_speed；窗口日志 | 保存/查询连续历史、代次过滤、缺口标识；Master 通用 speed Gauge 目前被注释，不能假定已导出 |
 | P1 | 真正中断区间与耗时 | phase/recovery/resume Histogram 和恢复事件 | 最后有效进展、停训起点、恢复有效进展证据；resume_duration 明确不是 downtime |
@@ -235,7 +240,15 @@ dlrover_master_vertical_benefit_observed_timestamp_seconds{job_uid="...",stage="
 
 前端读取只读接口，不需要 CORS 通配或上游服务 token。日志源必须过滤凭据/路径等不应公开的信息；event/plan/request ID 保留在事件存储和 JSON 内，不增加到 Prometheus 高基数标签。
 
-## 8. 验收建议
+## 8. 当前服务补充规则
+
+- `VerticalElasticEvent` 新增 checkpoint_ready，以及 exploration_updated（观测/回传确认，不新增调整次数）。收益事件补充 max_age_seconds，探索补充 observed_at/windows/reported。
+- 持久事件评估优先，只有没有评估事件时才使用 Prometheus 回退；不将最新 Gauge 填入历史行。
+- 旧事件缺少 max_age_seconds 返回 null；schema_version 仍为 1，客户端已兼容 unknown 生命周期及 null 时效配置，旧客户端需同步升级。
+- 单作业超过 10000 条原始事件返回 503；写请求单条限制 1 MiB。
+- 写入接口、平台生命周期快照及启动命令见[服务说明](../../dlrover/dashboard/elastic/README.md)。
+
+## 9. 验收建议
 
 1. 同作业关联成功，不串 task_id；服务返回错误 UID 时前端报错。
 2. mock 标识始终可见；API 失败不出现示例值。
@@ -245,3 +258,26 @@ dlrover_master_vertical_benefit_observed_timestamp_seconds{job_uid="...",stage="
 6. rejected/skipped 不计实际调整尝试；执行完成、恢复、收益结论独立。
 7. 点击事件联动详情；筛选、关键词、时间范围组合有效；空事件及空时序有明确说明。
 8. 中断区间来自真实证据，GPU 曲线来自实际资源，不能用示例或目标值补缺。
+
+## 10. MySQL 与 Kubernetes
+
+生产后端默认 MySQL，清单见 [deploy/elastic-dashboard](../../deploy/elastic-dashboard/README.md)。提供两副本 Deployment、ClusterIP Service 和 ConfigMap；数据库表提前通过 schema.sql 创建，不部署建表 Job，不配置接口鉴权 Secret。`/healthz` 不依赖 DB；`/readyz` 检查 DB 连接及表结构。MySQL 异常统一返回 503，不泄露连接信息。Master 可使用 `DLROVER_ELASTIC_EVENT_URL` 发送现有事件；HTTP 模式优先于旧 SQLite 路径。Master 通过有界队列和后台守护线程异步发送；网络故障不阻塞弹性控制，队列满时跳过 HTTP 投递，原始日志仍保留供补导。
+
+### 任务 JCT 汇总
+
+`GET /api/v1/elastic/jct-statistics?cluster=c&namespace=ns`
+
+cluster、namespace 为可选的精确过滤条件；省略则统计库中全部已登记任务，不局限于发生过弹性事件的任务。空值、重复或未知参数返回 422。当前按全生命周期统计，不按页面事件时间窗口筛选。
+
+| 字段 | 说明 |
+| --- | --- |
+| generated_at / scope | 本次统计时间（Unix 秒）及集群、命名空间范围 |
+| total_jobs / completed_jobs / running_jobs / failed_jobs / unknown_jobs | 范围内作业数及各状态数量 |
+| measured_jobs / excluded_jobs | 成功且提交/完成时间有效的样本数；其他排除数量 |
+| mean_seconds / min_seconds / max_seconds | 有效成功任务 JCT 的均值、最小、最大值 |
+| p50_seconds / p95_seconds | nearest-rank 分位数，排序后取 ceil(N×p) 对应样本 |
+| percentile_method / time_basis | 固定 nearest_rank / submission_to_completion |
+
+没有有效样本时所有时长统计返回 null，不返回 0。失败任务不计入成功 JCT；均值不代表可比任务的因果收益。每个 job_uid 只统计一次；重放、过期生命周期快照不增加样本。统计仅依赖生命周期表，不扫描弹性事件，无需新增表或修改 MySQL schema。
+
+数据仍通过 `POST /api/v1/elastic/job-snapshots` 从平台接入：运行中需提交 submitted_at，成功后需同时提供 completed_at、status=completed 以及最新 lifecycle_observed_at。这里没有自动增加 Kubernetes watcher，也不使用 Master 启动时间或扩缩容完成时间替代平台生命周期。接口失败不得作为平台任务状态推进的前置条件，采集方需异步补报。

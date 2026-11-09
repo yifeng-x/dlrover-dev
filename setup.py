@@ -23,6 +23,7 @@ install_requires = [
 
 extra_require = {
     "dashboard": ["tornado"],
+    "elastic-dashboard": ["PyMySQL[rsa]==1.2.3"],
     "k8s": ["kubernetes", "tornado", "grpcio"],
     "ray": ["ray[default]", "omegaconf", "pydantic"],
     "tensorflow": ["tensorflow"],
@@ -54,6 +55,7 @@ setup(
             "Makefile",
             "trainer/check/*",
         ],
+        "dlrover.dashboard.elastic": ["schema.sql"],
         "dlrover.dashboard": [
             "templates/*.html",
             "static/css/*.css",

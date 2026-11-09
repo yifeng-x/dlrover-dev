@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { demoDashboard } from './demo';
-import { dashboardSchema, filteredEvents, fmt, gainValue, jctValues } from './model';
+import { dashboardSchema, filteredEvents, fmt, gainValue, jctValues, elapsedJct } from './model';
 
 describe('收益口径与空值', () => {
   it('任务级 JCT 按提交到完成计算，不能使用剩余时间收益率', () => {
@@ -32,4 +32,18 @@ describe('收益口径与空值', () => {
     expect(filteredEvents(data.events,'expand','plan-003',0).map(e=>e.id)).toEqual(['evt-003']);
     expect(filteredEvents(data.events,'all','',data.events[0].occurred_at).length).toBe(1);
   });
+});
+
+it('服务端 JCT 字段及运行耗时，失败不展示成功 JCT', () => {
+  const running = demoDashboard('demo-train-002');
+  expect(elapsedJct(running)).toBe(running.generated_at-running.jct.submitted_at!);
+  expect(jctValues(running).actual).toBeNull();
+  const done = demoDashboard('demo-train-001');
+  done.jct.actual_seconds = null;
+  expect(jctValues(done).actual).toBeNull();
+  done.jct.actual_seconds = 5760;
+  expect(jctValues(done).actual).toBe(5760);
+  done.job = {...done.job, status: 'failed'};
+  expect(jctValues(done).actual).toBeNull();
+  expect(elapsedJct(done)).toBeNull();
 });

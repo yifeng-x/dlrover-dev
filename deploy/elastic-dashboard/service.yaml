@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: elastic-dashboard
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: elastic-dashboard
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

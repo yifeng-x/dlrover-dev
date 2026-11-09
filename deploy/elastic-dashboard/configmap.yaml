@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elastic-dashboard-config
+data:
+  DLROVER_ELASTIC_STORAGE: mysql
+  DLROVER_MYSQL_HOST: mysql.database.svc.cluster.local
+  DLROVER_MYSQL_PORT: "3306"
+  DLROVER_MYSQL_DATABASE: dlrover_dashboard
+  DLROVER_MYSQL_USER: REPLACE_WITH_DATABASE_USER
+  DLROVER_MYSQL_PASSWORD: REPLACE_WITH_DATABASE_PASSWORD
+  # Optional: set Prometheus URL and configure a mounted CA for MySQL TLS.
+  # DLROVER_PROMETHEUS_URL: http://prometheus.monitoring.svc.cluster.local:9090
+  # DLROVER_MYSQL_SSL_CA: /etc/mysql-ca/ca.crt

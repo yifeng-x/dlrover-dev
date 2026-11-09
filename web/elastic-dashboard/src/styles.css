@@ -86,3 +86,5 @@ h2{font-weight:750}
 .empty-event-track strong{color:#354761}
 .empty-event-track button{font-size:12px}
 @media(min-width:951px){.trend-svg{max-height:none}}
+.empty-track-stages{display:flex;flex-wrap:wrap;gap:12px 24px;padding-left:20px;text-align:left;color:#52657e;font-size:12px}
+.empty-track-stages time{color:#1769ff}

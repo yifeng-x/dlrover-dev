@@ -4,7 +4,7 @@ import { useState } from 'react';
 export default function Trend({ data, events, selected, onSelect, from }: { data: Dashboard; events: ElasticEvent[]; selected: string; onSelect: (id: string) => void; from: number }) {
   const [hover, setHover] = useState<number | null>(null);
   const points = data.series.points.filter(p => p.at >= from).sort((a,b) => a.at-b.at);
-  if (!points.length) return <div className="empty chart-empty">暂无历史采样数据<br/><small>需要接入 GPU 数量与训练吞吐时序</small><div className="empty-event-track"><strong>事件轨迹</strong>{events.length ? events.map(e => <button key={e.id} onClick={() => onSelect(e.id)}>{clock(e.occurred_at)} · {e.type === "expand" ? "扩容" : e.type === "shrink" ? "缩容" : "调整"}</button>) : <span>暂无弹性事件</span>}</div></div>;
+  if (!points.length) return <div className="empty chart-empty">暂无历史采样数据<br/><small>需要接入 GPU 数量与训练吞吐时序</small><div className="empty-event-track"><strong>事件轨迹</strong>{events.length ? events.map(e => <button key={e.id} onClick={() => onSelect(e.id)}>{clock(e.occurred_at)} · {e.type === "expand" ? "扩容" : e.type === "shrink" ? "缩容" : "调整"}</button>) : <span>暂无弹性事件</span>}</div><ol className="empty-track-stages">{(events.find(e=>e.id===selected)??events[0])?.stages.map((s,i)=><li key={`${s.at}-${i}`}><time>{clock(s.at)}</time> {s.name}</li>)}</ol></div>;
   const start = points[0].at, end = Math.max(start + 1, points.at(-1)!.at);
   const x = (t: number) => 90 + (t - start) / (end - start) * 688;
   const maxGpu = Math.max(1, ...points.map(p => p.gpus ?? 0));

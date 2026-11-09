@@ -6,6 +6,7 @@ import copy
 import functools
 import json
 import math
+import os
 import threading
 import time
 import uuid
@@ -51,7 +52,11 @@ class VerticalElasticEvents:
         self.job = copy.deepcopy(job or {})
         self.task_id = task_id
         self.clock = clock
-        self.sink = sink or self._log
+        self._event_db = os.getenv("DLROVER_ELASTIC_EVENT_DB", "")
+        self._event_url = os.getenv("DLROVER_ELASTIC_EVENT_URL", "")
+        self._http_sink = None
+        self._store = None
+        self.sink = sink or self._default_sink
         self.observation_provider = observation_provider
         self._lock = threading.RLock()
         self.context = None
@@ -60,6 +65,21 @@ class VerticalElasticEvents:
     def _log(event):
         logger.info("VerticalElasticEvent %s", json.dumps(
             event, ensure_ascii=False, allow_nan=False, sort_keys=True))
+
+    def _default_sink(self, event):
+        # Keep the log available for replay even when the optional ledger fails.
+        self._log(event)
+        if self._event_url:
+            if self._http_sink is None:
+                from dlrover.dashboard.elastic.client import AsyncHTTPEventSink
+                self._http_sink = AsyncHTTPEventSink(self._event_url)
+            self._http_sink(event)
+            return
+        if self._event_db:
+            if self._store is None:
+                from dlrover.dashboard.elastic.store import EventStore
+                self._store = EventStore(self._event_db)
+            self._store.append(event)
 
     def _emit(self, context, event_type, **fields):
         event = {k: v for k, v in context.items() if not k.startswith("_")}
@@ -140,6 +160,7 @@ class VerticalElasticEvents:
             decision="explore" if exploring else "allow" if allowed else "reject",
             reason_code="disabled" if guard.mode == "off" else result.reason,
             min_gain_ratio=guard.min_gain,
+            max_age_seconds=guard.max_age,
             estimates={} if guard.mode == "off" else result.estimates,
             evidence=evidence, evidence_request_id=(guard.last_request or {}).get("request_id"),
             estimate_kind="prediction",
@@ -177,6 +198,7 @@ class VerticalElasticEvents:
         if self.context is not None:
             self.context.update(checkpoint_step=step, checkpoint_ref=path,
                                 target_node_ids=sorted(targets))
+            self._emit(self.context, "checkpoint_ready")
 
     def _observe(self, context):
         if self.observation_provider:
@@ -226,12 +248,31 @@ class VerticalElasticEvents:
             estimate_kind="observed_throughput_projection",
             spent_gpu_seconds=state.get("spent_gpu_seconds"),
             candidate_generation=state.get("candidate_generation"),
+            observed_at=state.get("candidate_observed_at"),
+            windows=state.get("windows"),
+            reported=state.get("reported", False),
+            objective=state.get("objective"),
         )
         if decision in ("ACCEPTED", "RETAINED", "ROLLED_BACK"):
             # This is scalar-window verification, distinct from native progress reports.
             context["recovery_status"] = "verified_by_exploration"
         self._emit(context, "exploration_decided")
         self.finish(decision.lower(), state.get("reason", decision.lower()), context)
+
+    @best_effort
+    def exploration_updated(self, state):
+        """Record evidence/report acknowledgements without changing execution state."""
+        context = self.context
+        if context is None or context.get("root_plan_id") != state.get("id"):
+            return
+        trial = dict(status=state.get("status"), objective=state.get("objective"),
+                     estimates=copy.deepcopy(state.get("result")),
+                     observed_at=state.get("candidate_observed_at"),
+                     windows=state.get("windows"), reported=state.get("reported", False))
+        if context.get("_last_trial_snapshot") == trial:
+            return
+        context["_last_trial_snapshot"] = trial
+        self._emit(context, "exploration_updated", exploration=trial)
 
     @best_effort
     def finish(self, result, reason, context=None):
