@@ -484,6 +484,20 @@ def test_http_end_to_end_internal_ingestion(store):
         with pytest.raises(HTTPError) as error:
             call("/api/v1/elastic/jct-statistics?namespace=")
         assert error.value.code == 422
+        gpu = dict(
+            event("gpu", 100),
+            event_type="gpu_sample",
+            gpu_sample=dict(
+                basis="running_worker_allocations",
+                complete=True,
+                workers=2,
+                gpus=8,
+            ),
+        )
+        with pytest.raises(HTTPError) as error:
+            call("/api/v1/elastic/events", gpu)
+        assert error.value.code == 422
+
     finally:
         server.shutdown()
         server.server_close()

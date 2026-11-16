@@ -31,6 +31,9 @@ class MasterMetricsCollector:
 
     def collect(self) -> Iterable[MetricSample]:
         labels = self._labels()
+        gpu_reporter = getattr(self._job_manager, "_gpu_reporter", None)
+        if gpu_reporter is not None:
+            yield from gpu_reporter.metrics(labels)
         vertical_metrics = getattr(self._job_manager, "vertical_metrics", None)
         if vertical_metrics is not None:
             yield from vertical_metrics.collect(labels)

@@ -132,3 +132,96 @@ class PrometheusBenefits:
             result[k] is not None for k in fields
         )
         return result
+
+    def gpu_history(self, job, start, end):
+        """Bound chart resolution while retaining freshness checks per point."""
+        import math
+
+        if start > end:
+            return []
+        labels = {k: job[k] for k in ("cluster", "namespace")}
+        labels["job_uid"] = job["uid"]
+        selector = ",".join(k + "=" + json.dumps(v) for k, v in labels.items())
+        names = (
+            "running_worker_allocated_gpus|worker_gpu_observation_valid|"
+            "worker_gpu_observed_timestamp_seconds"
+        )
+        start = int(start)
+        step = max(10, math.ceil((end - start) / 1999))
+        params = dict(
+            query='{__name__=~"dlrover_master_('
+            + names
+            + ')",'
+            + selector
+            + "}",
+            start=start,
+            end=end,
+            step=step,
+        )
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        request = Request(
+            self.url + "/api/v1/query_range?" + urlencode(params),
+            headers=headers,
+        )
+        limit = 8 * 1024 * 1024
+        with urlopen(request, timeout=self.timeout) as response:
+            body = response.read(limit + 1)
+        if len(body) > limit:
+            raise ValueError("Prometheus response too large")
+        return self.parse_gpu(json.loads(body), labels, start, end, step)
+
+    @staticmethod
+    def parse_gpu(body, expected, start, end, step):
+        data = body.get("data", {})
+        if (
+            body.get("status") != "success"
+            or data.get("resultType") != "matrix"
+        ):
+            raise ValueError("Invalid Prometheus range response")
+        groups = {}
+        for item in data.get("result", []):
+            labels = item.get("metric", {})
+            if any(labels.get(k) != v for k, v in expected.items()):
+                continue
+            target = tuple(
+                sorted((k, v) for k, v in labels.items() if k != "__name__")
+            )
+            name = labels.get("__name__", "")
+            group = groups.setdefault(target, {})
+            if name in group:
+                raise ValueError("Ambiguous Prometheus GPU series")
+            group[name] = {
+                float(t): num(float(v)) for t, v in item.get("values", [])
+            }
+        points = []
+        prefix = "dlrover_master_"
+        # query_range evaluates on this grid. Missing evaluations remain null.
+        for i in range(min(2000, int((end - start) / step) + 1)):
+            at = start + i * step
+            candidates = []
+            for group in groups.values():
+
+                def value(name):
+                    return group.get(prefix + name, {}).get(at)
+
+                observed = value("worker_gpu_observed_timestamp_seconds")
+                gpus = value("running_worker_allocated_gpus")
+                if (
+                    value("worker_gpu_observation_valid") == 1
+                    and observed is not None
+                    and 0 <= at - observed <= 30
+                    and gpus is not None
+                    and 0 <= gpus <= 2147483647
+                    and gpus == int(gpus)
+                ):
+                    candidates.append((observed, int(gpus)))
+            gpus = None
+            if candidates:
+                newest = max(t for t, _ in candidates)
+                counts = {v for t, v in candidates if t == newest}
+                if len(counts) == 1:
+                    gpus = counts.pop()
+            points.append(dict(at=at, gpus=gpus, throughput=None))
+        return points

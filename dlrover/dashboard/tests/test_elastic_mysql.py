@@ -23,7 +23,10 @@ from sqlalchemy import delete, event, text
 from sqlalchemy.exc import OperationalError, TimeoutError
 
 from dlrover.dashboard.elastic.db import Database
-from dlrover.dashboard.elastic.models import ElasticEvent, ElasticJob
+from dlrover.dashboard.elastic.models import (
+    ElasticEvent,
+    ElasticJob,
+)
 from dlrover.dashboard.elastic.mysql_store import MySQLEventStore
 from dlrover.dashboard.elastic.store import StoreUnavailable, create_store
 
@@ -235,7 +238,10 @@ def test_orm_models_compile_to_existing_mysql_schema():
     from sqlalchemy.dialects import mysql
     from sqlalchemy.schema import CreateTable
 
-    from dlrover.dashboard.elastic.models import ElasticEvent, ElasticJob
+    from dlrover.dashboard.elastic.models import (
+        ElasticEvent,
+        ElasticJob,
+    )
 
     dialect = mysql.dialect()
     job_ddl = str(CreateTable(ElasticJob.__table__).compile(dialect=dialect))
@@ -330,6 +336,9 @@ def test_orm_round_trip_updates_ordering_and_rollback(tmp_path, monkeypatch):
         assert len(store.read("job")[1]) == 2
         with store.connect() as session:
             assert session.get(ElasticJob, "job").status == "completed"
+        with pytest.raises(ValueError, match="Prometheus"):
+            store.append(dict(record(job, "gpu"), event_type="gpu_sample"))
+        assert len(store.read("job")[1]) == 2
         assert store.database.engine.pool.checkedout() == 0
     finally:
         store.close()

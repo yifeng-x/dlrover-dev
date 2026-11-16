@@ -141,6 +141,7 @@ class DistributedJobManager(JobManager):
             perf_monitor=perf_monitor,
             external_config=external_config,
         )
+        self._gpu_reporter = None
         self.vertical_metrics = VerticalExecutionMetrics()
         self.vertical_metrics.events = VerticalElasticEvents(job={
             "job_uid": job_args.job_uuid, "job_name": job_args.job_name,
@@ -320,6 +321,29 @@ class DistributedJobManager(JobManager):
         self._job_context.update_total_worker_num(worker_num)
         self._perf_monitor.set_target_worker_num(worker_num)
         self._training_node_config.set_node_num(worker_num)
+        if self._gpu_reporter is None:
+            try:
+                from dlrover.python.master.monitor.gpu_sampler import (
+                    RunningGPUReporter,
+                )
+
+                selector = (
+                    f"{ElasticJobLabel.JOB_KEY}={self._job_args.job_name}"
+                )
+                self._gpu_reporter = RunningGPUReporter(
+                    job={
+                        "job_uid": self._job_args.job_uuid,
+                        "job_name": self._job_args.job_name,
+                        "namespace": self._job_args.namespace,
+                        "cluster": self._job_args.cluster,
+                    },
+                    list_pods=lambda: self._k8s_client.list_namespaced_pod(
+                        selector
+                    ),
+                )
+                self._gpu_reporter.start()
+            except Exception:
+                logger.warning("Running Worker GPU sampler unavailable")
         threading.Thread(
             target=self._monitor_nodes, name="node_monitor", daemon=True
         ).start()
@@ -1657,6 +1681,9 @@ class DistributedJobManager(JobManager):
             logger.info("Skip an empty scaleplan")
 
     def stop(self):
+        reporter = getattr(self, "_gpu_reporter", None)
+        if reporter is not None:
+            reporter.stop()
         scaler = getattr(self, "_job_resource_scaler", None)
         if scaler is not None:
             scaler.stop()

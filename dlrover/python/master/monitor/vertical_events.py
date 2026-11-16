@@ -121,8 +121,8 @@ class VerticalElasticEvents:
             source="dlrover-master",
             job=self.job,
             swanlab_task_id=self.task_id,
-            **fields,
         )
+        event.update(fields)
         # Snapshot before dispatch: later updates never rewrite an earlier event.
         event = finite_values(copy.deepcopy(event))
         json.dumps(event, allow_nan=False)

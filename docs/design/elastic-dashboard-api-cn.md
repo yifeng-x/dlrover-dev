@@ -1,6 +1,6 @@
 # 弹性收益 React 看板接口与数据缺口
 
-本文对应 `web/elastic-dashboard`，整理于 2026-11-06。**`/api/v1/elastic/*` 已由独立服务 `dlrover.dashboard.elastic` 实现，不是每个 Master 内嵌的 REST API。** 已实现 MySQL 事件持久化、接口补录、收益聚合和查询，以及无状态 K8s Deployment；部署及采集接入见[服务说明](../../dlrover/dashboard/elastic/README.md)。JCT 基线账本、连续趋势与真实中断采集仍待补齐。
+本文对应 `web/elastic-dashboard`，整理于 2026-11-06。**`/api/v1/elastic/*` 已由独立服务 `dlrover.dashboard.elastic` 实现，不是每个 Master 内嵌的 REST API。** 已实现 MySQL 事件持久化、接口补录、收益聚合和查询，以及无状态 K8s Deployment；部署及采集接入见[服务说明](../../dlrover/dashboard/elastic/README.md)。JCT 基线账本、连续吞吐趋势与真实中断采集仍待补齐。
 
 ## 1. 架构与现状
 
@@ -261,7 +261,7 @@ dlrover_master_vertical_benefit_observed_timestamp_seconds{job_uid="...",stage="
 
 ## 10. MySQL 与 Kubernetes
 
-生产后端默认 MySQL，清单见 [deploy/elastic-dashboard](../../deploy/elastic-dashboard/README.md)。提供两副本 Deployment、ClusterIP Service 和 ConfigMap；数据库表提前通过 schema.sql 创建，不部署建表 Job，不配置接口鉴权 Secret。`/healthz` 不依赖 DB；`/readyz` 检查 DB 连接及表结构。MySQL 异常统一返回 503，不泄露连接信息。Master 可使用 `DLROVER_ELASTIC_EVENT_URL` 发送现有事件；HTTP 模式优先于旧 SQLite 路径。Master 通过有界队列和后台守护线程异步发送；网络故障不阻塞弹性控制，队列满时跳过 HTTP 投递，原始日志仍保留供补导。
+生产后端默认 MySQL，清单见 [deploy/elastic-dashboard](../../deploy/elastic-dashboard/README.md)。提供两副本 Deployment、ClusterIP Service 和 ConfigMap；数据库表提前通过 schema.sql 创建，不部署建表 Job，不配置接口鉴权 Secret。`/healthz` 不依赖 DB；`/readyz` 检查 DB 连接及三张表结构。MySQL 异常统一返回 503，不泄露连接信息。Master 可使用 `DLROVER_ELASTIC_EVENT_URL` 发送现有事件；HTTP 模式优先于旧 SQLite 路径。Master 通过有界队列和后台守护线程异步发送；网络故障不阻塞弹性控制，队列满时跳过 HTTP 投递，原始日志仍保留供补导。
 
 ### 任务 JCT 汇总
 
@@ -281,3 +281,22 @@ cluster、namespace 为可选的精确过滤条件；省略则统计库中全部
 没有有效样本时所有时长统计返回 null，不返回 0。失败任务不计入成功 JCT；均值不代表可比任务的因果收益。每个 job_uid 只统计一次；重放、过期生命周期快照不增加样本。统计仅依赖生命周期表，不扫描弹性事件，无需新增表或修改 MySQL schema。
 
 数据仍通过 `POST /api/v1/elastic/job-snapshots` 从平台接入：运行中需提交 submitted_at，成功后需同时提供 completed_at、status=completed 以及最新 lifecycle_observed_at。这里没有自动增加 Kubernetes watcher，也不使用 Master 启动时间或扩缩容完成时间替代平台生命周期。接口失败不得作为平台任务状态推进的前置条件，采集方需异步补报。
+
+### 运行 Worker 分配 GPU 数采集
+
+Master 每 10 秒只读采集运行 Worker 的 GPU 分配数，在内存中更新 Gauge，由 Prometheus 拉取；采集线程和指标抓取均不依赖聚合服务。聚合服务通过 `/api/v1/query_range` 查询历史曲线，不再周期写入 MySQL。
+
+| Prometheus 原始指标 | 含义 |
+| --- | --- |
+| `dlrover_master_running_worker_allocated_gpus` | 运行 Worker 训练容器分配的加速器数量 |
+| `dlrover_master_running_worker_count` | 运行 Worker 数 |
+| `dlrover_master_worker_gpu_observation_valid` | 采样有效为 1，否则为 0 |
+| `dlrover_master_worker_gpu_observed_timestamp_seconds` | 最近一次采集开始时间，Unix 秒 |
+
+标签沿用 `cluster`、`namespace`、`job_uid`、`strategy`。必须配置聚合服务 `DLROVER_PROMETHEUS_URL`，并让 Prometheus 抓取 Master 的 `/metrics`（端口由 Master 的 `metrics_port` 配置决定），建议抓取间隔 10 秒。部署聚合服务不会自动创建 Prometheus 抓取配置。
+
+`series.points[].gpus` 由 GPU 数、有效性及采样时间联合计算：采样失败、缺失或超过 30 秒返回 null；确认没有运行 Worker 才返回 0。多个抓取目标取最新有效观测，同一观测时间值冲突返回 null，不累加副本。查询覆盖任务提交至完成/当前时间，最多 2000 个等间距点，长任务会降低显示分辨率；缺少提交时间时使用已记录事件起点或最近一天，并在 missing_data 提示。历史覆盖范围取决于 Prometheus 保留时间，长期回溯需配置长期存储。该曲线用于展示，不作为精确计费依据。
+
+MySQL 仅保存弹性事件、事件中的资源快照和任务生命周期/JCT。GPU 周期采样仅由 Prometheus 保存；events 接口拒绝 gpu_sample 上报并返回 422。Prometheus 查询失败仅令 GPU 曲线不可用并返回缺失说明，不阻塞其他弹性组件。
+
+口径是实际运行容器的资源分配，包含空闲 GPU；MIG 按实例计数，不折算整卡。SwanLab 吞吐历史仍待接入。

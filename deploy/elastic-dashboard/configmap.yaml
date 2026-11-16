@@ -8,6 +8,6 @@ data:
   DLROVER_MYSQL_DATABASE: dlrover_dashboard
   DLROVER_MYSQL_USER: REPLACE_WITH_DATABASE_USER
   DLROVER_MYSQL_PASSWORD: REPLACE_WITH_DATABASE_PASSWORD
-  # Optional: set Prometheus URL and configure a mounted CA for MySQL TLS.
-  # DLROVER_PROMETHEUS_URL: http://prometheus.monitoring.svc.cluster.local:9090
+  # Required for GPU history; use your Prometheus service address.
+  DLROVER_PROMETHEUS_URL: http://prometheus.monitoring.svc.cluster.local:9090
   # DLROVER_MYSQL_SSL_CA: /etc/mysql-ca/ca.crt

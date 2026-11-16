@@ -348,6 +348,7 @@ class DashboardService:
         job, raw = self.store.read(uid)
         now = self.clock()
         jct = durations(job, now)
+        points = []
         plans = [
             aggregate_plan(key, records)
             for key, records in group_events(raw).items()
@@ -365,10 +366,29 @@ class DashboardService:
         )
         missing = [
             "JCT 不调整基线尚未冻结",
-            "尚未接入连续实际 GPU 与训练吞吐时序",
+            "尚未接入训练吞吐时序",
             "真实训练中断区间尚未采集",
             "事件记录为 best-effort，不能保证全生命周期完整",
         ]
+        if self.prometheus:
+            try:
+                end = positive_time(job.get("completed_at")) or now
+                start = positive_time(job.get("submitted_at"))
+                if start is None:
+                    start = min(
+                        (e["occurred_at"] for e in raw),
+                        default=end - 86400,
+                    )
+                    missing.append(
+                        "GPU 查询起点缺少提交时间，使用事件起点或最近一天"
+                    )
+                points = self.prometheus.gpu_history(job, start, min(end, now))
+            except Exception:
+                missing.append("Prometheus GPU 时序查询暂不可用")
+        else:
+            missing.append("未配置 DLROVER_PROMETHEUS_URL，GPU 时序不可用")
+        if not any(p["gpus"] is not None for p in points):
+            missing.append("暂无有效运行 Worker GPU 采样")
         if job["status"] == "unknown":
             missing.append("作业生命周期尚未接入；弹性计划完成不代表训练完成")
         if (
@@ -416,7 +436,7 @@ class DashboardService:
             summary=counts,
             series=dict(
                 work_unit=latest["work_unit"] if latest else "unknown",
-                points=[],
+                points=points,
             ),
             events=events,
             missing_data=missing,

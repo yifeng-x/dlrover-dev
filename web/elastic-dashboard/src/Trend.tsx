@@ -72,6 +72,6 @@ export default function Trend({ data, events, selected, onSelect, from }: { data
       {current && <line x1={x(current.at)} x2={x(current.at)} y1="45" y2="246" stroke="#8190aa" strokeDasharray="4 4"/>}
       {points.map((p,i) => <rect key={p.at} x={Math.max(90,x(p.at)-344/points.length)} y="45" width={688/points.length} height="200" fill="transparent" onMouseEnter={()=>setHover(i)} onMouseLeave={()=>setHover(null)}><title>{clock(p.at)} · GPU {fmt(p.gpus)} · {fmt(p.throughput,`${data.series.work_unit}/s`)}</title></rect>)}
     </svg></div>
-    <div className="chart-caption">{current ? `${clock(current.at)} · GPU ${fmt(current.gpus)} · 吞吐 ${fmt(current.throughput, `${data.series.work_unit}/s`)}` : '悬停查看采样值 · 点击事件标记查看详情 · 缺失采样保留断点'}</div>
+    <div className="chart-caption">{current ? `${clock(current.at)} · GPU ${fmt(current.gpus)} · 吞吐 ${fmt(current.throughput, `${data.series.work_unit}/s`)}` : '运行 Worker 分配 GPU 数 · 非 GPU 忙碌数量 · 缺失采样保留断点'}</div>
   </>;
 }

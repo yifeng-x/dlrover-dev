@@ -58,6 +58,8 @@ def event_values(event):
     ):
         if event.get(key) is not None:
             text(event[key], key)
+    if event["event_type"] == "gpu_sample":
+        raise ValueError("GPU samples are collected by Prometheus")
     payload = json.dumps(
         event, sort_keys=True, ensure_ascii=False, allow_nan=False
     )

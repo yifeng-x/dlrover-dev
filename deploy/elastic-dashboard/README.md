@@ -4,8 +4,8 @@
 
 ## 准备
 
-1. 在已有 MySQL 8.x 数据库执行 [schema.sql](../../dlrover/dashboard/elastic/schema.sql)。运行账号需要两张表的 SELECT、INSERT、UPDATE 权限。
-2. 在 [configmap.yaml](configmap.yaml) 填写数据库连接参数，实际密码按现有内部配置流程注入，不提交到仓库。
+1. 在已有 MySQL 8.x 数据库执行 [schema.sql](../../dlrover/dashboard/elastic/schema.sql)。运行账号需要 elastic_jobs、elastic_events 的 SELECT、INSERT、UPDATE 权限。GPU 周期采样仅由 Prometheus 保存。
+2. 在 [configmap.yaml](configmap.yaml) 填写数据库连接参数和 Prometheus 地址，实际密码按现有内部配置流程注入，不提交到仓库。
 3. 构建并推送镜像，将 [deployment.yaml](deployment.yaml) 的 `image` 改为实际地址：
 
 ```bash
@@ -39,6 +39,8 @@ Master 镜像需包含异步事件发送代码，配置：
 ```text
 DLROVER_ELASTIC_EVENT_URL=http://elastic-dashboard.dlrover.svc.cluster.local:8080/api/v1/elastic/events
 ```
+
+Master 在独立后台线程每 10 秒只读查询本任务 Worker Pod 并更新内存指标，Prometheus 拉取 `/metrics`。此流程不依赖上述事件 URL。GPU 曲线需要在 ConfigMap 设置 `DLROVER_PROMETHEUS_URL` 并配置 Prometheus 抓取 Master，建议间隔 10 秒；长期回溯需保证历史保留时间。
 
 平台向 `/api/v1/elastic/job-snapshots` 同步生命周期；前端 `/api` 同源代理到上述 Service 的 8080 端口，页面使用 `?mode=api`。更换 namespace 时同步修改 Service 地址。内部调用无需 Authorization 请求头。
 
