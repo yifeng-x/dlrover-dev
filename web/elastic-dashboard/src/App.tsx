@@ -3,6 +3,7 @@ import { Percent, Home, ClipboardList, CalendarDays, CircleX, CircleMinus, Arrow
 import { loadDashboard, loadJobs, type Mode } from './api';
 import { type Dashboard, type ElasticEvent, type Job, clock, filteredEvents, finite, fmt, gainValue, jctValues, elapsedJct, dateTime, objectiveLabel } from './model';
 import Trend from './Trend';
+import Cluster from './Cluster';
 
 const execution = { pending: '待执行', running: '执行中', completed: '执行完成', failed: '失败', skipped: '已跳过', unknown: '未知' };
 const conclusion = { accepted: '已采纳', retained: '收益不足 · 保留配置', inconclusive: '无法确定', failed: '无有效评估', rejected: '门禁拒绝', unknown: '待评估' };
@@ -15,6 +16,7 @@ function minutes(v: number | null) { return finite(v) ? v/60 : null; }
 function hours(v: number | null) { return finite(v) ? v/3600 : null; }
 
 export default function App() {
+  const [tab, setTab] = useState('cluster');
   const [mode,setMode] = useState<Mode>(() => new URLSearchParams(window.location.search).get('mode') === 'api' ? 'api' : 'demo');
   const [jobs,setJobs] = useState<Job[]>([]), [uid,setUid] = useState('');
   const [data,setData] = useState<Dashboard|null>(null), [error,setError] = useState(''), [loading,setLoading] = useState(true);
@@ -25,18 +27,20 @@ export default function App() {
     return () => controller.abort();
   },[mode,refresh]);
   useEffect(() => {
-    if(!uid || !jobs.some(j=>j.uid===uid)) return;
+    if(tab !== 'task' || !uid || !jobs.some(j=>j.uid===uid)) return;
     const controller = new AbortController(); setLoading(true); setData(null); setError('');
     loadDashboard(mode,uid,controller.signal).then(result => { if(controller.signal.aborted) return; setData(result); setSelected(result.events[0]?.id ?? ''); }).catch(e => { if(!controller.signal.aborted) setError(e instanceof Error ? e.message : '看板加载失败'); }).finally(()=>{ if(!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  },[mode,uid,jobs]);
+  },[mode,uid,jobs,tab]);
   const end = data?.jct.completed_at ?? data?.generated_at ?? 0;
   const from = range==='all' ? 0 : end-Number(range)*60;
   const events = data ? filteredEvents(data.events,filter,query,from) : [];
   const active = events.find(e => e.id===selected) ?? events[0];
   return <div className="shell">
     <aside className="sidebar"><a className="brand" href="#top">DLRover</a><nav><a href="#jct"><Home size={19}/>总览</a><a href="#top"><ClipboardList size={19}/>训练任务</a><a className="active" href="#analysis"><BarChart3 size={19}/>弹性分析</a><a href="#events"><CalendarDays size={19}/>事件记录</a></nav><div className="sidebar-footer"><span className="live-dot"/>弹性训练观测台<small>DLRover / Elastic Insights</small></div></aside>
-    <main id="top"><header><div><h1>弹性收益与事件 {data && <Badge tone={data.job.status==='completed'?'green':'blue'}>{data.job.status==='completed'?<><Check size={12}/> 已完成</>:data.job.status==='running'?'运行中':data.job.status==='failed'?'失败':'生命周期未知'}</Badge>}</h1><p>{data?.job.name ?? '选择训练作业'} <span className="muted">/ {data?.job.namespace ?? 'Elastic training observability'}</span></p></div><div className="header-right"><Badge tone={mode==='demo'?'blue':'neutral'}>{mode==='demo'?'示例数据 · 非真实采集':'API 数据'}</Badge><label className="mode-label">数据模式<select aria-label="数据模式" value={mode} onChange={e=>{setJobs([]);setUid('');setMode(e.target.value as Mode);}}><option value="demo">演示模式</option><option value="api">真实 API</option></select></label></div></header>
+    <main id="top"><header><div><h1>弹性收益与事件 {tab==='task' && data && <Badge tone={data.job.status==='completed'?'green':'blue'}>{data.job.status==='completed'?<><Check size={12}/> 已完成</>:data.job.status==='running'?'运行中':data.job.status==='failed'?'失败':'生命周期未知'}</Badge>}</h1><p>{tab==='cluster'?'集群 JCT 前后对比':data?.job.name ?? '选择训练作业'} <span className="muted">/ {data?.job.namespace ?? 'Elastic training observability'}</span></p></div><div className="header-right"><Badge tone={mode==='demo'?'blue':'neutral'}>{mode==='demo'?'示例数据 · 非真实采集':'API 数据'}</Badge><label className="mode-label">数据模式<select aria-label="数据模式" value={mode} onChange={e=>{setJobs([]);setUid('');setMode(e.target.value as Mode);}}><option value="demo">演示模式</option><option value="api">真实 API</option></select></label></div></header>
+    <div className="tabs page-tabs" role="tablist" aria-label="分析范围">{[['cluster','集群总览'],['task','任务分析']].map(([key,label])=><button role="tab" aria-selected={tab===key} className={tab===key?'selected':''} key={key} onClick={()=>setTab(key)}>{label}</button>)}</div>
+    {tab==='cluster'?<Cluster mode={mode}/>:<>
     <div className="toolbar"><label>作业<select aria-label="作业" value={uid} onChange={e=>setUid(e.target.value)} disabled={!jobs.length}>{!jobs.length && <option value="">暂无作业</option>}{jobs.map(j=><option key={j.uid} value={j.uid}>{j.name}</option>)}</select></label><label>事件与趋势范围<select value={range} onChange={e=>setRange(e.target.value)}><option value="all">全生命周期</option><option value="60">结束前 / 最近 1 小时</option><option value="10">结束前 / 最近 10 分钟</option></select></label><span className="toolbar-note">时区 Asia/Shanghai</span><button className="primary" onClick={()=>setRefresh(v=>v+1)} disabled={loading}><RefreshCw size={15} className={loading?'spin':''}/>刷新</button></div>
     {loading ? <div className="panel loading" role="status"><RefreshCw className="spin"/>正在加载作业与收益数据…</div> : error ? <div className="panel error" role="alert"><TriangleAlert/><h2>数据暂不可用</h2><p>{error.length>250?'接口数据不符合看板 schema，请检查字段类型和必填项。':error}</p><p>真实 API 模式不会回退到示例数据。请检查聚合接口及代理配置。</p><button onClick={()=>setRefresh(v=>v+1)}>重试</button></div> : !data ? <div className="panel empty">暂无可展示的作业</div> : <>
       <Jct data={data}/><Benefits data={data}/>
@@ -45,6 +49,7 @@ export default function App() {
       <div className="table-scroll"><table><thead><tr>{['时间','类型','GPU 变化（计划）','执行状态','中断耗时','预计时间收益','预计卡时收益','评估结论'].map(t=><th key={t}>{t}</th>)}</tr></thead><tbody>{events.map(e=><tr key={e.id} className={active?.id===e.id?'highlight':''}><td><button className="row-link" onClick={()=>setSelected(e.id)} aria-label={`查看事件 ${e.id}`}>{clock(e.occurred_at)}</button><small>{e.id}</small></td><td><Badge tone={e.type==='shrink'?'teal':'blue'}>{typeLabel[e.type]}</Badge></td><td>{fmt(e.before_gpus)} → {fmt(e.target_gpus)}</td><td><Badge tone={e.execution_status==='completed'?'green':e.execution_status==='failed'?'red':'neutral'}>{execution[e.execution_status]}</Badge></td><td>{fmt(e.interruption_seconds,'s')}</td><td className={gainTone(gainValue(e.evaluation,'time_gain_seconds'))}>{fmt(minutes(gainValue(e.evaluation,'time_gain_seconds')),'min',true)}</td><td className={gainTone(gainValue(e.evaluation,'gpu_seconds_saved'))}>{fmt(hours(gainValue(e.evaluation,'gpu_seconds_saved')),'GPU·h',true)}</td><td><Badge tone={e.conclusion==='accepted'?'green':'neutral'}>{conclusion[e.conclusion]}</Badge></td></tr>)}</tbody></table>{!events.length && <div className="empty">没有符合筛选条件的事件</div>}</div><div className="footnote"><Info size={14}/>执行完成不等于训练恢复或收益达标；GPU 变化为计划值，实际资源见详情。</div></section>
       {data.missing_data.length>0 && <div className="missing"><Info size={16}/><div><strong>数据完整性提示</strong><p>{data.missing_data.join(' · ')}</p></div></div>}
       <footer><span>DLRover · Elastic Insights</span><span>快照 {new Date(data.generated_at*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})} · 收益非累计总账</span></footer>
+    </>}
     </>}
     </main></div>;
 }

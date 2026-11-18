@@ -484,6 +484,13 @@ def test_http_end_to_end_internal_ingestion(store):
         with pytest.raises(HTTPError) as error:
             call("/api/v1/elastic/jct-statistics?namespace=")
         assert error.value.code == 422
+        assert call("/api/v1/elastic/jct-statistics?submitted_from=50&submitted_to=100")["mean_seconds"] == 150
+        assert call("/api/v1/elastic/jct-statistics?submitted_from=0&submitted_to=50")["measured_jobs"] == 0
+        for query in ("submitted_from=50", "submitted_from=nan&submitted_to=100",
+                      "submitted_from=100&submitted_to=50", "submitted_from=x&submitted_to=100"):
+            with pytest.raises(HTTPError) as error:
+                call("/api/v1/elastic/jct-statistics?" + query)
+            assert error.value.code == 422
         gpu = dict(
             event("gpu", 100),
             event_type="gpu_sample",

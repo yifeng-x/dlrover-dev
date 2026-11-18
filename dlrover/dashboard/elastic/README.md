@@ -82,3 +82,25 @@ Master 每 10 秒只读采集运行 Worker 的 GPU 分配数，在内存中更�
 MySQL 仅保存弹性事件、事件中的资源快照和任务生命周期/JCT。GPU 周期采样仅由 Prometheus 保存；events 接口拒绝 gpu_sample 上报并返回 422。Prometheus 查询失败仅令 GPU 曲线不可用并返回缺失说明，不阻塞其他弹性组件。
 
 口径是实际运行容器的资源分配，包含空闲 GPU；MIG 按实例计数，不折算整卡。SwanLab 吞吐历史仍待接入。
+
+## 临时 Master 生命周期上报（仅联调）
+
+测试任务的 Master 可设置：
+
+```text
+DLROVER_MASTER_LIFECYCLE_ENABLED=true
+DLROVER_MASTER_LIFECYCLE_URL=http://elastic-dashboard.dlrover.svc.cluster.local:8080/api/v1/elastic/job-snapshots
+```
+
+默认关闭，不新增表、不修改平台接口。读取已有 args.raw_job 的 ElasticJob UID 和
+creationTimestamp，UID必须匹配。缺失/非法创建时间保留null，不用Master启动时间替代。
+进入Master运行循环时上报running，每60秒补报相同快照；明确成功/失败后生成完整终态。
+每次发送最多尝试2次，保留快照时间；网络在daemon线程执行，退出最多等待2秒。
+中断或无法确定结果的退出不补造成功，需人工补录。强杀、网络故障、重启无法保证终态送达。
+终态判断由训练结果分支产生，不由通用stop()推断。已终止任务不要重新启动Master继续上报。
+
+该数据口径是CR创建至Master确认完成，缺少平台创建前等待，也不覆盖Master尚未启动的任务。
+目前接口不保存来源字段，必须在测试范围和报告明确注明来源，两阶段采用一致口径。
+同一任务禁止平台和临时Master双写：当前后端仅按快照时间新旧处理，不提供来源优先级。
+平台就绪后关闭开关，确认旧Master已经停止发送，再由平台补报完整生命周期。
+修改环境配置不会热更新已有进程；最简单是等待旧测试任务结束后切换。

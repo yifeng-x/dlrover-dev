@@ -72,19 +72,22 @@ class Handler(BaseHTTPRequestHandler):
                     urlsplit(self.path).query, keep_blank_values=True
                 )
                 if any(
-                    key not in ("cluster", "namespace")
+                    key not in ("cluster", "namespace", "submitted_from", "submitted_to")
                     or len(values) != 1
                     or not values[0]
                     or len(values[0]) > 512
                     for key, values in query.items()
                 ):
                     return self.send_json(422, {"code": "INVALID_FILTER"})
-                return self.send_json(
-                    200,
-                    self.server.service.jct_statistics(
-                        **{key: values[0] for key, values in query.items()}
-                    ),
-                )
+                try:
+                    filters = {key: values[0] for key, values in query.items()}
+                    for key in ("submitted_from", "submitted_to"):
+                        if key in filters:
+                            filters[key] = float(filters[key])
+                    result = self.server.service.jct_statistics(**filters)
+                except ValueError:
+                    return self.send_json(422, {"code": "INVALID_FILTER"})
+                return self.send_json(200, result)
             prefix, suffix = "/api/v1/elastic/jobs/", "/dashboard"
             if path.startswith(prefix) and path.endswith(suffix):
                 uid = unquote(

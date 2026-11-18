@@ -1,0 +1,13 @@
+FROM --platform=arm64 node:22-alpine AS build
+WORKDIR /app
+COPY web/elastic-dashboard/package*.json ./
+RUN npm ci
+COPY web/elastic-dashboard/index.html web/elastic-dashboard/tsconfig.json web/elastic-dashboard/vite.config.ts ./
+COPY web/elastic-dashboard/src ./src
+RUN npm run build
+
+FROM --platform=arm64 nginx:stable-alpine
+ENV DASHBOARD_BACKEND=elastic-dashboard:8080
+COPY deploy/elastic-dashboard/frontend.conf.template /etc/nginx/templates/default.conf.template
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 8080

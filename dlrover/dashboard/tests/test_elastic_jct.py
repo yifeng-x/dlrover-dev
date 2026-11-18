@@ -94,3 +94,29 @@ def test_jct_persists_completion_and_ignores_stale_snapshots(tmp_path):
         == 80
     )
     assert service.jct_statistics(namespace="other")["total_jobs"] == 0
+
+
+def test_submission_window_includes_later_completion_and_missing(tmp_path):
+    store = EventStore(tmp_path / "window.db")
+    for uid, start, status, end in [
+        ("before", 99, "completed", 150),
+        ("left", 100, "completed", 400),
+        ("running", 150, "running", None),
+        ("failed", 160, "failed", None),
+        ("right", 200, "completed", 250),
+        ("missing", None, "completed", 300),
+    ]:
+        store.register(dict(job_uid=uid, cluster="c", namespace="n",
+                            submitted_at=start, completed_at=end, status=status,
+                            lifecycle_observed_at=500))
+    service = DashboardService(store, clock=lambda: 600)
+    result = service.jct_statistics(cluster="c", submitted_from=100, submitted_to=200)
+    assert result["total_jobs"] == 3
+    assert result["measured_jobs"] == 1
+    assert result["mean_seconds"] == 300
+    assert result["running_jobs"] == result["failed_jobs"] == 1
+    assert result["unassigned_jobs"] == 1
+    for start, end in [(100, None), (200, 100), (100, 100), (-1, 100),
+                       (float("nan"), 100), (0, float("inf"))]:
+        with pytest.raises(ValueError):
+            service.jct_statistics(submitted_from=start, submitted_to=end)

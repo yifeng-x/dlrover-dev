@@ -76,6 +76,9 @@ def _create_elastic_ps_service_if_needed(params: JobArgs):
         return ElasticPsService()
     return None
 
+from dlrover.python.master.monitor.job_lifecycle import MasterLifecycle
+
+
 def _create_master_service_on_k8s(namespace, job_name, job_uuid, target_port):
     from dlrover.python.scheduler.kubernetes import (
         NODE_SERVICE_PORTS,
@@ -526,6 +529,8 @@ class DistributedJobMaster(JobMaster):
 
         self._event_reporter.report_job_start(self._job_evt, self._job_args)
 
+        lifecycle = MasterLifecycle.start_if_enabled(self._job_args)
+        lifecycle_outcome = None
         # into running loop
         try:
             while True:
@@ -544,6 +549,7 @@ class DistributedJobMaster(JobMaster):
                         exit_code = 0 if outcome else 1
                         reason = JobExitReason.SUCCEEDED if outcome else (self.exit_reason or JobExitReason.UNKNOWN_ERROR)
                         self.set_exit(exit_code, reason)
+                        lifecycle_outcome = "completed" if outcome else "failed"
                         break
                     # Keep RPCs/watchers alive until actual Pod cleanup is
                     # complete. None means running OR still draining.
@@ -553,6 +559,10 @@ class DistributedJobMaster(JobMaster):
                     logger.info(
                         f"Job is stopped: {self._job_ctx.get_job_stage()}"
                     )
+                    if self.exit_code != 0:
+                        lifecycle_outcome = "failed"
+                    elif self.exit_reason == JobExitReason.SUCCEEDED:
+                        lifecycle_outcome = "completed"
                     break
                 elif self._job_ctx.is_restarting():
                     logger.info("Trigger job restarting.")
@@ -567,6 +577,7 @@ class DistributedJobMaster(JobMaster):
                         msg=msg,
                     )
                     self.request_stop(False, reason, msg)
+                    lifecycle_outcome = "failed"
                     break
                 self.job_manager.clear_exited_nodes()
                 if self.job_manager and self.job_manager.all_workers_exited():
@@ -596,6 +607,7 @@ class DistributedJobMaster(JobMaster):
                     if self.job_manager.all_workers_failed():
                         logger.error("All workers failed")
                         self.set_exit(1, JobExitReason.UNKNOWN_ERROR)
+                        lifecycle_outcome = "failed"
                     elif (
                         self.task_manager
                         and not self.task_manager.finished()
@@ -604,6 +616,8 @@ class DistributedJobMaster(JobMaster):
                         logger.warning(
                             "All workers exited but there also are unfinished tasks",
                         )
+                    elif lifecycle is not None and self.job_manager.all_critical_node_completed():
+                        lifecycle_outcome = "completed" if self.exit_code == 0 else "failed"
                     break
                 get_suspend_manager().complete_resume()
 
@@ -623,12 +637,15 @@ class DistributedJobMaster(JobMaster):
                     )
                 ):
                     logger.info("All task completed")
+                    lifecycle_outcome = "completed" if self.exit_code == 0 else "failed"
                     break
 
                 time.sleep(30)
         except KeyboardInterrupt:
             logger.warning("Server stopping")
         finally:
+            if lifecycle is not None:
+                lifecycle.finish(lifecycle_outcome)
             if self.job_manager:
                 self.job_manager.stop()
             if self.diagnosis_manager:

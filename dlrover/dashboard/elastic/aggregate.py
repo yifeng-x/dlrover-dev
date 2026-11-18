@@ -332,15 +332,28 @@ class DashboardService:
     def jobs(self):
         return {"items": [public_job(job) for job in self.store.jobs()]}
 
-    def jct_statistics(self, cluster=None, namespace=None):
+    def jct_statistics(self, cluster=None, namespace=None, submitted_from=None, submitted_to=None):
+        if (submitted_from is None) != (submitted_to is None):
+            raise ValueError("Both submission bounds are required")
+        if submitted_from is not None and not (
+            finite(submitted_from) and finite(submitted_to)
+            and 0 <= submitted_from < submitted_to
+        ):
+            raise ValueError("Invalid submission range")
         jobs = [
             job
             for job in self.store.jobs()
             if (cluster is None or job["cluster"] == cluster)
             and (namespace is None or job["namespace"] == namespace)
         ]
+        missing = sum(not finite(job.get("submitted_at")) for job in jobs)
+        if submitted_from is not None:
+            jobs = [job for job in jobs if finite(job.get("submitted_at"))
+                    and submitted_from <= job["submitted_at"] < submitted_to]
         return dict(
             statistics(jobs, self.clock()),
+            unassigned_jobs=missing,
+            submitted_from=submitted_from, submitted_to=submitted_to,
             scope=dict(cluster=cluster, namespace=namespace),
         )
 

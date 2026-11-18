@@ -51,3 +51,49 @@ Master 先记录事件日志，再非阻塞入队；单个后台守护线程负�
 Brain、Master 的启动、健康检查和扩缩容决策不依赖聚合服务就绪。MySQL 使用 SQLAlchemy 连接池（每 Pod 20 个常驻、最多 10 个溢出连接，等待上限 3 秒）。聚合服务的 `/readyz` 检查 MySQL 和表，失败仅摘除聚合 Pod；`/healthz` 不依赖数据库。不要将此服务加入其他组件的启动等待或健康探针。未配置事件 URL 时不创建 HTTP 发送线程。
 
 接口与数据缺口见 [接口文档](../../docs/design/elastic-dashboard-api-cn.md)，本地调试、补导和测试见 [开发说明](../../dlrover/dashboard/elastic/README.md)。
+
+## 随 DLRover Helm release 安装前端
+
+先按上文创建聚合服务。在仓库根目录构建前端镜像并推送到集群可拉取的仓库：
+
+```bash
+IMAGE=YOUR_REGISTRY/dlrover/elastic-dashboard-web:0.1.0
+docker build -f deploy/elastic-dashboard/Dockerfile.frontend -t "$IMAGE" .
+docker push "$IMAGE"
+```
+
+在现有 DLRover 安装用的 values 文件中加入以下字段，并替换镜像地址：
+
+```yaml
+dashboardWeb:
+  enabled: true
+  image: YOUR_REGISTRY/dlrover/elastic-dashboard-web:0.1.0
+  backend: elastic-dashboard:8080
+```
+
+沿用原 release 名称、命名空间和 values 文件，例如：
+
+```bash
+helm upgrade --install dlrover ./helm_install -n dlrover \
+  -f helm_install/custom-values.yaml --wait
+kubectl -n dlrover port-forward svc/elastic-dashboard-web 18080:80
+```
+
+浏览器打开 `http://127.0.0.1:18080/?mode=api`。前端 Service 类型为 ClusterIP，平台网关可以将已鉴权的页面入口转发到其 80 端口。Nginx 启动时需要能够解析后端 Service；若聚合服务在另一命名空间，将 `backend` 改为 `elastic-dashboard.<后端命名空间>:8080`。
+
+## 使用已有源码卷在集群中调试前端
+
+在 [frontend.yaml](frontend.yaml) 中将 `claimName` 改为部署命名空间中已有的源码 PVC 名称。
+`subPath` 指向卷内包含前端 `package.json` 和 `package-lock.json` 的目录。默认值
+`web/elastic-dashboard` 假设卷根就是仓库根目录。如果卷根就是前端目录，删除 `subPath` 行。
+
+```bash
+kubectl -n dlrover apply -f deploy/elastic-dashboard/frontend.yaml
+kubectl -n dlrover rollout status deployment/elastic-dashboard-web-dev --timeout=300s
+kubectl -n dlrover port-forward svc/elastic-dashboard-web-dev 18080:80
+```
+
+Pod 启动后在挂载的源码目录执行 `npm ci` 并启动 Vite，依赖保存在 Pod 的临时卷中。
+Pod 需要能拉取 Node 镜像并访问项目使用的 npm registry。浏览器打开
+`http://127.0.0.1:18080/?mode=api`。直接编辑共享卷上的前端源码，Vite 会检测改动并热更新。
+更新依赖清单后，执行 `kubectl -n dlrover rollout restart deployment/elastic-dashboard-web-dev` 重新安装依赖。

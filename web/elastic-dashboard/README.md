@@ -29,3 +29,16 @@ npm run preview
 构建输出 `dist/`。接口的可执行类型校验位于 `src/model.ts`，示例数据位于 `src/demo.ts`。后续接入无需改动展示组件。后端入口为 `python -m dlrover.dashboard.elastic --host 0.0.0.0 --port 8080`。尚未自动部署、执行资源调整或实现完整 JCT 收益结算。缺少生命周期显示“未知”，不完整统计显示“已记录次数”。
 
 生产聚合服务使用 MySQL，并通过 K8s ClusterIP Service 暴露；部署方法见 [MySQL + Kubernetes](../../deploy/elastic-dashboard/README.md)。聚合服务为内部接口，无需 read/ingest token；前端通过平台同源代理访问。
+
+## 精简集群对比
+
+默认进入“集群总览”，选择集群及基线/实验的提交日期窗口，展示平均 JCT、
+P50/P95 三张卡片和对比图；“任务分析”保留原有看板。日期采用上海时区，
+结束日期不含，任务在窗口后完成仍计入。刷新重取两组统计。
+真实模式调用已有 `jct-statistics` 接口的新提交时间参数，无需数据库迁移。
+需先通过 job-snapshots 接入全部任务（包括非弹性任务）的生命周期。
+阶段标签不代表系统已核验弹性开关，前后变化也不直接代表算法收益。
+任务分析页原有时间范围仍仅作用于事件与趋势。
+
+集群与任务页的完整本地 HTTP mock 演示步骤、测试矩阵及演讲流程：
+[Showcase 测试说明](../../docs/design/elastic-dashboard-showcase-test-cn.md)。
