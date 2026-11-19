@@ -15,6 +15,7 @@
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     Double,
     ForeignKey,
@@ -37,7 +38,7 @@ def identifier():
 
 
 class ElasticJob(Base):
-    __tablename__ = "elastic_jobs"
+    __tablename__ = "jobs"
     __table_args__ = {
         "mysql_engine": "InnoDB",
         "mysql_charset": "utf8mb4",
@@ -52,6 +53,10 @@ class ElasticJob(Base):
     submitted_at = Column(Double)
     completed_at = Column(Double)
     lifecycle_observed_at = Column(Double)
+    job_type = Column(String(512))
+    platform_type = Column(String(512))
+    platform_task_id = Column(String(512))
+    elasticity_enabled = Column(Boolean)
 
     def to_dict(self):
         return {
@@ -82,7 +87,7 @@ class ElasticEvent(Base):
     event_id = Column(identifier(), nullable=False)
     job_uid = Column(
         identifier(),
-        ForeignKey("elastic_jobs.uid", name="fk_elastic_event_job"),
+        ForeignKey("jobs.uid", name="fk_elastic_event_job"),
         nullable=False,
     )
     occurred_at = Column(Double, nullable=False)

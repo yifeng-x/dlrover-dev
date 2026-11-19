@@ -509,3 +509,33 @@ def test_http_end_to_end_internal_ingestion(store):
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_manual_mock_evaluation_and_recovery_timing(store):
+    gate = benefit()
+    gate.update(evaluation_status="positive")
+    gate["evidence"]["training"].update(data_source="mock", start={"observed_at": 90})
+    for record in [
+        event("eval", 110, "evaluated", benefit=gate, trigger_source="rpc"),
+        event("ckpt", 111, phase="save_checkpoint"),
+        event("done", 215, "control_completed", recovery_status="pending",
+              execution_status="completed", resource_observation={"matches_target": True}),
+    ]:
+        store.append({**record, "action": "manual"})
+    service = DashboardService(store)
+    data = service.dashboard("uid-1")
+    item = data["events"][0]
+    assert item["trigger"] == "manual"
+    assert item["conclusion"] == "prediction_passed"
+    assert item["recovery_status"] == "resources_restored"
+    assert item["interruption_seconds"] == 104
+    assert item["interruption_basis"] == "control_estimate"
+    assert data["series"]["windows"] == [dict(
+        start=90, end=100, throughput=2, evaluated_at=110, candidate=3, source="mock",
+    )]
+    store.append(event("launch", 220, "workers_restarted"))
+    item = service.dashboard("uid-1")["events"][0]
+    assert (item["recovery_status"], item["interruption_seconds"]) == ("workers_restarted", 109)
+    store.append(event("progress", 227, "training_recovered"))
+    item = service.dashboard("uid-1")["events"][0]
+    assert (item["recovery_status"], item["interruption_seconds"]) == ("recovered", 116)

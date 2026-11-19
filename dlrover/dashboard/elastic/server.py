@@ -15,8 +15,11 @@
 
 import json
 import sqlite3
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
+
+from dlrover.python.common.log import default_logger as logger
 
 from .store import StoreUnavailable
 
@@ -41,6 +44,23 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def send_json(self, status, body):
+        elapsed_ms = (time.monotonic() - self.request_started) * 1000
+        if status >= 400:
+            logger.warning(
+                "Elastic API %s %s status=%d reason=%s elapsed_ms=%.1f",
+                self.command, self.operation, status,
+                body.get("code", body.get("status")), elapsed_ms,
+            )
+        elif "inserted" in body:
+            logger.info(
+                "Elastic API %s %s status=%d inserted=%s elapsed_ms=%.1f",
+                self.command, self.operation, status, body["inserted"], elapsed_ms,
+            )
+        elif self.operation not in ("healthz", "readyz"):
+            logger.info(
+                "Elastic API %s %s status=%d elapsed_ms=%.1f",
+                self.command, self.operation, status, elapsed_ms,
+            )
         payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode(
             "utf-8"
         )
@@ -53,10 +73,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self):
+        self.request_started = time.monotonic()
+        self.operation = "unknown"
         path = urlsplit(self.path).path
         if path == "/healthz":
+            self.operation = "healthz"
             return self.send_json(200, {"status": "alive"})
         if path == "/readyz":
+            self.operation = "readyz"
             try:
                 if self.server.draining:
                     raise StoreUnavailable("Draining")
@@ -66,13 +90,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(503, {"status": "not_ready"})
         try:
             if path == "/api/v1/elastic/jobs":
+                self.operation = "jobs"
                 return self.send_json(200, self.server.service.jobs())
             if path == "/api/v1/elastic/jct-statistics":
+                self.operation = "jct-statistics"
                 query = parse_qs(
                     urlsplit(self.path).query, keep_blank_values=True
                 )
                 if any(
-                    key not in ("cluster", "namespace", "submitted_from", "submitted_to")
+                    key not in ("cluster", "namespace", "submitted_from", "submitted_to", "elasticity_enabled")
                     or len(values) != 1
                     or not values[0]
                     or len(values[0]) > 512
@@ -90,6 +116,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, result)
             prefix, suffix = "/api/v1/elastic/jobs/", "/dashboard"
             if path.startswith(prefix) and path.endswith(suffix):
+                self.operation = "job-dashboard"
                 uid = unquote(
                     path[len(prefix) : -len(suffix)], errors="strict"
                 )
@@ -104,12 +131,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         # Internal component endpoint for Master and platform collectors.
+        self.request_started = time.monotonic()
+        self.operation = "unknown"
         path = urlsplit(self.path).path
         if path not in (
             "/api/v1/elastic/events",
             "/api/v1/elastic/job-snapshots",
         ):
             return self.send_json(404, {"code": "NOT_FOUND"})
+        self.operation = path.rsplit("/", 1)[1]
         try:
             if self.headers.get("Transfer-Encoding"):
                 return self.send_json(400, {"code": "CONTENT_LENGTH_REQUIRED"})

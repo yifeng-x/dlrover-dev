@@ -187,7 +187,7 @@ class VerticalElasticEvents:
             self.context["generation_before"] = generation or None
 
     @best_effort
-    def evaluated(self, guard, allowed, exploring):
+    def evaluated(self, guard, allowed, exploring, original_workers=()):
         if self.context is None:
             return
         result = guard.last_result
@@ -270,6 +270,15 @@ class VerticalElasticEvents:
                 for job in scheduling["other_jobs"]
                 if isinstance(job, dict)
             ]
+        # Queue estimate ends when all original training containers have started.
+        if original_workers and all(
+            worker.relaunch_count == 0 and worker.start_time is not None
+            and worker.start_time.tzinfo is not None
+            for worker in original_workers
+        ):
+            evidence["workers_started_at"] = max(
+                worker.start_time.timestamp() for worker in original_workers
+            )
         self.context["_exploring"] = exploring
         self.context["benefit"] = dict(
             mode=guard.mode,
@@ -358,6 +367,18 @@ class VerticalElasticEvents:
                 if observed.get("resources") is not None
                 else None
             )
+
+    @best_effort
+    def workers_started(self, plan_id, node_id):
+        context = self.context
+        if not context or context["plan_id"] != plan_id or context["_finished"]:
+            return
+        targets = context.get("target_node_ids") or []
+        started = context.setdefault("_started_workers", set())
+        if node_id in targets and node_id not in started:
+            started.add(node_id)
+            if started == set(targets):
+                self._emit(context, "workers_restarted")
 
     @best_effort
     def recovery_finished(self, context, result, elapsed, progress=None):

@@ -318,3 +318,42 @@ from < to；非法值返回 422。按提交时间左闭右开筛选，完成时�
 成功样本，同时展示运行中、失败、未知及完成时间无效数量。
 阶段标签由用户确认，不自动验证弹性开关；不保存实验配置，不新增数据库表。
 演示模式固定显示示例统计，不伪装为日期筛选后的真实结果。
+
+### 全量任务分类与强制删除同步
+
+升级前执行一次 `dlrover/dashboard/elastic/migrate_jobs.sql`（先备份）。
+新安装使用 schema.sql。原有未知分类不自动回填，不按名字推断弹性开关。
+快照接口新增 job_type、platform_type、platform_task_id、elasticity_enabled；
+status 支持 cancelled，取消任务不参与已完成 JCT。
+统计接口支持 elasticity_enabled=true/false，并返回参与该组的任务明细。
+
+Kubernetes 任务使用 annotation `dlrover.io/elasticity-enabled: "true"` 或
+`"false"` 明确标记实际配置（该 annotation 用于统计，不修改训练配置）。
+普通 Job 自动归为关闭弹性。使用以下命令周期同步：
+
+```sh
+python -m dlrover.dashboard.elastic.reconcile --context YOUR_CONTEXT --cluster YOUR_CLUSTER --namespace YOUR_NAMESPACE
+```
+
+使用 API 相同的 MySQL 环境变量。同步读取完整 ElasticJob / Job 列表，
+仅将该集群、命名空间及类型中已登记且仍 running、但资源已不存在的记录标为 cancelled。
+API 读取失败时不更新状态。删除仅能确认作业已不在集群，不能恢复丢失的成功终态；
+因此该记录不参与完成 JCT。已经删除且缺少类型的历史任务需按 UID 核实后通过快照接口补录取消状态。
+不要与临时 Master 生命周期上报同时作为生命周期写入方运行。
+
+### 小时级测试窗口与分类字段补齐
+
+集群对比支持 Asia/Shanghai 日期时间（精确到分钟），快捷时长 1/3/6/12 小时、
+1 天及自定义，默认等长对比。按提交时间采用左闭右开窗口；
+窗口结束后完成的任务仍使用完整 JCT。
+
+Master 生命周期快照现携带 job_type、platform_type、platform_task_id、
+elasticity_enabled。分类优先使用明确的统计 annotation；Master 的资源监控或
+手动扩缩开关为 on 时判定开启，否则读取显式 worker.autoScale 布尔值；
+未明确配置的保持未知。不要仅根据任务名字判断。
+Kubernetes 同步命令也支持从显式 worker.autoScale 读取配置。
+
+已经存在的空字段不会仅因页面刷新而自动补齐：升级上报端后接收新快照，
+或对仍存在的 CR 运行 reconcile。相同生命周期时间戳的相同快照允许补齐分类。
+已经删除的历史 CR 无法从 Kubernetes 恢复配置，需根据原始任务配置按 UID 补录快照。
+任务明细展示当前集群全部已登记任务，即使分类未知或不在窗口内，也展示排除说明。

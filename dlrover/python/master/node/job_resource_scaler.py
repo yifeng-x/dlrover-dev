@@ -703,7 +703,8 @@ class AllreduceTrainingResourceScaler(JobResourceScaler):
         self.events.evaluated(
             guard, 
             allowed, 
-            self.exploration.active
+            self.exploration.active,
+            original_workers=workers if healthy else (),
         )
         result = guard.last_result
         self.vertical_metrics.record_benefit(guard)

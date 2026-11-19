@@ -22,7 +22,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from .db import Database
 from .models import Base, ElasticEvent, ElasticJob
-from .store import StoreUnavailable, event_values, lifecycle_values, text
+from .store import StoreUnavailable, event_values, lifecycle_values, job_metadata, text
 
 
 def identity(value, name):
@@ -131,7 +131,13 @@ class MySQLEventStore:
                         old.completed_at,
                     ):
                         raise ValueError("Conflicting lifecycle snapshot")
+                    for key, value in job_metadata(job).items():
+                        setattr(old, key, value)
                     return False
+            if old.status in ("completed", "failed", "cancelled") and status == "running":
+                return False
+            for key, value in job_metadata(job).items():
+                setattr(old, key, value)
             old.status = status
             old.submitted_at = submitted
             old.completed_at = completed

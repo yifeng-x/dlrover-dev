@@ -16,7 +16,9 @@
 import time
 from collections import defaultdict
 
-from .jct import durations, statistics
+from dlrover.python.common.log import default_logger as logger
+
+from .jct import durations, estimate_baseline, statistics
 from .store import finite
 
 
@@ -38,8 +40,8 @@ def choice(value, allowed, default="unknown"):
 
 def public_job(job):
     return {
-        key: job[key]
-        for key in ("uid", "name", "cluster", "namespace", "status")
+        key: (bool(job[key]) if key == "elasticity_enabled" and job.get(key) is not None else job.get(key))
+        for key in ("uid", "name", "cluster", "namespace", "status", "job_type", "platform_type", "platform_task_id", "elasticity_enabled", "submitted_at", "completed_at")
     }
 
 
@@ -181,6 +183,7 @@ PHASES = {
 STAGES = {
     "checkpoint_ready": "checkpoint 完成",
     "control_completed": "控制执行完成",
+    "workers_restarted": "替换训练进程已启动",
     "training_recovered": "确认训练恢复",
     "exploration_decided": "探索评估完成",
 }
@@ -296,26 +299,60 @@ def aggregate_plan(key, records):
         "skipped",
     ):
         execution, conclusion = "skipped", "rejected"
+    if (not state and benefit.get("decision") == "allow"
+            and benefit.get("evaluation_status") == "positive"
+            and benefit.get("mode") != "off"):
+        conclusion = "prediction_passed"
+
+    start = next((e["occurred_at"] for e in records
+                  if e["event_type"] == "phase_changed"
+                  and e.get("phase") == "save_checkpoint"), None)
+    timestamps = {e["event_type"]: e["occurred_at"] for e in reversed(records)}
+    recovery = str(context.get("recovery_status") or "unknown")
+    end = timestamps.get("training_recovered")
+    basis = "training_progress"
+    if end is not None:
+        recovery = "recovered"
+    else:
+        end = timestamps.get("workers_restarted")
+        basis = "worker_processes"
+        if end is not None and recovery != "verified_by_exploration":
+            recovery = "workers_restarted"
+        if end is None and execution == "completed":
+            end = timestamps.get("control_completed")
+            basis = "control_estimate"
+            if recovery == "pending" and end is not None:
+                observed = obj(context.get("resource_observation"))
+                recovery = (
+                    "resources_restored" if observed.get("matches_target") is True
+                    else "awaiting_progress"
+                )
+    if start is None or end is None or end < start:
+        start = end = basis = None
+    trigger = context.get("trigger_source")
+    if trigger == "rpc" and action == "manual":
+        trigger = "manual"
     item = dict(
         id=key,
         plan_id=context.get("plan_id"),
         occurred_at=min(e["occurred_at"] for e in records),
         type=kind,
-        trigger=str(context.get("trigger_source") or "unknown"),
+        trigger=str(trigger or "unknown"),
         before_gpus=num(before.get("total_gpus")),
         target_gpus=num(target.get("total_gpus")),
         actual_gpus=num(actual.get("total_gpus")),
         execution_status=execution,
-        recovery_status=str(context.get("recovery_status") or "unknown"),
+        recovery_status=recovery,
         conclusion=conclusion,
         reason=str(
             context.get("reason_code")
             or benefit.get("reason_code")
             or "unknown"
         ),
-        interruption_seconds=None,
-        interruption_start=None,
-        interruption_end=None,
+        interruption_seconds=end - start if end is not None else None,
+        interruption_start=start,
+        interruption_end=end,
+        interruption_basis=basis,
         evaluation=latest,
         stages=stages,
         before_finish_at=None,
@@ -325,6 +362,28 @@ def aggregate_plan(key, records):
     return item, attempted, latest_at
 
 
+def throughput_windows(records, unit):
+    """Plot the measured interval and the prediction at its decision time."""
+    windows = []
+    for event in records:
+        if event["event_type"] != "evaluated":
+            continue
+        result = evaluation(event)
+        if result["work_unit"] != unit or unit == "unknown":
+            continue
+        training = obj(obj(obj(event.get("benefit")).get("evidence")).get("training"))
+        start = positive_time(obj(training.get("start")).get("observed_at"))
+        end = positive_time(obj(training.get("end")).get("observed_at"))
+        rate = result["baseline_throughput"]
+        if start is None or end is None or start >= end or rate is None or rate < 0:
+            continue
+        windows.append(dict(start=start, end=end, throughput=rate,
+                            source=result["data_source"],
+                            evaluated_at=event["occurred_at"],
+                            candidate=result["candidate_throughput"]))
+    return windows
+
+
 class DashboardService:
     def __init__(self, store, prometheus=None, clock=time.time):
         self.store, self.prometheus, self.clock = store, prometheus, clock
@@ -332,7 +391,7 @@ class DashboardService:
     def jobs(self):
         return {"items": [public_job(job) for job in self.store.jobs()]}
 
-    def jct_statistics(self, cluster=None, namespace=None, submitted_from=None, submitted_to=None):
+    def jct_statistics(self, cluster=None, namespace=None, submitted_from=None, submitted_to=None, elasticity_enabled=None):
         if (submitted_from is None) != (submitted_to is None):
             raise ValueError("Both submission bounds are required")
         if submitted_from is not None and not (
@@ -346,21 +405,35 @@ class DashboardService:
             if (cluster is None or job["cluster"] == cluster)
             and (namespace is None or job["namespace"] == namespace)
         ]
+        if elasticity_enabled not in (None, "true", "false"):
+            raise ValueError("Invalid elasticity filter")
+        if elasticity_enabled is not None:
+            enabled = elasticity_enabled == "true"
+            jobs = [j for j in jobs if j.get("elasticity_enabled") is not None
+                    and bool(j["elasticity_enabled"]) == enabled]
         missing = sum(not finite(job.get("submitted_at")) for job in jobs)
         if submitted_from is not None:
             jobs = [job for job in jobs if finite(job.get("submitted_at"))
                     and submitted_from <= job["submitted_at"] < submitted_to]
-        return dict(
+        result = dict(
             statistics(jobs, self.clock()),
             unassigned_jobs=missing,
             submitted_from=submitted_from, submitted_to=submitted_to,
             scope=dict(cluster=cluster, namespace=namespace),
+            jobs=[dict(public_job(j), **durations(j, self.clock())) for j in jobs],
         )
+
+        logger.info(
+            "JCT statistics total_jobs=%d measured_jobs=%d unassigned_jobs=%d",
+            result["total_jobs"], result["measured_jobs"], missing,
+        )
+        return result
 
     def dashboard(self, uid):
         job, raw = self.store.read(uid)
         now = self.clock()
         jct = durations(job, now)
+        baseline = estimate_baseline(job, raw)
         points = []
         plans = [
             aggregate_plan(key, records)
@@ -378,11 +451,10 @@ class DashboardService:
             else None
         )
         missing = [
-            "JCT 不调整基线尚未冻结",
-            "尚未接入训练吞吐时序",
-            "真实训练中断区间尚未采集",
             "事件记录为 best-effort，不能保证全生命周期完整",
         ]
+        if baseline["baseline_seconds"] is None:
+            missing.append("缺少排队时间" if baseline["baseline_basis"] else "JCT 不调整基线尚未冻结")
         if self.prometheus:
             try:
                 end = positive_time(job.get("completed_at")) or now
@@ -396,7 +468,8 @@ class DashboardService:
                         "GPU 查询起点缺少提交时间，使用事件起点或最近一天"
                     )
                 points = self.prometheus.gpu_history(job, start, min(end, now))
-            except Exception:
+            except Exception as exc:
+                logger.warning("Prometheus GPU history query failed (%s)", type(exc).__name__)
                 missing.append("Prometheus GPU 时序查询暂不可用")
         else:
             missing.append("未配置 DLROVER_PROMETHEUS_URL，GPU 时序不可用")
@@ -412,10 +485,15 @@ class DashboardService:
         if self.prometheus and latest is None:
             try:
                 latest = self.prometheus.latest(job)
-            except Exception:
+            except Exception as exc:
+                logger.warning("Prometheus benefit query failed (%s)", type(exc).__name__)
                 missing.append("Prometheus 收益查询暂不可用")
         if latest is None:
             missing.append("暂无收益评估")
+        unit = latest["work_unit"] if latest else "unknown"
+        windows = throughput_windows(raw, unit)
+        if not windows:
+            missing.append("暂无训练吞吐观测窗口")
         counts = dict(
             attempted=None, succeeded=None, failed=None, complete=False
         )
@@ -432,6 +510,10 @@ class DashboardService:
                     for p in plans
                 ),
             )
+        logger.info(
+            "Dashboard aggregated records=%d plans=%d gpu_points=%d",
+            len(raw), len(plans), len(points),
+        )
         return dict(
             schema_version=1,
             generated_at=now,
@@ -440,15 +522,13 @@ class DashboardService:
                 **jct,
                 submitted_at=job["submitted_at"],
                 completed_at=job["completed_at"],
-                baseline_seconds=None,
-                baseline_frozen_at=None,
-                baseline_source="unavailable",
-                baseline_description="尚未接入不可变 JCT 基线账本",
+                **baseline,
             ),
             latest_evaluation=latest,
             summary=counts,
             series=dict(
-                work_unit=latest["work_unit"] if latest else "unknown",
+                work_unit=unit,
+                windows=windows,
                 points=points,
             ),
             events=events,

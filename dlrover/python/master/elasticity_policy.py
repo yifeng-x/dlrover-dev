@@ -1,5 +1,6 @@
 """Startup elasticity selection. This module has no cluster side effects."""
 
+import re
 from decimal import Decimal, InvalidOperation
 
 from dlrover.python.common.constants import (
@@ -38,6 +39,15 @@ def policy_record(policy):
             "configmap_manual_scale_switch",
         )
     }
+
+
+def is_accelerator_count(key):
+    """Device allocations, excluding vendor memory and core quotas."""
+    return (
+        key in ("nvidia.com/gpu", "metax-tech.com/gpu", "kunlunxin.com/xpu")
+        or re.fullmatch(r"huawei\.com/Ascend[0-9]+[A-Za-z]?[0-9]*", key) is not None
+        or re.fullmatch(r"nvidia\.com/mig-\d+g\.\d+gb(?:\+me)?", key) is not None
+    )
 
 
 def is_accelerator_resource(key):

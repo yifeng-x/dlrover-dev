@@ -299,3 +299,18 @@ def test_gpu_range_request_scope_resolution_and_auth(monkeypatch):
     )
     assert len(points) <= 2000
     assert all(p["gpus"] is None for p in points)
+
+
+def test_ascend_quotas_do_not_change_device_count():
+    from dlrover.python.master.watcher.k8s_watcher import _parse_container_resource
+
+    worker = pod("one")
+    container = worker.spec.containers[0]
+    for count in (1, 2):
+        container.resources.requests = container.resources.limits = {
+            "huawei.com/Ascend910B3": str(count),
+            "huawei.com/Ascend910B3-memory": "65536",
+            "huawei.com/Ascend910B3-cores": "1",
+        }
+        assert running_gpu_sample([worker], "job")["gpus"] == count
+        assert _parse_container_resource(container).gpu_num == count

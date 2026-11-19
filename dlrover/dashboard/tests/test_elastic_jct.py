@@ -120,3 +120,32 @@ def test_submission_window_includes_later_completion_and_missing(tmp_path):
                        (float("nan"), 100), (0, float("inf"))]:
         with pytest.raises(ValueError):
             service.jct_statistics(submitted_from=start, submitted_to=end)
+
+
+def test_pre_adjustment_baseline_uses_original_steps_and_queue(tmp_path):
+    store = EventStore(tmp_path / "baseline.db")
+    job = dict(job_uid="job", submitted_at=100, status="running", lifecycle_observed_at=900)
+    store.register(job)
+    training = dict(
+        unit="steps", steady=True, comparable=True, target_work=6600, data_source="mock",
+        start=dict(generation="original", observed_at=750, work=50),
+        end=dict(generation="original", observed_at=810, work=110),
+    )
+    event = dict(schema_version=1, event_id="prediction", event_type="evaluated",
+                 job=job, occurred_at=820, benefit=dict(evidence=dict(
+                     training=training, workers_started_at=700)))
+    store.append(event)
+    store.append(dict(event, event_id="checkpoint", event_type="phase_changed",
+                      phase="save_checkpoint", occurred_at=821))
+    training["target_work"] = 20000
+    store.append(dict(event, event_id="later", occurred_at=950))
+    result = DashboardService(store, clock=lambda: 1000).dashboard("job")["jct"]
+    assert result["baseline_seconds"] == 7200
+    assert result["baseline_frozen_at"] == 820
+    assert result["baseline_basis"] == dict(total_steps=6600, average_steps_per_second=1,
+                                          queue_seconds=600, data_source="mock")
+    from dlrover.dashboard.elastic.jct import estimate_baseline
+    del event["benefit"]["evidence"]["workers_started_at"]
+    partial = estimate_baseline(job, [event])
+    assert partial["baseline_basis"]["queue_seconds"] is None
+    assert partial["baseline_seconds"] is None

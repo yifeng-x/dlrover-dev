@@ -351,6 +351,7 @@ class ElasticLaunchConfig(LaunchConfig):
         dynamic_failover_extension: extend implementation for dynamic failover.
     """
 
+    vertical_replacement_plan: str = ""
     precheck: int = 0
     network_check: bool = False
     comm_perf_test: bool = False
@@ -1365,6 +1366,15 @@ class ElasticTrainingAgent(LocalElasticAgent):
             )
 
         self._initialize_workers(self._worker_group)
+        if self._config.vertical_replacement_plan:
+            try:
+                self._client.report_node_event(
+                    NodeEventType.VERTICAL_WORKERS_STARTED,
+                    self._config.vertical_replacement_plan,
+                    event_time=int(time.time()),
+                )
+            except Exception as error:
+                logger.warning("Replacement launch report failed: %s", error)
         monitor_interval = spec.monitor_interval
         rdzv_handler = spec.rdzv_handler
 
@@ -2451,6 +2461,7 @@ def _auto_param_tuning_by_vertical_elastic(
                     config.nproc_per_node)
         return
 
+    config.vertical_replacement_plan = phase_info.plan_id
     master_client.set_param_tunning_ready(
         param_tunning_ready=True,
         plan_id=phase_info.plan_id,

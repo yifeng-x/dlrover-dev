@@ -40,6 +40,56 @@ def durations(job, now):
     )
 
 
+def estimate_baseline(job, records):
+    """Use a durable prediction window preceding the first resource change."""
+    result = dict(baseline_source="unavailable", baseline_seconds=None,
+                  baseline_frozen_at=None, baseline_basis=None,
+                  baseline_description="缺少调整前的步数与速度观测")
+    for event in records:
+        if event.get("event_type") in ("checkpoint_ready", "control_completed") or (
+            event.get("event_type") == "phase_changed"
+            and event.get("phase") in ("save_checkpoint", "replacing_workers", "resumed")
+        ):
+            break
+        if event.get("event_type") != "evaluated":
+            continue
+        benefit = event.get("benefit") or {}
+        if not isinstance(benefit, dict):
+            continue
+        evidence = benefit.get("evidence") or {}
+        training = evidence.get("training") if isinstance(evidence, dict) else None
+        if not isinstance(training, dict) or training.get("unit") != "steps":
+            continue
+        start, end = training.get("start"), training.get("end")
+        if not isinstance(start, dict) or not isinstance(end, dict):
+            continue
+        steps = training.get("target_work")
+        t0, t1 = start.get("observed_at"), end.get("observed_at")
+        w0, w1 = start.get("work"), end.get("work")
+        if not (all(finite(v) for v in (steps, t0, t1, w0, w1))
+                and steps == int(steps) and 0 <= w0 < w1 <= steps
+                and 0 < t0 < t1 <= event["occurred_at"]
+                and start.get("generation") == end.get("generation")
+                and training.get("steady") is True and training.get("comparable") is True):
+            continue
+        speed = (w1 - w0) / (t1 - t0)
+        if not finite(speed) or speed <= 0 or not finite(steps / speed):
+            continue
+        submitted, started = job.get("submitted_at"), evidence.get("workers_started_at")
+        queue = (started - submitted if finite(submitted) and finite(started)
+                 and 0 <= submitted <= started <= t0 else None)
+        result.update(
+            baseline_source="estimate", baseline_frozen_at=event["occurred_at"],
+            baseline_description="首次调整前的稳定训练窗口",
+            baseline_seconds=steps / speed + queue if queue is not None else None,
+            baseline_basis=dict(total_steps=int(steps), average_steps_per_second=speed,
+                                queue_seconds=queue, data_source=training.get("data_source")
+                                or "unknown"),
+        )
+        break
+    return result
+
+
 def statistics(jobs, now):
     values = sorted(
         value
@@ -61,6 +111,7 @@ def statistics(jobs, now):
         measured_jobs=len(values),
         excluded_jobs=len(jobs) - len(values),
         running_jobs=sum(job["status"] == "running" for job in jobs),
+        cancelled_jobs=sum(job["status"] == "cancelled" for job in jobs),
         failed_jobs=sum(job["status"] == "failed" for job in jobs),
         completed_jobs=sum(job["status"] == "completed" for job in jobs),
         unknown_jobs=sum(job["status"] == "unknown" for job in jobs),

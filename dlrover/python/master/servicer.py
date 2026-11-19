@@ -867,6 +867,11 @@ class MasterServicer(ABC):
         return True
 
     def _deal_with_reported_node_event(self, message: comm.NodeEvent):
+        if message.event_type == NodeEventType.VERTICAL_WORKERS_STARTED:
+            metrics = getattr(self._job_manager, "vertical_metrics", None)
+            if metrics and metrics.events and message.node.type == "worker":
+                metrics.events.workers_started(message.event_message, message.node.id)
+            return True
         node = Node(
             node_type=message.node.type,
             node_id=message.node.id,
@@ -1125,6 +1130,7 @@ class MasterServicer(ABC):
             f"job_uuid:{message.job_uuid},"
             f"namespace:{message.namespace}"
         )
+        source = "manual" if message.scale_action == "manual" else "rpc"
         metrics = getattr(self._job_manager, "vertical_metrics", None)
         if (
             not self._job_manager
@@ -1138,7 +1144,7 @@ class MasterServicer(ABC):
                     if message.scale_action not in VERTICAL_ACTIONS
                     else "dimension_mismatch"
                 )
-                metrics.request(message.scale_action, "rejected", reason, trigger_source="rpc")
+                metrics.request(message.scale_action, "rejected", reason, trigger_source=source)
 
             logger.warning(
                 "DIMENSION_MISMATCH: reject incompatible elastic request"
@@ -1154,14 +1160,14 @@ class MasterServicer(ABC):
             value = getattr(message, field)
             if value and value != expected:
                 if metrics is not None:
-                    metrics.request(message.scale_action, "rejected", "job_mismatch", trigger_source="rpc")
+                    metrics.request(message.scale_action, "rejected", "job_mismatch", trigger_source=source)
                 logger.warning(
                     "Reject elastic request: %s does not match job", field
                 )
                 return False
 
         return bool(
-            self._job_manager.start_resource_scaling(message.scale_action, trigger_source="rpc")
+            self._job_manager.start_resource_scaling(message.scale_action, trigger_source=source)
         )
 
 

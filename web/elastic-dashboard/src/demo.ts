@@ -9,7 +9,7 @@ export function demoDashboard(uid: string): Dashboard {
   const job = demoJobs.find(j => j.uid === uid) ?? demoJobs[0];
   const data: Dashboard = {
     schema_version: 1, generated_at: at('14:40:00'), job,
-    jct: { submitted_at: at('13:04:00'), completed_at: at('14:40:00'), baseline_seconds: 7200, baseline_frozen_at: at('14:32:00'), baseline_source: 'estimate', baseline_description: '原配置吞吐估算' },
+    jct: { submitted_at: at('13:04:00'), completed_at: at('14:40:00'), baseline_seconds: 7200, baseline_frozen_at: at('14:32:00'), baseline_source: 'estimate', baseline_description: '原配置吞吐估算', baseline_basis: {total_steps:6600, average_steps_per_second:1, queue_seconds:600, data_source:'mock'} },
     latest_evaluation: evaluation, summary: { attempted: 2, succeeded: 1, failed: 1, complete: true },
     series: { work_unit: 'steps', points: Array.from({ length: 41 }, (_, i) => ({ at: at('14:30:00') + i * 15, gpus: i < 12 ? 2 : 4, throughput: i < 8 ? 2 + Math.sin(i) * .06 : i < 14 ? 0 : 9.85 + Math.sin(i) * .1 })) },
     events: [
@@ -19,7 +19,7 @@ export function demoDashboard(uid: string): Dashboard {
     ], missing_data: [],
   };
   if (job.status === 'running') {
-    data.jct = { ...data.jct, completed_at: null, baseline_seconds: null, baseline_frozen_at: null, baseline_source: 'unavailable', baseline_description: '尚未冻结基线' };
+    data.jct = { ...data.jct, completed_at: null, baseline_seconds: null, baseline_frozen_at: null, baseline_source: 'unavailable', baseline_description: '尚未冻结基线', baseline_basis:null };
     data.latest_evaluation = { ...evaluation, valid: false, observed_at: null, time_gain_seconds: null, gpu_seconds_saved: null, gain_ratio: null, state: 'inconclusive', windows: 1, reported: false };
     data.events = []; data.series.points = []; data.summary = { attempted: null, succeeded: null, failed: null, complete: false };
     data.missing_data = ['尚无完整观测窗口', '尚无持久化事件记录', 'JCT 基线未冻结'];

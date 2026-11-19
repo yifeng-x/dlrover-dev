@@ -23,6 +23,7 @@ from dlrover.python.common.constants import (
 )
 from dlrover.python.common.log import default_logger as logger
 from dlrover.python.common.metric.prometheus import MetricSample
+from dlrover.python.master.elasticity_policy import is_accelerator_count
 from dlrover.python.scheduler.kubernetes import get_main_container
 
 
@@ -71,26 +72,13 @@ def running_gpu_sample(pods, job_uid):
         limits = container.resources.limits if container.resources else {}
         requests = container.resources.requests if container.resources else {}
         values = {**(limits or {}), **(requests or {})}
-        for key, value in values.items():
-            if not key.startswith(
-                (
-                    "nvidia.com/",
-                    "huawei.com/",
-                    "metax-tech.com/",
-                    "kunlunxin.com/",
-                )
-            ):
-                continue
-            if not (
-                key
-                in (
-                    "nvidia.com/gpu",
-                    "metax-tech.com/gpu",
-                    "kunlunxin.com/xpu",
-                )
-                or key.startswith(("nvidia.com/mig-", "huawei.com/Ascend"))
-            ):
-                raise ValueError("Unsupported accelerator resource")
+        device_counts = {k: v for k, v in values.items() if is_accelerator_count(k)}
+        if not device_counts and any(
+            k.startswith(("nvidia.com/", "huawei.com/", "metax-tech.com/", "kunlunxin.com/"))
+            for k in values
+        ):
+            raise ValueError("Unsupported accelerator resource")
+        for key, value in device_counts.items():
             count = int(value)
             if count < 0 or str(count) != str(value):
                 raise ValueError("Invalid accelerator allocation")

@@ -3,7 +3,7 @@ import { z } from 'zod';
 const number = z.number().finite();
 const nullable = number.nullable();
 const timestamp = number.nonnegative();
-export const jobSchema = z.object({ uid: z.string(), name: z.string(), cluster: z.string(), namespace: z.string(), status: z.enum(['running', 'completed', 'failed', 'unknown']) });
+export const jobSchema = z.object({ uid: z.string(), name: z.string(), cluster: z.string(), namespace: z.string(), status: z.enum(['running', 'completed', 'failed', 'cancelled', 'unknown']), job_type: z.string().nullable().optional(), platform_type: z.string().nullable().optional(), platform_task_id: z.string().nullable().optional(), elasticity_enabled: z.boolean().nullable().optional(), submitted_at: z.number().nullable().optional(), completed_at: z.number().nullable().optional() });
 export const evaluationSchema = z.object({
   stage: z.enum(['prediction', 'exploration']), objective: z.enum(['time', 'gpu_hours', 'cluster_jct', 'unknown']),
   work_unit: z.enum(['steps', 'samples', 'tokens', 'unknown']), data_source: z.enum(['mock', 'http', 'unknown']),
@@ -17,7 +17,8 @@ export const eventSchema = z.object({
   type: z.enum(['expand', 'shrink', 'other']), trigger: z.string(),
   before_gpus: nullable, target_gpus: nullable, actual_gpus: nullable,
   execution_status: z.enum(['pending', 'running', 'completed', 'failed', 'skipped', 'unknown']),
-  recovery_status: z.string(), conclusion: z.enum(['accepted', 'retained', 'inconclusive', 'failed', 'rejected', 'unknown']),
+  recovery_status: z.string(), conclusion: z.enum(['prediction_passed', 'accepted', 'retained', 'inconclusive', 'failed', 'rejected', 'unknown']),
+  interruption_basis: z.enum(["control_estimate", "worker_processes", "training_progress"]).nullable().optional(),
   reason: z.string(), interruption_seconds: nullable, interruption_start: timestamp.nullable(), interruption_end: timestamp.nullable(),
   evaluation: evaluationSchema.nullable(),
   stages: z.array(z.object({ name: z.string(), at: timestamp })),
@@ -25,10 +26,16 @@ export const eventSchema = z.object({
 });
 export const dashboardSchema = z.object({
   schema_version: z.literal(1), generated_at: timestamp, job: jobSchema,
-  jct: z.object({ actual_seconds: number.nonnegative().nullable().optional(), elapsed_seconds: number.nonnegative().nullable().optional(), measurement_status: z.enum(['completed', 'running', 'unavailable']).optional(), submitted_at: timestamp.nullable(), completed_at: timestamp.nullable(), baseline_seconds: number.positive().nullable(), baseline_frozen_at: timestamp.nullable(), baseline_source: z.enum(['estimate', 'control_run', 'unavailable']), baseline_description: z.string() }),
+  jct: z.object({ actual_seconds: number.nonnegative().nullable().optional(), elapsed_seconds: number.nonnegative().nullable().optional(), measurement_status: z.enum(['completed', 'running', 'unavailable']).optional(), submitted_at: timestamp.nullable(), completed_at: timestamp.nullable(), baseline_seconds: number.positive().nullable(), baseline_frozen_at: timestamp.nullable(), baseline_source: z.enum(['estimate', 'control_run', 'unavailable']), baseline_description: z.string(), baseline_basis: z.object({
+    total_steps: number.int().positive(), average_steps_per_second: number.positive(),
+    queue_seconds: number.nonnegative().nullable(), data_source: z.string(),
+  }).nullish() }),
   latest_evaluation: evaluationSchema.nullable(),
   summary: z.object({ attempted: number.int().nonnegative().nullable(), succeeded: number.int().nonnegative().nullable(), failed: number.int().nonnegative().nullable(), complete: z.boolean() }),
-  series: z.object({ work_unit: z.enum(['steps', 'samples', 'tokens', 'unknown']), points: z.array(z.object({ at: timestamp, gpus: number.nonnegative().nullable(), throughput: number.nonnegative().nullable() })) }),
+  series: z.object({ windows: z.array(z.object({
+    start: timestamp, end: timestamp, throughput: number.nonnegative(),
+    source: z.string(), evaluated_at: timestamp, candidate: nullable,
+  })).optional(), work_unit: z.enum(['steps', 'samples', 'tokens', 'unknown']), points: z.array(z.object({ at: timestamp, gpus: number.nonnegative().nullable(), throughput: number.nonnegative().nullable() })) }),
   events: z.array(eventSchema), missing_data: z.array(z.string()),
 });
 export type Dashboard = z.infer<typeof dashboardSchema>;

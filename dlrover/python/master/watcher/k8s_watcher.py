@@ -39,6 +39,7 @@ from dlrover.python.common.node import (
     NodeGroupResource,
     NodeResource,
 )
+from dlrover.python.master.elasticity_policy import is_accelerator_count
 from dlrover.python.master.node.job_context import JobContext, get_job_context
 from dlrover.python.master.elastic_training.suspend_manager import (
     get_suspend_manager,
@@ -279,7 +280,7 @@ def _parse_container_resource(container):
     memory = convert_memory_to_mb(requests.get("memory", "0Mi"))
     gpu_type, gpu_num = None, 0
     for key, value in requests.items():
-        if key.startswith(("nvidia.com/", "huawei.com/")):
+        if is_accelerator_count(key):
             gpu_type, gpu_num = key, int(value)
     return NodeResource(cpu, memory, gpu_type, gpu_num)
 

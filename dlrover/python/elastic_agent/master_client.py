@@ -297,6 +297,8 @@ class MasterClient(Singleton, ABC):
             ),
         )
 
+        if event_type == NodeEventType.VERTICAL_WORKERS_STARTED:
+            return self._report_once(message, timeout=2)
         if node_rank != -1:
             message.node.rank = node_rank
 

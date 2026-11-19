@@ -72,7 +72,7 @@ def lifecycle_values(job):
     if not isinstance(job, dict):
         raise ValueError("Invalid job")
     status = job.get("status", "unknown")
-    if status not in ("running", "completed", "failed", "unknown"):
+    if status not in ("running", "completed", "failed", "cancelled", "unknown"):
         raise ValueError("Invalid lifecycle status")
     submitted, completed, observed = (
         job.get(k)
@@ -89,7 +89,21 @@ def lifecycle_values(job):
         and completed < submitted
     ):
         raise ValueError("Invalid completed lifecycle")
+    job_metadata(job)
     return status, submitted, completed, observed
+
+
+def job_metadata(job):
+    result = {}
+    for key in ("job_type", "platform_type", "platform_task_id"):
+        if key in job:
+            result[key] = text(job[key], key) if job[key] is not None else None
+    if "elasticity_enabled" in job:
+        value = job["elasticity_enabled"]
+        if value is not None and not isinstance(value, bool):
+            raise ValueError("elasticity_enabled must be boolean or null")
+        result["elasticity_enabled"] = value
+    return result
 
 
 class EventStore:
@@ -114,6 +128,12 @@ class EventStore:
                 CREATE INDEX IF NOT EXISTS event_job_time
                     ON events(job_uid, occurred_at, seq);
             """)
+
+            columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+            for key in ("job_type", "platform_type", "platform_task_id", "elasticity_enabled"):
+                if key not in columns:
+                    db.execute(f"ALTER TABLE jobs ADD COLUMN {key} " +
+                               ("INTEGER" if key == "elasticity_enabled" else "TEXT"))
 
     @contextmanager
     def connect(self):
@@ -181,7 +201,13 @@ class EventStore:
                         old["completed_at"],
                     ):
                         raise ValueError("Conflicting lifecycle snapshot")
+                    for key, value in job_metadata(job).items():
+                        db.execute(f"UPDATE jobs SET {key}=? WHERE uid=?", (value, uid))
                     return False
+            for key, value in job_metadata(job).items():
+                db.execute(f"UPDATE jobs SET {key}=? WHERE uid=?", (value, uid))
+            if old["status"] in ("completed", "failed", "cancelled") and status == "running":
+                return False
             db.execute(
                 "UPDATE jobs SET status=?,submitted_at=?,completed_at=?,"
                 "lifecycle_observed_at=? WHERE uid=?",

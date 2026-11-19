@@ -328,3 +328,14 @@ def test_scaler_negative_observation_keeps_candidate_and_reports_result(trial):
     assert finished[0]["resources"]["final"]["total_gpus"] == 8
     assert finished[0]["exploration"]["evaluation_status"] == "negative"
     assert finished[0]["recovery_status"] == "verified_by_exploration"
+
+
+def test_launch_reports_require_all_replacement_workers_and_matching_plan():
+    events, messages = recorder()
+    events.checkpoint(12, "ckpt", {7, 8})
+    for plan, node in [("old", 8), ("p", 2), ("p", 7), ("p", 7)]:
+        events.workers_started(plan, node)
+    assert messages[-1]["event_type"] == "checkpoint_ready"
+    events.workers_started("p", 8)
+    events.workers_started("p", 8)
+    assert sum(e["event_type"] == "workers_restarted" for e in messages) == 1
