@@ -3,7 +3,7 @@ import { z } from 'zod';
 const number = z.number().finite();
 const nullable = number.nullable();
 const timestamp = number.nonnegative();
-export const jobSchema = z.object({ uid: z.string(), name: z.string(), cluster: z.string(), namespace: z.string(), status: z.enum(['running', 'completed', 'failed', 'cancelled', 'unknown']), job_type: z.string().nullable().optional(), platform_type: z.string().nullable().optional(), platform_task_id: z.string().nullable().optional(), elasticity_enabled: z.boolean().nullable().optional(), submitted_at: z.number().nullable().optional(), completed_at: z.number().nullable().optional() });
+export const jobSchema = z.object({ actual_seconds: z.number().finite().nonnegative().nullable().optional(), uid: z.string(), name: z.string(), cluster: z.string(), namespace: z.string(), status: z.enum(['running', 'completed', 'failed', 'cancelled', 'unknown']), job_type: z.string().nullable().optional(), platform_type: z.string().nullable().optional(), platform_task_id: z.string().nullable().optional(), elasticity_enabled: z.boolean().nullable().optional(), submitted_at: z.number().nullable().optional(), completed_at: z.number().nullable().optional() });
 export const evaluationSchema = z.object({
   stage: z.enum(['prediction', 'exploration']), objective: z.enum(['time', 'gpu_hours', 'cluster_jct', 'unknown']),
   work_unit: z.enum(['steps', 'samples', 'tokens', 'unknown']), data_source: z.enum(['mock', 'http', 'unknown']),

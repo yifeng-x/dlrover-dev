@@ -18,7 +18,7 @@ function hours(v: number | null) { return finite(v) ? v/3600 : null; }
 
 export default function App() {
   const [tab, setTab] = useState('cluster');
-  const [mode,setMode] = useState<Mode>(() => new URLSearchParams(window.location.search).get('mode') === 'api' ? 'api' : 'demo');
+  const [mode,setMode] = useState<Mode>(() => new URLSearchParams(window.location.search).get('mode') === 'demo' ? 'demo' : 'api');
   const [jobs,setJobs] = useState<Job[]>([]), [uid,setUid] = useState('');
   const [data,setData] = useState<Dashboard|null>(null), [error,setError] = useState(''), [loading,setLoading] = useState(true);
   const [refresh,setRefresh] = useState(0), [selected,setSelected] = useState(''), [filter,setFilter] = useState('all'), [query,setQuery] = useState(''), [range,setRange] = useState('all');

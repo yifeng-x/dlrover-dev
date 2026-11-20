@@ -6,8 +6,49 @@ import { loadJobs, type Mode } from './api';
 
 const count = z.number().int().nonnegative();
 const duration = z.number().finite().nonnegative().nullable();
-const schema = z.object({ jobs: z.array(jobSchema.extend({ actual_seconds: duration })).optional(), cancelled_jobs: count.optional(), generated_at: z.number(), total_jobs: count, measured_jobs: count, running_jobs: count, failed_jobs: count, unknown_jobs: count, completed_jobs: count, unassigned_jobs: count, mean_seconds: duration, p50_seconds: duration, p95_seconds: duration });
+const schema = z.object({ jobs: z.array(jobSchema.extend({ actual_seconds: duration })), cancelled_jobs: count.optional(), generated_at: z.number(), total_jobs: count, measured_jobs: count, running_jobs: count, failed_jobs: count, unknown_jobs: count, completed_jobs: count, unassigned_jobs: count, mean_seconds: duration, p50_seconds: duration, p95_seconds: duration });
 type Stats = z.infer<typeof schema>;
+const groups = ['关闭弹性', '开启弹性'];
+const reasons = {running:'运行中', failed:'失败', cancelled:'已取消', completed:'完成时间无效', unknown:'状态未知'};
+type Reason = keyof typeof reasons;
+type Selection = { group: number; reason: Reason };
+
+function excludedCounts(stats: Stats): Record<Reason, number> {
+  return {running: stats.running_jobs, failed: stats.failed_jobs, cancelled: stats.cancelled_jobs ?? 0,
+    completed: stats.completed_jobs - stats.measured_jobs, unknown: stats.unknown_jobs};
+}
+
+function SampleCoverage({data, days, demo, detailsOpen, onToggle, onSelect}: {
+  data: [Stats, Stats]; days: string[]; demo: boolean; detailsOpen: boolean; onToggle: ()=>void; onSelect: (filter: Selection | null)=>void;
+}) {
+  const [expanded, setExpanded] = useState<number | null>(null);
+  const pending = data.flatMap((s,i)=>s.running_jobs ? [`${groups[i]}组有 ${s.running_jobs} 个任务运行中`] : []);
+  const missing = data.reduce((n,s)=>n+s.unassigned_jobs,0);
+  const provisional = pending.length > 0 || missing > 0 || data.some((s,i)=>
+    !s.measured_jobs || s.unknown_jobs || s.completed_jobs>s.measured_jobs || timestamp(days[i*2+1])>s.generated_at);
+  return <section className="panel sample-coverage">
+    <div className="section-heading"><h2>有效完成样本</h2>{demo && <small>示例数据</small>}</div>
+    <p className="muted">覆盖率 = 有效完成任务数 / 该组时段内提交任务数</p>
+    <div className="sample-scroll"><table><thead><tr><th>对比组</th><th>有效完成 / 提交</th><th>样本覆盖率</th><th>未纳入</th></tr></thead>
+    <tbody>{data.map((stats,i)=>{
+      const percent = stats.total_jobs ? stats.measured_jobs / stats.total_jobs * 100 : null;
+      const excluded = stats.total_jobs - stats.measured_jobs;
+      return <tr key={groups[i]} className={i?'sample-on':'sample-off'}>
+        <th><i/>{groups[i]}<small>{days[i*2].replace('T',' ')} 至 {days[i*2+1].replace('T',' ')}</small></th>
+        <td><strong>{stats.measured_jobs} / {stats.total_jobs}</strong></td>
+        <td><div className="sample-meter"><span><b style={{width:`${percent??0}%`}}/></span>{percent===null?'—':percent.toLocaleString('zh-CN',{maximumFractionDigits:1})+'%'}</div></td>
+        <td><button disabled={!excluded} aria-expanded={expanded===i} aria-label={groups[i]+'未纳入 '+excluded+' 个，查看原因'} onClick={()=>setExpanded(expanded===i?null:i)}>{excluded} 个 {excluded>0 && (expanded===i?'▴':'▾')}</button></td>
+      </tr>;
+    })}</tbody></table></div>
+    {provisional && <p className="sample-notice">{pending.length?pending.join('，')+'。':''}当前 JCT 为暂定结果。</p>}
+    {missing>0 && <p>另有 {missing} 个任务缺少提交时间，无法分配到对比时段。</p>}
+    {expanded!==null && <div className="sample-reasons"><b>{groups[expanded]} · 未纳入原因</b>
+      <div>{Object.entries(excludedCounts(data[expanded])).map(([key,n])=>
+        <button key={key} disabled={!n || !data[expanded].jobs} onClick={()=>onSelect({group:expanded,reason:key as Reason})}>{reasons[key as Reason]} {n}</button>)}</div>
+    </div>}
+    <button className="sample-details-link" aria-expanded={detailsOpen} aria-controls="cluster-job-details" onClick={onToggle}>{detailsOpen ? '收起任务明细 ▴' : '查看任务明细 ▾'}</button>
+  </section>;
+}
 const metrics = [['mean_seconds', '平均 JCT'], ['p50_seconds', 'JCT P50'], ['p95_seconds', 'JCT P95']] as const;
 export function change(before: number | null, after: number | null) {
   return before !== null && before > 0 && after !== null ? (after - before) / before * 100 : null;
@@ -25,13 +66,37 @@ export function adjustRange(values: string[], index: number, value: string, equa
   return next;
 }
 async function load(mode: Mode, cluster: string, from: number, to: number, experiment: boolean, signal: AbortSignal): Promise<Stats> {
-  if (mode === 'demo') return { generated_at: Date.now()/1000, total_jobs: 100, measured_jobs: experiment?72:80, running_jobs: experiment?23:15, failed_jobs: 5, unknown_jobs: 0, completed_jobs: experiment?72:80, unassigned_jobs: 0, mean_seconds: experiment?4800:6000, p50_seconds: experiment?4080:5100, p95_seconds: experiment?11700:10800 };
+  if (mode === 'demo') {
+    const measured = experiment ? 12 : 18;
+    const running = experiment ? 6 : 1;
+    const seconds = experiment ? 4800 : 6000;
+    const jobs = Array.from({length:20}, (_,i)=>{
+      const status: Job['status'] = i<measured ? 'completed' : i<measured+running ? 'running' : i===measured+running ? 'failed' : 'cancelled';
+      const submitted = from + i;
+      const uid = `demo-${experiment?'on':'off'}-${i+1}`;
+      return {uid, name:uid, namespace:'demo', cluster, job_type:'ElasticJob', platform_type:'kubernetes',
+        elasticity_enabled:experiment, status, submitted_at:submitted, completed_at:status==='completed'?submitted+seconds:null,
+        actual_seconds:status==='completed'?seconds:null};
+    });
+    return {jobs, generated_at:Date.now()/1000, total_jobs:jobs.length, measured_jobs:measured,
+      running_jobs:running, failed_jobs:1, cancelled_jobs:experiment?1:0, unknown_jobs:0, completed_jobs:measured,
+      unassigned_jobs:0, mean_seconds:seconds, p50_seconds:seconds, p95_seconds:seconds};
+  }
   const query = new URLSearchParams({ cluster, submitted_from: String(from), submitted_to: String(to), elasticity_enabled: String(experiment) });
   const response = await fetch(`/api/v1/elastic/jct-statistics?${query}`, { signal, credentials: 'same-origin' });
   if (!response.ok) throw new Error(`统计接口请求失败（${response.status}）`);
   return schema.parse(await response.json());
 }
 export default function Cluster({ mode }: { mode: Mode }) {
+  const [selection, setSelection] = useState<Selection | null>(null);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  useEffect(()=>{
+    if (detailsOpen) document.getElementById('cluster-job-details')?.scrollIntoView({block:'start'});
+  }, [detailsOpen, selection]);
+  function showDetails(filter: Selection | null) {
+    setSelection(filter);
+    setDetailsOpen(true);
+  }
   const [clusters, setClusters] = useState<string[]>([]), [cluster, setCluster] = useState('');
   const [allJobs, setAllJobs] = useState<Job[]>([]);
   const [equal, setEqual] = useState(true);
@@ -43,7 +108,7 @@ export default function Cluster({ mode }: { mode: Mode }) {
     return ()=>controller.abort();
   }, [mode,refresh]);
   useEffect(() => {
-    const controller = new AbortController(); setData(null); setError(''); setLoading(false);
+    const controller = new AbortController(); setData(null); setDetailsOpen(false); setSelection(null); setError(''); setLoading(false);
     if (!cluster) return;
     const [a,b,c,d] = days.map(timestamp);
     if (![a,b,c,d].every(Number.isFinite) || a<0 || !(a<b && b<=c && c<d)) { setError('请选择有效日期：基线开始 < 基线结束 ≤ 实验开始 < 实验结束。'); return; }
@@ -77,12 +142,15 @@ export default function Cluster({ mode }: { mode: Mode }) {
         <li><span className="baseline-bar" aria-hidden="true"/>关闭弹性</li>
         <li><span className="experiment-bar" aria-hidden="true"/>开启弹性</li>
       </ul></div><div className="cluster-chart" role="img" aria-label="平均 JCT、P50、P95前后对比，柱高使用相同尺度，单位分钟">{metrics.map(([key,label])=><div className="cluster-group" key={key}><div className="cluster-bars">{data.map((s,i)=><div key={i} className="cluster-bar-column"><span>{format(s[key])}</span><div className={i?'experiment-bar':'baseline-bar'} style={{height:s[key]===null?0:`${s[key]!/maximum*180}px`}}/></div>)}</div><b>{label}</b></div>)}</div><p className="muted">单位：分钟 · 无数据以 — 展示</p></section>
-      <section className="panel"><b>有效完成样本：基线 {data[0].measured_jobs}/{data[0].total_jobs} · 实验 {data[1].measured_jobs}/{data[1].total_jobs}</b><p>{data.map((s,i)=>`${i?'实验':'基线'}：运行中 ${s.running_jobs}，失败 ${s.failed_jobs}，已取消 ${s.cancelled_jobs??0}，未知 ${s.unknown_jobs}，完成时间无效 ${s.completed_jobs-s.measured_jobs}`).join('；')}</p><p className="amber">{data.some(s=>s.measured_jobs===0 || s.unassigned_jobs>0 || s.running_jobs>0 || s.unknown_jobs>0 || s.completed_jobs>s.measured_jobs)||timestamp(days[3])>Math.min(...data.map(s=>s.generated_at))?'结果暂定：窗口未结束、样本不足或仍有未完成/无效记录。':'已完成样本对比。'} 前后变化不直接代表算法收益。</p>{data[0].unassigned_jobs>0&&<p>当前集群有 {data[0].unassigned_jobs} 个任务缺少提交时间，无法归组。</p>}<small>按提交时间归组 · Asia/Shanghai · JCT 包含排队 · 按任务弹性配置过滤，未知配置不计入两组 · {mode==='demo'?'示例数值固定，仅演示布局':`统计截止 ${new Date(Math.min(...data.map(s=>s.generated_at))*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}`}</small></section>
-      <section className="panel"><h2>任务明细</h2><p className="muted">展示当前集群全部已登记任务；窗口外、配置未知及未完成任务不纳入本次 JCT。时间均为 Asia/Shanghai。</p><div style={{overflowX:'auto'}}><table><thead><tr>{['任务','任务类型','平台','弹性配置','状态','实际 JCT','统计说明'].map(v=><th key={v}>{v}</th>)}</tr></thead><tbody>{allJobs.filter(j=>j.cluster===cluster).map(j=>{
+      <SampleCoverage data={data} days={days} demo={mode==='demo'} detailsOpen={detailsOpen} onToggle={()=>detailsOpen ? setDetailsOpen(false) : showDetails(null)} onSelect={showDetails}/>
+      {detailsOpen && <section className="panel" id="cluster-job-details"><h2>任务明细</h2>
+      {selection ? <p>{groups[selection.group]} · {reasons[selection.reason]} <button onClick={()=>setSelection(null)}>清除筛选</button></p> :
+        <p className="muted">当前集群全部已登记任务 · Asia/Shanghai</p>}
+      <div style={{overflowX:'auto'}}><table><thead><tr>{['任务','任务类型','平台','弹性配置','状态','实际 JCT','统计说明'].map(v=><th key={v}>{v}</th>)}</tr></thead><tbody>{(selection ? (data[selection.group].jobs??[]).filter(j=>j.status===selection.reason && j.actual_seconds===null) : mode==='demo' ? data.flatMap(s=>s.jobs??[]) : allJobs.filter(j=>j.cluster===cluster)).map(j=>{
         const included = data.some(s=>s.jobs?.some(v=>v.uid===j.uid));
-        const actual = j.status==='completed' && j.completed_at!=null && j.submitted_at!=null && j.completed_at>=j.submitted_at ? j.completed_at-j.submitted_at : null;
+        const actual = j.actual_seconds ?? null;
         return <tr key={j.uid}><td title={j.uid}>{j.name}<small> · {j.uid.slice(0,8)}</small></td><td>{j.job_type??'未知'}</td><td>{j.platform_type??'未知'}</td><td>{j.elasticity_enabled==null?'待确认':j.elasticity_enabled?'开启弹性':'关闭弹性'}</td><td>{{running:'运行中',completed:'已完成',failed:'失败',cancelled:'已取消',unknown:'未知'}[j.status]}</td><td>{format(actual)} 分钟</td><td>{j.elasticity_enabled==null?'配置未知':!included?'窗口外或缺少提交时间':actual===null?'未完成或时间无效':'已纳入'}</td></tr>;
-      })}{!allJobs.some(j=>j.cluster===cluster)&&<tr><td colSpan={7}>该集群暂无已登记任务，请检查任务同步。</td></tr>}</tbody></table></div></section>
+      })}{!allJobs.some(j=>j.cluster===cluster)&&<tr><td colSpan={7}>该集群暂无已登记任务，请检查任务同步。</td></tr>}</tbody></table></div></section>}
     </>}
   </>;
 }

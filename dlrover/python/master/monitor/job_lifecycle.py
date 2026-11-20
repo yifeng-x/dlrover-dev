@@ -15,7 +15,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from dlrover.python.common.job_classification import classify_job
+from dlrover.python.common.job_classification import MASTER_JOB_TYPE, classify_job
 from dlrover.python.common.log import default_logger as logger
 
 
@@ -40,7 +40,8 @@ class MasterLifecycle:
         self.identity = dict(job_uid=args.job_uuid, job_name=args.job_name,
                              cluster=args.cluster, namespace=args.namespace,
                              submitted_at=submitted)
-        self.identity.update(classify_job(getattr(args, "raw_job", None) or {},
+        master_job = dict(getattr(args, "raw_job", None) or {}, kind=MASTER_JOB_TYPE)
+        self.identity.update(classify_job(master_job,
                              getattr(args, "resource_monitor_switch", None),
                              getattr(args, "configmap_manual_scale_switch", None)))
         self.url, self.clock = url, clock

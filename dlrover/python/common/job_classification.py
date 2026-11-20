@@ -1,9 +1,12 @@
 """Task classification derived from explicit platform configuration."""
 
 
+MASTER_JOB_TYPE = "ElasticJob"
+
+
 def classify_job(job, resource_monitor=None, manual_scale=None):
     metadata = job.get("metadata") or {}
-    kind = job.get("kind") or "ElasticJob"
+    kind = job.get("kind") or MASTER_JOB_TYPE
     annotations = metadata.get("annotations") or {}
     enabled = None
     explicit = annotations.get("dlrover.io/elasticity-enabled")

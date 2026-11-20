@@ -107,6 +107,7 @@ class TestJobInfoHandler(AsyncHTTPTestCase):
 
             data = json.loads(response.body)
             self.assertEqual(data["job_name"], "test-job")
+            self.assertEqual(data["job_type"], "ElasticJob")
             self.assertIn("job_stage", data)
             self.assertEqual(data["total_nodes"], 2)
             self.assertEqual(data["running_nodes"], 1)

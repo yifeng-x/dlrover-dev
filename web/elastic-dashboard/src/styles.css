@@ -174,3 +174,19 @@ h2{font-weight:750}
 .trend-custom label { display:grid; gap:3px; }
 .trend-custom input { max-width:100%; padding:4px; border:1px solid #cdd7e6; border-radius:4px; }
 .trend-custom [role=alert] { color:#ae3434; }
+
+.sample-scroll { overflow-x:auto; }
+.sample-coverage table { width:100%; border-collapse:collapse; min-width:550px; }
+.sample-coverage th,.sample-coverage td { text-align:left; padding:12px; border-bottom:1px solid #e4e9f1; }
+.sample-coverage thead { background:#f4f6fa; }
+.sample-off { --group:#788496; }
+.sample-on { --group:#1769ff; }
+.sample-coverage tbody th i { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--group); margin-right:7px; }
+.sample-coverage th small { display:block; margin-top:4px; color:#64748b; font-weight:400; }
+.sample-meter { display:flex; align-items:center; gap:10px; font-variant-numeric:tabular-nums; }
+.sample-meter span { width:clamp(65px,12vw,200px); height:9px; background:#e6eaf1; border-radius:8px; overflow:hidden; }
+.sample-meter b { display:block; height:100%; background:var(--group); }
+.sample-notice { color:#895016; background:#fff6e5; padding:10px 14px; border-radius:6px; }
+.sample-reasons { padding:12px 0; }
+.sample-reasons div { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+.sample-details-link { display:block; margin:12px 0 0 auto; color:#1769ff; }

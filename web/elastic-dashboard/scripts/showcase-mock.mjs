@@ -18,18 +18,20 @@ function records() {
     const minutes = experiment ? (i===9?215:65) : (i===9?190:90);
     const submitted = at(`${experiment?'2026-11-03':'2026-10-27'}T13:04:00`);
     const running = scenario==='partial' && experiment && i===9;
-    return {uid:`mock-${group}-${String(i+1).padStart(2,'0')}`, name:`MOCK-${group}-${String(i+1).padStart(2,'0')}`, cluster, namespace:'showcase', status:running?'running':'completed', submitted_at:submitted, completed_at:running?null:submitted+minutes*60};
+    return {uid:`mock-${group}-${String(i+1).padStart(2,'0')}`, name:`MOCK-${group}-${String(i+1).padStart(2,'0')}`, cluster, namespace:'showcase', job_type:'ElasticJob', elasticity_enabled:experiment, actual_seconds:running?null:minutes*60, status:running?'running':'completed', submitted_at:submitted, completed_at:running?null:submitted+minutes*60};
   }));
 }
 function stats(url) {
-  const allowed = new Set(['cluster','namespace','submitted_from','submitted_to']);
+  const allowed = new Set(['cluster','namespace','submitted_from','submitted_to','elasticity_enabled']);
   for (const key of url.searchParams.keys()) if (!allowed.has(key) || url.searchParams.getAll(key).length!==1 || !url.searchParams.get(key)) throw Error('filter');
   const from = url.searchParams.get('submitted_from'), to = url.searchParams.get('submitted_to');
   if ((from===null)!==(to===null) || from!==null && (!Number.isFinite(+from)||!Number.isFinite(+to)||+from<0||+from>=+to)) throw Error('range');
-  const jobs=records().filter(j=>(!url.searchParams.has('cluster')||j.cluster===url.searchParams.get('cluster')) && (!url.searchParams.has('namespace')||j.namespace===url.searchParams.get('namespace')) && (from===null||j.submitted_at>=+from&&j.submitted_at<+to));
+  const flag=url.searchParams.get('elasticity_enabled');
+  if(flag!==null && !['true','false'].includes(flag)) throw Error('filter');
+  const jobs=records().filter(j=>(flag===null || String(j.elasticity_enabled)===flag) && (!url.searchParams.has('cluster')||j.cluster===url.searchParams.get('cluster')) && (!url.searchParams.has('namespace')||j.namespace===url.searchParams.get('namespace')) && (from===null||j.submitted_at>=+from&&j.submitted_at<+to));
   const values=jobs.filter(j=>j.status==='completed').map(j=>j.completed_at-j.submitted_at).sort((a,b)=>a-b);
   const percentile=p=>values.length?values[Math.ceil(values.length*p)-1]:null;
-  return {generated_at:now, total_jobs:jobs.length, measured_jobs:values.length, excluded_jobs:jobs.length-values.length, completed_jobs:values.length, running_jobs:jobs.length-values.length, failed_jobs:0, unknown_jobs:0, unassigned_jobs:0, mean_seconds:values.length?values.reduce((a,b)=>a+b,0)/values.length:null, p50_seconds:percentile(.5),p95_seconds:percentile(.95),min_seconds:values[0]??null,max_seconds:values.at(-1)??null,percentile_method:'nearest_rank',time_basis:'submission_to_completion',submitted_from:from===null?null:+from,submitted_to:to===null?null:+to};
+  return {jobs, generated_at:now, total_jobs:jobs.length, measured_jobs:values.length, excluded_jobs:jobs.length-values.length, completed_jobs:values.length, running_jobs:jobs.length-values.length, failed_jobs:0, unknown_jobs:0, unassigned_jobs:0, mean_seconds:values.length?values.reduce((a,b)=>a+b,0)/values.length:null, p50_seconds:percentile(.5),p95_seconds:percentile(.95),min_seconds:values[0]??null,max_seconds:values.at(-1)??null,percentile_method:'nearest_rank',time_basis:'submission_to_completion',submitted_from:from===null?null:+from,submitted_to:to===null?null:+to};
 }
 function dashboard(job) {
   const data=demoDashboard(job.status==='running'?'demo-train-002':'demo-train-001');

@@ -389,7 +389,11 @@ class DashboardService:
         self.store, self.prometheus, self.clock = store, prometheus, clock
 
     def jobs(self):
-        return {"items": [public_job(job) for job in self.store.jobs()]}
+        now = self.clock()
+        return {"items": [
+            dict(public_job(job), actual_seconds=durations(job, now)["actual_seconds"])
+            for job in self.store.jobs()
+        ]}
 
     def jct_statistics(self, cluster=None, namespace=None, submitted_from=None, submitted_to=None, elasticity_enabled=None):
         if (submitted_from is None) != (submitted_to is None):
@@ -415,12 +419,13 @@ class DashboardService:
         if submitted_from is not None:
             jobs = [job for job in jobs if finite(job.get("submitted_at"))
                     and submitted_from <= job["submitted_at"] < submitted_to]
+        now = self.clock()
         result = dict(
-            statistics(jobs, self.clock()),
+            statistics(jobs, now),
             unassigned_jobs=missing,
             submitted_from=submitted_from, submitted_to=submitted_to,
             scope=dict(cluster=cluster, namespace=namespace),
-            jobs=[dict(public_job(j), **durations(j, self.clock())) for j in jobs],
+            jobs=[dict(public_job(j), **durations(j, now)) for j in jobs],
         )
 
         logger.info(

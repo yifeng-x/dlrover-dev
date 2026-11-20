@@ -14,6 +14,7 @@
 import time
 from typing import Dict
 
+from dlrover.python.common.job_classification import MASTER_JOB_TYPE
 from dlrover.python.common.constants import (
     NodeType,
     OptimizeMode,
@@ -81,7 +82,7 @@ class LocalJobMaster(JobMaster):
         collector = JobMetricCollector(
             job_uuid, params.job_name, params.namespace, params.cluster, params.user, reporter
         )
-        collector.collect_job_type(params.distribution_strategy)
+        collector.collect_job_type(MASTER_JOB_TYPE)
         return collector
 
     def prepare(self):

@@ -26,6 +26,7 @@ from dlrover.python.common.log import default_logger as logger
 from dlrover.python.common.serialize import to_dict
 from dlrover.python.master.monitor.perf_monitor import PerfMonitor
 from dlrover.python.master.node.job_context import get_job_context, JobContext
+from dlrover.python.common.job_classification import MASTER_JOB_TYPE
 from dlrover.python.common.constants import NodeType, NodeStatus
 from dlrover.python.common.global_context import Context
 from tornado.ioloop import PeriodicCallback
@@ -73,7 +74,6 @@ class JobInfoHandler(BaseHandler):
             return
 
         job_name = job_args.job_name
-        job_type = job_args.distribution_strategy
         job_stage = self.job_ctx.get_job_stage()
 
         # Try to get some sensible node counts
@@ -119,7 +119,8 @@ class JobInfoHandler(BaseHandler):
 
         job_info = {
             "job_name": job_name,
-            "job_type": job_type,
+            "job_type": MASTER_JOB_TYPE,
+            "distribution_strategy": job_args.distribution_strategy,
             "job_stage": job_stage,
             "create_time": self._format_time(earliest_create_time),
             "start_time": self._format_time(earliest_start_time),
