@@ -41,9 +41,15 @@ class MasterLifecycle:
                              cluster=args.cluster, namespace=args.namespace,
                              submitted_at=submitted)
         master_job = dict(getattr(args, "raw_job", None) or {}, kind=MASTER_JOB_TYPE)
-        self.identity.update(classify_job(master_job,
-                             getattr(args, "resource_monitor_switch", None),
-                             getattr(args, "configmap_manual_scale_switch", None)))
+        self.identity.update(classify_job(
+            master_job, master_enabled=getattr(args, "master_elasticity_enabled", None)
+        ))
+        logger.info(
+            "Master lifecycle initialized job_uid=%s cluster=%s namespace=%s "
+            "job_name=%s elasticity_enabled=%s submitted_at=%s",
+            args.job_uuid, args.cluster, args.namespace, args.job_name,
+            self.identity["elasticity_enabled"], submitted,
+        )
         self.url, self.clock = url, clock
         self.send = send or self._send
         self._lock = threading.Lock()
@@ -64,7 +70,8 @@ class MasterLifecycle:
             logger.warning("Temporary Master lifecycle enabled: CR-to-Master timing; disable platform writer for these jobs")
             return reporter
         except Exception:
-            logger.warning("Temporary Master lifecycle unavailable; training continues")
+            logger.exception("Master lifecycle initialization failed job_uid=%s",
+                             getattr(args, "job_uuid", None))
             return None
 
     def _make(self, status, completed):
@@ -87,12 +94,18 @@ class MasterLifecycle:
                 snapshot = dict(self._snapshot)
                 terminal = self._terminal
             # Retries preserve the original observation time and payload.
-            for _ in range(2):
+            for attempt in (1, 2):
                 try:
                     self.send(snapshot)
+                    log = logger.info if terminal else logger.debug
+                    log("Lifecycle snapshot acknowledged job_uid=%s status=%s",
+                        snapshot["job_uid"], snapshot["status"])
                     break
-                except Exception:
-                    logger.warning("Temporary lifecycle delivery failed")
+                except Exception as exc:
+                    logger.warning(
+                        "Lifecycle delivery failed job_uid=%s status=%s attempt=%d/2 error=%s",
+                        snapshot["job_uid"], snapshot["status"], attempt, type(exc).__name__,
+                    )
             if terminal:
                 return
             self._wake.wait(60)

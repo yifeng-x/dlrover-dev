@@ -17,6 +17,8 @@ import json
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
+from dlrover.python.common.log import default_logger as logger
+
 from .aggregate import choice, num, positive_time
 
 PREFIX = "dlrover_master_vertical_benefit_"
@@ -196,6 +198,7 @@ class PrometheusBenefits:
                 float(t): num(float(v)) for t, v in item.get("values", [])
             }
         points = []
+        stale_candidates = conflicts = missing_points = 0
         prefix = "dlrover_master_"
         # query_range evaluates on this grid. Missing evaluations remain null.
         for i in range(min(2000, int((end - start) / step) + 1)):
@@ -208,8 +211,11 @@ class PrometheusBenefits:
 
                 observed = value("worker_gpu_observed_timestamp_seconds")
                 gpus = value("running_worker_allocated_gpus")
+                valid = value("worker_gpu_observation_valid") == 1
+                if valid and observed is not None and at - observed > 30:
+                    stale_candidates += 1
                 if (
-                    value("worker_gpu_observation_valid") == 1
+                    valid
                     and observed is not None
                     and 0 <= at - observed <= 30
                     and gpus is not None
@@ -223,5 +229,15 @@ class PrometheusBenefits:
                 counts = {v for t, v in candidates if t == newest}
                 if len(counts) == 1:
                     gpus = counts.pop()
+                else:
+                    conflicts += 1
+            if gpus is None:
+                missing_points += 1
             points.append(dict(at=at, gpus=gpus, throughput=None))
+        logger.info(
+            "GPU history job_uid=%r window=[%s,%s] step=%s targets=%d points=%d "
+            "missing_points=%d stale_candidates=%d conflicting_points=%d",
+            expected.get("job_uid"), start, end, step, len(groups), len(points),
+            missing_points, stale_candidates, conflicts,
+        )
         return points

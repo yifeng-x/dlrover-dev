@@ -409,12 +409,15 @@ class DashboardService:
             if (cluster is None or job["cluster"] == cluster)
             and (namespace is None or job["namespace"] == namespace)
         ]
+        scoped = len(jobs)
+        unknown_config = sum(j.get("elasticity_enabled") is None for j in jobs)
         if elasticity_enabled not in (None, "true", "false"):
             raise ValueError("Invalid elasticity filter")
         if elasticity_enabled is not None:
             enabled = elasticity_enabled == "true"
             jobs = [j for j in jobs if j.get("elasticity_enabled") is not None
                     and bool(j["elasticity_enabled"]) == enabled]
+        group_size = len(jobs)
         missing = sum(not finite(job.get("submitted_at")) for job in jobs)
         if submitted_from is not None:
             jobs = [job for job in jobs if finite(job.get("submitted_at"))
@@ -429,7 +432,9 @@ class DashboardService:
         )
 
         logger.info(
-            "JCT statistics total_jobs=%d measured_jobs=%d unassigned_jobs=%d",
+            "JCT statistics cluster=%r namespace=%r elasticity_enabled=%s window=[%s,%s) "
+            "scoped=%d unknown_config=%d matching_config=%d total_jobs=%d measured_jobs=%d unassigned_jobs=%d",
+            cluster, namespace, elasticity_enabled, submitted_from, submitted_to, scoped, unknown_config, group_size,
             result["total_jobs"], result["measured_jobs"], missing,
         )
         return result
@@ -474,7 +479,7 @@ class DashboardService:
                     )
                 points = self.prometheus.gpu_history(job, start, min(end, now))
             except Exception as exc:
-                logger.warning("Prometheus GPU history query failed (%s)", type(exc).__name__)
+                logger.warning("Prometheus GPU history query failed job_uid=%r error=%s", uid, type(exc).__name__)
                 missing.append("Prometheus GPU 时序查询暂不可用")
         else:
             missing.append("未配置 DLROVER_PROMETHEUS_URL，GPU 时序不可用")
@@ -491,7 +496,7 @@ class DashboardService:
             try:
                 latest = self.prometheus.latest(job)
             except Exception as exc:
-                logger.warning("Prometheus benefit query failed (%s)", type(exc).__name__)
+                logger.warning("Prometheus benefit query failed job_uid=%r error=%s", uid, type(exc).__name__)
                 missing.append("Prometheus 收益查询暂不可用")
         if latest is None:
             missing.append("暂无收益评估")
@@ -516,8 +521,10 @@ class DashboardService:
                 ),
             )
         logger.info(
-            "Dashboard aggregated records=%d plans=%d gpu_points=%d",
-            len(raw), len(plans), len(points),
+            "Dashboard aggregated job_uid=%r status=%s records=%d plans=%d gpu_points=%d "
+            "throughput_windows=%d jct=%s baseline=%s",
+            uid, job["status"], len(raw), len(plans), len(points), len(windows),
+            jct["measurement_status"], baseline["baseline_source"],
         )
         return dict(
             schema_version=1,

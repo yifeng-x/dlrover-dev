@@ -327,8 +327,7 @@ from < to；非法值返回 422。按提交时间左闭右开筛选，完成时�
 status 支持 cancelled，取消任务不参与已完成 JCT。
 统计接口支持 elasticity_enabled=true/false，并返回参与该组的任务明细。
 
-Kubernetes 任务使用 annotation `dlrover.io/elasticity-enabled: "true"` 或
-`"false"` 明确标记实际配置（该 annotation 用于统计，不修改训练配置）。
+Kubernetes 任务按 Master 显式启动参数判断弹性配置。
 普通 Job 自动归为关闭弹性。使用以下命令周期同步：
 
 ```sh
@@ -348,10 +347,10 @@ API 读取失败时不更新状态。删除仅能确认作业已不在集群，�
 窗口结束后完成的任务仍使用完整 JCT。
 
 Master 生命周期快照现携带 job_type、platform_type、platform_task_id、
-elasticity_enabled。分类优先使用明确的统计 annotation；Master 的资源监控或
-手动扩缩开关为 on 时判定开启，否则读取显式 worker.autoScale 布尔值；
-未明确配置的保持未知。不要仅根据任务名字判断。
-Kubernetes 同步命令也支持从显式 worker.autoScale 读取配置。
+elasticity_enabled。Master 显式指定 elastic_dimension（auto、horizontal、vertical）
+或 configmap_manual_scale_switch=on 时记为开启，其余记为关闭。
+Kubernetes 同步从 Master 容器启动命令读取同一配置；无法获取启动配置时保留已有值。
+平台可在提交时用这两个参数计算布尔值并随任务快照写入。
 
 已经存在的空字段不会仅因页面刷新而自动补齐：升级上报端后接收新快照，
 或对仍存在的 CR 运行 reconcile。相同生命周期时间戳的相同快照允许补齐分类。

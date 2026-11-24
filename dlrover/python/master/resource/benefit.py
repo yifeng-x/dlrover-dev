@@ -312,10 +312,12 @@ class BenefitGuard:
             parsed = urlparse(self.url)
         except ValueError:
             return BenefitResult("unknown", "invalid_configuration")
+        
         if (not self.valid or parsed.scheme not in ("http", "https")
                 or not parsed.hostname or parsed.username or parsed.password
                 or not self.job.get("job_uid")):
             return BenefitResult("unknown", "invalid_configuration")
+        
         try:
             request = dict(
                 schema_version=1, request_id=uuid.uuid4().hex,

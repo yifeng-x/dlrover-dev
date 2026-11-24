@@ -1628,10 +1628,6 @@ class ElasticTrainingAgent(LocalElasticAgent):
                         step=task.step,
                         checkpoint_path=task.checkpoint_dir,
                     )
-                elif elastic_mode == "ucp":
-                    raise RuntimeError(
-                        "Vertical UCP requires DeepSpeed checkpoint saver"
-                    )
                 else:
                     self.set_save_ckpt_status(
                         True,
@@ -1647,10 +1643,12 @@ class ElasticTrainingAgent(LocalElasticAgent):
             while True:
                 phase = self._client.get_vertical_elastic_phase()
                 if phase.plan_id != phase_info.plan_id:
+                    
                     raise RuntimeError(
                         "Vertical elastic plan changed while waiting"
                     )
                 if phase.phase in (
+                    VerticalElasticPhaseType.REPLACING_WORKERS,
                     VerticalElasticPhaseType.REPLACING_WORKERS,
                     VerticalElasticPhaseType.TUNE_PARAM,
                     VerticalElasticPhaseType.RENDEZVOUS_READY,

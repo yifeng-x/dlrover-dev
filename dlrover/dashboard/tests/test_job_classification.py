@@ -14,7 +14,7 @@ class ClassificationTest(unittest.TestCase):
             item = dict(metadata=dict(uid="u", name="same", creationTimestamp="2026-01-01T00:00:00Z",
                                       annotations={"dlrover.io/elasticity-enabled": "false"}))
             reconcile(store, [item], "c", "n", "ElasticJob", now=1800000000)
-            self.assertEqual(store.jobs()[0]["elasticity_enabled"], 0)
+            self.assertIsNone(store.jobs()[0]["elasticity_enabled"])
             reconcile(store, [], "c", "n", "ElasticJob", now=1800000001)
             self.assertEqual(store.jobs()[0]["status"], "cancelled")
             reconcile(store, [item], "c", "n", "ElasticJob", now=1800000002)
@@ -38,8 +38,22 @@ class ClassificationTest(unittest.TestCase):
         value = classify_job(job)
         self.assertEqual(value["platform_task_id"], "real")
         self.assertEqual(value["platform_type"], "kubernetes")
-        self.assertFalse(value["elasticity_enabled"])
-        self.assertTrue(classify_job(job, resource_monitor="on")["elasticity_enabled"])
+        self.assertIsNone(value["elasticity_enabled"])
+        container = {"name": "main"}
+        job["spec"]["replicaSpecs"]["dlrover-master"] = {
+            "template": {"spec": {"containers": [container]}}}
+        for flags, expected in [
+            ("--elastic_dimension auto", True),
+            ("--elastic_dimension=vertical --configmap_manual_scale_switch off", True),
+            ("--configmap_manual_scale_switch on", True),
+            ("--configmap_manual_scale_switch off", False),
+            ("--resource_monitor_switch on", False),
+            ("", False),
+        ]:
+            container["command"] = ["/bin/bash", "-c",
+                "cd /app && python -m dlrover.python.master.main " + flags]
+            self.assertEqual(classify_job(job)["elasticity_enabled"], expected)
+        self.assertTrue(classify_job(job, master_enabled=True)["elasticity_enabled"])
 
     def test_metadata_backfill_identical_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:

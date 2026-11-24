@@ -126,7 +126,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(404, {"code": "NOT_FOUND"})
         except KeyError:
             self.send_json(404, {"code": "JOB_NOT_FOUND"})
-        except (ValueError, sqlite3.Error, StoreUnavailable):
+        except (ValueError, sqlite3.Error, StoreUnavailable) as exc:
+            logger.warning("Dashboard read failed operation=%s error=%s", self.operation, type(exc).__name__)
             self.send_json(503, {"code": "DATA_UNAVAILABLE"})
 
     def do_POST(self):
@@ -140,6 +141,7 @@ class Handler(BaseHTTPRequestHandler):
         ):
             return self.send_json(404, {"code": "NOT_FOUND"})
         self.operation = path.rsplit("/", 1)[1]
+        uid = None
         try:
             if self.headers.get("Transfer-Encoding"):
                 return self.send_json(400, {"code": "CONTENT_LENGTH_REQUIRED"})
@@ -151,14 +153,24 @@ class Handler(BaseHTTPRequestHandler):
             if len(raw) != length:
                 raise ValueError("Incomplete body")
             value = json.loads(raw)
+            if isinstance(value, dict):
+                identity = value.get("job") if path.endswith("/events") else value
+                if isinstance(identity, dict) and isinstance(identity.get("job_uid"), str):
+                    uid = identity["job_uid"][:512]
             store = self.server.service.store
             inserted = (
                 store.append(value)
                 if path.endswith("/events")
                 else store.register(value)
             )
+            log = logger.info if inserted else logger.debug
+            log("Dashboard ingest operation=%s job_uid=%r changed=%s", self.operation, uid, inserted)
             self.send_json(200, {"recorded": True, "inserted": inserted})
-        except (ValueError, TypeError, UnicodeError):
+        except (ValueError, TypeError, UnicodeError) as exc:
+            logger.warning("Dashboard rejected record operation=%s job_uid=%r error=%s",
+                           self.operation, uid, type(exc).__name__)
             self.send_json(422, {"code": "INVALID_RECORD"})
-        except (sqlite3.Error, StoreUnavailable):
+        except (sqlite3.Error, StoreUnavailable) as exc:
+            logger.warning("Dashboard write failed operation=%s job_uid=%r error=%s",
+                           self.operation, uid, type(exc).__name__)
             self.send_json(503, {"code": "STORE_UNAVAILABLE"})

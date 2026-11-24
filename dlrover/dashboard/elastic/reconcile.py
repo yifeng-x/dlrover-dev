@@ -9,6 +9,8 @@ import subprocess
 import time
 from datetime import datetime
 
+from dlrover.python.common.log import default_logger as logger
+
 from .store import create_store
 from dlrover.python.common.job_classification import classify_job
 
@@ -20,6 +22,7 @@ def timestamp(value):
 def reconcile(store, items, cluster, namespace, job_type, now=None):
     now = time.time() if now is None else now
     seen = set()
+    cancelled = 0
     for item in items:
         meta = item["metadata"]
         uid = meta["uid"]
@@ -34,29 +37,34 @@ def reconcile(store, items, cluster, namespace, job_type, now=None):
         state = ("completed" if completed or phase in ("succeeded", "completed") else
                  "failed" if failed or phase == "failed" else
                  "cancelled" if meta.get("deletionTimestamp") else "running")
-        annotations = meta.get("annotations", {})
-        flag = annotations.get("dlrover.io/elasticity-enabled")
-        # Explicit configuration only: no inference from job name or event count.
-        enabled = flag == "true" if flag in ("true", "false") else None
-        if job_type != "ElasticJob":
-            enabled = False
         classification = classify_job(dict(item, kind=job_type))
-        enabled = classification["elasticity_enabled"]
-        store.register(dict(job_uid=uid, job_name=meta["name"], cluster=cluster,
-                            namespace=namespace, job_type=job_type, platform_type="kubernetes",
-                            platform_task_id=uid, elasticity_enabled=enabled, status=state,
+        # A template may use an opaque entrypoint. Preserve a known Master snapshot.
+        if classification["elasticity_enabled"] is None:
+            classification.pop("elasticity_enabled")
+
+        updated = store.register(dict(job_uid=uid, job_name=meta["name"], cluster=cluster,
+                            namespace=namespace, **classification, status=state,
                             submitted_at=timestamp(meta.get("creationTimestamp")),
                             completed_at=timestamp(status.get("completionTime") or
                                 (completed or {}).get("lastTransitionTime")) if state == "completed" else None,
                             lifecycle_observed_at=now))
+        logger.info("Reconciled job_uid=%s status=%s elasticity_enabled=%s updated=%s",
+                     uid, state, classification.get("elasticity_enabled", "preserved"), updated)
+    
     for job in store.jobs():
         if (job["cluster"] == cluster and job["namespace"] == namespace
                 and job.get("job_type") == job_type and job["status"] == "running"
                 and job["uid"] not in seen):
-            store.register(dict(job_uid=job["uid"], job_name=job["name"],
+            updated = store.register(dict(job_uid=job["uid"], job_name=job["name"],
                                 cluster=cluster, namespace=namespace, status="cancelled",
                                 submitted_at=job["submitted_at"], completed_at=None,
                                 lifecycle_observed_at=now))
+            if updated:
+                cancelled += 1
+                logger.info("Marked missing Kubernetes job cancelled job_uid=%s cluster=%s namespace=%s",
+                            job["uid"], cluster, namespace)
+    logger.info("Kubernetes reconciliation complete cluster=%s namespace=%s job_type=%s seen=%d cancelled=%d",
+                cluster, namespace, job_type, len(seen), cancelled)
 
 
 def main():

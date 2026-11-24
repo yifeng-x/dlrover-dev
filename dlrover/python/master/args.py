@@ -164,7 +164,7 @@ def _build_master_args_parser():
     )
     parser.add_argument(
         "--elastic_dimension",
-        default="auto",
+        default=None,
         type=str.lower,
         choices=("horizontal", "vertical", "auto"),
         help="Elastic dimension; defaults to auto based on worker replicas and GPUs or "
@@ -191,6 +191,20 @@ def parse_master_args(master_args=None):
     parser = _build_master_args_parser()
 
     args, unknown_args = parser.parse_known_args(args=master_args)
+
+    from dlrover.python.common.job_classification import master_elasticity_enabled
+
+    args.master_elasticity_enabled = master_elasticity_enabled(
+        args.elastic_dimension, args.configmap_manual_scale_switch
+    )
+    logger.info(
+        "Master elasticity configuration job_name=%s elastic_dimension=%s "
+        "configmap_manual_scale_switch=%s elasticity_enabled=%s",
+        args.job_name, args.elastic_dimension, args.configmap_manual_scale_switch,
+        args.master_elasticity_enabled,
+    )
+    if args.elastic_dimension is None:
+        args.elastic_dimension = "auto"
 
     # Set default values for resource_monitor_switch and configmap_manual_scale_switch
     # if they are not provided in the command line arguments.

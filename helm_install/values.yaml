@@ -25,7 +25,7 @@ controller:
     masterServiceMonitor:
       # One monitor discovers the Master Service of every ElasticJob.
       enabled: true
-      interval: 30s
+      interval: 10s
       scrapeTimeout: 5s
       # Change this value when the Prometheus Helm release has another name.
       labels:

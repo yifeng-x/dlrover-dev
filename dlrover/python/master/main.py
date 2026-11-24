@@ -70,6 +70,7 @@ def update_context(job_args: JobArgs):
 def run(args):
     job_args = new_job_args(args.platform, args.job_name, args.namespace)
 
+    job_args.master_elasticity_enabled = getattr(args, "master_elasticity_enabled", None)
     job_args.requested_elastic_dimension = args.elastic_dimension.lower()
     if job_args.requested_elastic_dimension != ElasticDimension.AUTO:
         job_args.elastic_dimension = job_args.requested_elastic_dimension
