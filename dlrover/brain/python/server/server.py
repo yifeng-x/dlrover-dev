@@ -128,6 +128,10 @@ class BrainServer:
             self._elastic_manager.metrics_snapshot
         )
 
+        if os.getenv("DLROVER_BENEFIT_UPSTREAM_URL"):
+            from dlrover.brain.python.server.benefit_history import router
+
+            self._server.include_router(router)
         self.register_routes()
 
         self._configmap_manual_scaler = new_configmap_scale_watcher(

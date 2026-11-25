@@ -50,10 +50,11 @@ def begin(obj, before=4, after=8):
     obj.observing()
 
 
-def observe(obj, speed=2, generation="g2", start=1120, end=1180, work=280):
+def observe(obj, speed=2, generation="g2", start=1120, end=1180, work=280, history_context=None):
     def http(url, **kwargs):
         req = kwargs["json"]
         data = payload(req, now=obj.test_clock[0])
+        data["history_context"] = history_context
         data["candidate"] = {"status": "unavailable"}
         data["training"]["start"] = dict(generation=generation, observed_at=start, work=work-speed*(end-start))
         data["training"]["end"] = dict(generation=generation, observed_at=end, work=work)
@@ -455,14 +456,18 @@ def test_startup_fence_blocks_initial_launch_on_partial_mutation(trial):
 
 def test_result_upload_ack_is_durable_and_idempotent(trial):
     begin(trial)
-    observe(trial)
-    assert observe(trial, start=1180, end=1240, work=400) == "ACCEPTED"
+    context = dict(config_revision="recipe-v1", phase="train")
+    observe(trial, history_context=context)
+    assert observe(trial, start=1180, end=1240, work=400, history_context=context) == "ACCEPTED"
     requests = []
     def http(url, **kwargs):
         request = kwargs["json"]
         requests.append(request)
         assert request["exploration"]["result"]["candidate_throughput"] == 2
         assert request["exploration"]["report_result"] is True
+        assert request["exploration"]["history_context"] == context
+        assert request["exploration"]["baseline_training"]["unit"] == "steps"
+        assert request["exploration"]["baseline_throughput"] == 1
         response = MagicMock(status_code=200)
         response.__enter__.return_value = response
         response.json.return_value = dict(recorded=True, request_id=request["request_id"], exploration_id="trial-1")
@@ -577,3 +582,13 @@ def test_completed_legacy_journal_only_sends_release_notification(trial):
     assert trial.enter()
     assert trial.state["reported"] is True
     assert len(requests) == 1
+
+
+def test_history_context_change_keeps_result_for_audit_only(trial):
+    begin(trial)
+    first = dict(config_revision="v1", phase="train")
+    assert observe(trial, history_context=first) == "wait"
+    assert observe(trial, start=1180, end=1240, work=400,
+                   history_context={**first, "phase": "finetune"}) == "ACCEPTED"
+    assert trial.store.load()["history_context"] is None
+    assert trial.state["result"]["candidate_throughput"] == 2

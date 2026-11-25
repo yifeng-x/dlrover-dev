@@ -93,3 +93,19 @@ create table gpu_tw_metric_decision_records(
     PRIMARY KEY (uid)
 );
 
+CREATE TABLE IF NOT EXISTS elastic_exploration_history (
+    cluster VARCHAR(128) NOT NULL,
+    job_uid VARCHAR(128) NOT NULL,
+    exploration_id VARCHAR(128) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    current_resource JSON NOT NULL,
+    target_resource JSON NOT NULL,
+    report JSON NOT NULL,
+    baseline_throughput DOUBLE,
+    candidate_throughput DOUBLE,
+    observed_at DOUBLE,
+    reuse_key CHAR(64),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (cluster, job_uid, exploration_id),
+    INDEX history_lookup (cluster, reuse_key, observed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

@@ -239,27 +239,33 @@ class Exploration:
                 or self.guard.last_result.reason != "candidate_unavailable"
                 or self.store is None or self.store.lock is None):
             return reject("ineligible_or_disabled")
+        
         snapshot = self.guard.last_snapshot
         try:
             admission = snapshot["exploration"]
             if admission.get("policy") != POLICY:
                 return reject("observation_policy_required")
+            
             if not all(admission.get(k) is True for k in (
                 "allowed", "checkpoint_compatible", "quiescent_checkpoint"
             )):
                 return reject("admission_conditions")
+            
             tiers = admission["gpu_tiers"]
             if (not isinstance(tiers, list) or len(tiers) < 2 or
                     any(type(t) is not int or t <= 0 for t in tiers) or
                     tiers != sorted(set(tiers))):
                 return reject("invalid_gpu_tiers")
+            
             a, b = pack(current), pack(target)
             if abs(tiers.index(a["gpu_num"]) - tiers.index(b["gpu_num"])) != 1:
                 return reject("nonadjacent_gpu_tiers")
+            
             if {k: v for k, v in a.items() if k != "gpu_num"} != {
                 k: v for k, v in b.items() if k != "gpu_num"
             }:
                 return reject("resource_shape_changed")
+            
             limits = snapshot["limits"]
             baseline = self.guard.last_result.estimates["baseline_seconds"]
             # The configured duration is a ceiling, not a requirement for the
@@ -267,15 +273,19 @@ class Exploration:
             duration = min(self.duration, baseline)
             if duration <= 2 * self.guard.min_window:
                 return reject("insufficient_remaining_time")
+            
             if limits["max_delay_seconds"] < duration:
                 return reject("delay_budget")
+            
             deadline = limits.get("deadline_at")
             if deadline is not None and self.clock() + baseline + duration > deadline:
                 return reject("deadline")
+            
             gpu_budget = self.max_gpu_hours * 3600
             trial_gpu = max(a["gpu_num"], b["gpu_num"]) * a["count"] * duration
             if trial_gpu > gpu_budget:
                 return reject("gpu_budget")
+            
             self.state = dict(
                 version=1, policy=POLICY, id=plan_id, status="PREPARING", original=a, target=b,
                 started_at=self.clock(), expires_at=self.clock() + duration,
@@ -357,6 +367,10 @@ class Exploration:
                            reason=state.get("reason"), policy=state.get("policy"),
                            objective=state.get("objective"),
                            result=state.get("result"), windows=state.get("windows", 0),
+                           baseline_throughput=state.get("q0"),
+                           history_context=state.get("history_context"),
+                           baseline_training=state.get("baseline", {}).get("training"),
+                           baseline_context=state.get("baseline", {}).get("history_context"),
                            candidate_observed_at=state.get("candidate_observed_at"),
                            candidate_generation=state.get("candidate_generation"))
             if state.get("policy") == POLICY:
@@ -466,7 +480,13 @@ class Exploration:
             if not math.isfinite(q1) or q1 <= 0:
                 return self._wait("invalid_throughput")
             q1 = min(q1, state.get("measured_lower") or q1)
-            self.save(last_window_end=end["observed_at"], windows=state["windows"] + 1,
+            # A minimum across different workloads is unsuitable for later reuse.
+            history_context = snapshot.get("history_context")
+            if training.get("data_source") == "mock":
+                history_context = None
+            if state["windows"] and state.get("history_context") != history_context:
+                history_context = None
+            self.save(history_context=history_context, last_window_end=end["observed_at"], windows=state["windows"] + 1,
                       spent_gpu_seconds=spent, observation_generation=start["generation"],
                       measured_lower=q1)
             state = self.state

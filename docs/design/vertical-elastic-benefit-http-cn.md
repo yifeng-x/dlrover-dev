@@ -412,7 +412,28 @@ keep_seconds = max(0,R)/q1
 
 ACCEPTED、RETAINED、INCONCLUSIVE、FAILED 均调用 `report_result`，发送 exploration.report_result=true、policy、id、status、reason、objective、result、windows、candidate_observed_at、candidate_generation。result 在有效测量时包含 candidate_throughput、baseline_throughput、overall_gain、gain_unit、gain_ratio、time_gain_seconds、gpu_seconds_saved、keep_seconds、elapsed_seconds、remaining_work、trial_gpu_seconds、evaluation_status、constraints_satisfied、unit、data_source、windows、candidate_resource；证据不足时 result 可为 null，不得作为已验证候选收益入库。
 
-服务按探索 ID 幂等记录，返回匹配 request_id、exploration_id 和 recorded=true，Master 才将 reported=true 持久化。回传不获取 SwanLab 数据，不因训练已结束而失效；失败保留本地结果，在下次进入/重启尝试回传，不提供后台无限重试。结果可作为后续 candidate.evidence=trial 的数据来源；本实现没有新增候选数据库或自动生成历史候选模型。
+服务按探索 ID 幂等记录，返回匹配 request_id、exploration_id 和 recorded=true，Master 才将 reported=true 持久化。回传不获取 SwanLab 数据，不因训练已结束而失效；失败保留本地结果，在下次进入/重启尝试回传，不提供后台无限重试。可使用下面的 Brain 入口把回传结果写入训练库，并在后续预测中引用有效观测。
+
+#### 使用 Brain 探索历史表
+
+1. 在 Brain 的 MySQL 训练库 `dlrover` 创建 `elastic_exploration_history`。新库使用 [Brain 建表脚本](../../dlrover/brain/python/docker/dlrover-tables.sql)，已有库只执行其中的 `CREATE TABLE IF NOT EXISTS elastic_exploration_history` 语句。Brain 沿用已有的数据库连接配置。
+2. 在 Brain 设置 `DLROVER_BENEFIT_UPSTREAM_URL` 为**原有证据适配器**的完整快照 URL 并重启。在 Master 设置 `DLROVER_BENEFIT_HTTP_URL=http://<brain-service>:<port>/benefit/snapshot`。配置了 Bearer token 的部署在 Brain 和 Master 设置相同的 `DLROVER_BENEFIT_HTTP_TOKEN`。Brain 校验该 token 并在调用上游时转发。普通快照、探索授权和观测仍由上游提供。新策略的终态回传由 Brain 接收、提交事务并确认，上游原有的终态通知处理逻辑需要随接入一并迁移。
+3. 为启用复用，上游在**候选观测和调整前预测**的快照顶层返回目标配置的特征，例如 `"history_context": {"template_id":"llm-sft","config_revision":"recipe-v3","phase":"finetune","layout":"1x8-A100-NVLink"}`。其中 `template_id` 为同一项目或租户在多次提交中保持稳定的模板标识，`job.namespace` 用于限定命名空间；共享命名空间的不同项目应将项目标识纳入模板 ID。
+   `config_revision` 标识训练配方版本，模型、精度、输入形状分布、并行策略或 batch 语义发生变化时须更新；`phase` 标识训练阶段。布局字段可区分 GPU 资源名无法表达的硬件差异。整个对象参与精确匹配，准入基线快照与两个候选观测窗口须提供相同的目标配方特征。缺少匹配字段的结果仍会归档。
+
+每行代表一次探索，以 `(cluster, job_uid, exploration_id)` 唯一标识。原/目标资源、基线/候选吞吐、观测时间独立存列，`report` JSON 保存基线训练快照、配置特征、探索代次、窗口数、终态原因和收益明细。未形成有效结果时，候选吞吐为 SQL NULL。服务对相同回传幂等确认，对同一主键的冲突回传返回 HTTP 409。
+
+普通预测中，上游明确给出 `candidate.status=unavailable` 并确认训练可比后，Brain 按集群、命名空间、训练模板与版本、阶段、原/目标资源、吞吐单位和 batch 语义查询近期真实探索。作业 UID 用于追溯和去重。ACCEPTED 与 RETAINED 的有效 HTTP 实测均可参与。有效期按观测时间计算，`DLROVER_BENEFIT_HISTORY_MAX_AGE_SECONDS` 默认 86400 秒。
+
+Brain 用本次训练窗口的工作量增量除以耗时得到 q0，再乘以匹配记录中最小的实测倍率（历史候选吞吐 / 历史基线吞吐）。例如作业 A 从 2 提升至 3 steps/s，作业 B 当前为 1.6 steps/s，则估算为 2.4 steps/s。单条可比记录也可使用，该估算是经验值；当前没有用历史回测校准统计下界。响应给出 `evidence=history`、探索 ID、来源集群和来源作业 UID。无匹配或缺少有效当前窗口时保留候选不可用。
+
+已有旧版表只需在训练库执行一次索引调整。旧哈希未包含命名空间、模板及原配置，旧记录保留供审计；升级后新写入且满足条件的记录参与跨作业预测。
+
+```sql
+ALTER TABLE elastic_exploration_history
+    DROP INDEX history_lookup,
+    ADD INDEX history_lookup (cluster, reuse_key, observed_at);
+```
 
 ### 重启兼容
 
