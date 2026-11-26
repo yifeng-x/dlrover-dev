@@ -16,12 +16,12 @@
 import json
 from contextlib import contextmanager
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from .db import Database
-from .models import Base, ElasticEvent, ElasticJob
+from .models import Base, ClusterBaseline, ElasticEvent, ElasticJob
 from .store import StoreUnavailable, event_values, lifecycle_values, job_metadata, text
 
 
@@ -170,6 +170,23 @@ class MySQLEventStore:
                     "Job exceeds 10000 events; pagination is required"
                 )
             return job.to_dict(), [json.loads(payload) for payload in payloads]
+
+    def save_baseline(self, snapshot):
+        with self.connect() as session:
+            statement = insert(ClusterBaseline).values(id=snapshot["id"], cluster=snapshot["cluster"],
+                                                       payload=json.dumps(snapshot))
+            session.execute(statement.on_duplicate_key_update(id=ClusterBaseline.id))
+            return json.loads(session.get(ClusterBaseline, snapshot["id"]).payload)
+
+    def baselines(self, cluster, kind=None, resource_pool=None):
+        query = select(ClusterBaseline.payload).where(ClusterBaseline.cluster == cluster)
+        for field, value in (("kind", kind), ("resource_pool", resource_pool)):
+            if value is not None:
+                query = query.where(func.json_unquote(
+                    func.json_extract(ClusterBaseline.payload, "$." + field)
+                ) == value)
+        with self.connect() as session:
+            return [json.loads(payload) for payload in session.scalars(query)]
 
     def health(self):
         with self.connect() as session:

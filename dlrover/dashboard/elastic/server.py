@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from dlrover.python.common.log import default_logger as logger
 
+from .baselines import preview
 from .store import StoreUnavailable
 
 
@@ -89,6 +90,14 @@ class Handler(BaseHTTPRequestHandler):
             except (StoreUnavailable, sqlite3.Error):
                 return self.send_json(503, {"status": "not_ready"})
         try:
+            if path == "/api/v1/elastic/baselines":
+                self.operation = "baselines"
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                items = self.server.service.store.baselines(
+                    query.get("cluster", [""])[0], query.get("kind", [None])[0],
+                    query.get("resource_pool", [None])[0],
+                )
+                return self.send_json(200, {"items": items})
             if path == "/api/v1/elastic/jobs":
                 self.operation = "jobs"
                 return self.send_json(200, self.server.service.jobs())
@@ -136,6 +145,8 @@ class Handler(BaseHTTPRequestHandler):
         self.operation = "unknown"
         path = urlsplit(self.path).path
         if path not in (
+            "/api/v1/elastic/baselines",
+            "/api/v1/elastic/baselines/preview",
             "/api/v1/elastic/events",
             "/api/v1/elastic/job-snapshots",
         ):
@@ -153,6 +164,16 @@ class Handler(BaseHTTPRequestHandler):
             if len(raw) != length:
                 raise ValueError("Incomplete body")
             value = json.loads(raw)
+            if path.startswith("/api/v1/elastic/baselines"):
+                try:
+                    snapshot = preview(self.server.service, value)
+                except ValueError as exc:
+                    return self.send_json(422, {"code": "INVALID_BASELINE", "message": str(exc)})
+                if path.endswith("/preview"):
+                    return self.send_json(200, snapshot)
+                if value.get("preview_id") != snapshot["id"]:
+                    return self.send_json(409, {"message": "数据已变化，请重新计算后保存"})
+                return self.send_json(200, self.server.service.store.save_baseline(snapshot))
             if isinstance(value, dict):
                 identity = value.get("job") if path.endswith("/events") else value
                 if isinstance(identity, dict) and isinstance(identity.get("job_uid"), str):

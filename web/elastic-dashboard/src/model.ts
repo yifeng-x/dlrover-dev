@@ -3,7 +3,7 @@ import { z } from 'zod';
 const number = z.number().finite();
 const nullable = number.nullable();
 const timestamp = number.nonnegative();
-export const jobSchema = z.object({ actual_seconds: z.number().finite().nonnegative().nullable().optional(), uid: z.string(), name: z.string(), cluster: z.string(), namespace: z.string(), status: z.enum(['running', 'completed', 'failed', 'cancelled', 'unknown']), job_type: z.string().nullable().optional(), platform_type: z.string().nullable().optional(), platform_task_id: z.string().nullable().optional(), elasticity_enabled: z.boolean().nullable().optional(), submitted_at: z.number().nullable().optional(), completed_at: z.number().nullable().optional() });
+export const jobSchema = z.object({ resource_pool:z.string().nullable().optional(), actual_seconds: z.number().finite().nonnegative().nullable().optional(), uid: z.string(), name: z.string(), cluster: z.string(), namespace: z.string(), status: z.enum(['running', 'completed', 'failed', 'cancelled', 'unknown']), job_type: z.string().nullable().optional(), platform_type: z.string().nullable().optional(), platform_task_id: z.string().nullable().optional(), elasticity_enabled: z.boolean().nullable().optional(), submitted_at: z.number().nullable().optional(), completed_at: z.number().nullable().optional() });
 export const evaluationSchema = z.object({
   stage: z.enum(['prediction', 'exploration']), objective: z.enum(['time', 'gpu_hours', 'cluster_jct', 'unknown']),
   work_unit: z.enum(['steps', 'samples', 'tokens', 'unknown']), data_source: z.enum(['mock', 'http', 'unknown']),
@@ -40,6 +40,9 @@ export const dashboardSchema = z.object({
 });
 export type Dashboard = z.infer<typeof dashboardSchema>;
 export type ElasticEvent = z.infer<typeof eventSchema>;
+export function isEffectiveEvent(event: ElasticEvent) {
+  return event.execution_status === 'completed' && event.conclusion === 'accepted';
+}
 export type Evaluation = z.infer<typeof evaluationSchema>;
 export type Job = z.infer<typeof jobSchema>;
 export const objectiveLabel = { time: '剩余时间收益率', gpu_hours: '卡时收益率', cluster_jct: '集群加权 JCT 收益率', unknown: '收益率（目标未知）' };

@@ -53,6 +53,7 @@ class ElasticJob(Base):
     submitted_at = Column(Double)
     completed_at = Column(Double)
     lifecycle_observed_at = Column(Double)
+    resource_pool = Column(String(512))
     job_type = Column(String(512))
     platform_type = Column(String(512))
     platform_task_id = Column(String(512))
@@ -94,3 +95,10 @@ class ElasticEvent(Base):
     payload = Column(
         Text().with_variant(mysql.LONGTEXT(), "mysql"), nullable=False
     )
+
+
+class ClusterBaseline(Base):
+    __tablename__ = "cluster_baselines"
+    id = Column(String(64), primary_key=True)
+    cluster = Column(identifier(), nullable=False)
+    payload = Column(Text, nullable=False)

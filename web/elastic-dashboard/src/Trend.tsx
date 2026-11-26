@@ -48,7 +48,7 @@ export default function Trend(props: TrendProps) {
 }
 
 export function TrendPlot({ data, events, selected, onSelect, start, end }: TrendProps & Bounds) {
-  const [hover, setHover] = useState<number | null>(null);
+  const [hover, setHover] = useState<{ at: number; x: number; y: number } | null>(null);
   const visible = (t: number) => t >= start && t <= end;
   const overlaps = (left: number, right: number) => left <= end && right >= start;
   const points = data.series.points.filter(p => visible(p.at)).sort((a,b) => a.at-b.at);
@@ -97,7 +97,9 @@ export function TrendPlot({ data, events, selected, onSelect, start, end }: Tren
       <title>{label}</title>
     </g>;
   }
-  const current = points[hover ?? -1];
+  const current = hover && points.reduce<(typeof points)[number] | undefined>((nearest, point) =>
+    !nearest || Math.abs(point.at - hover.at) < Math.abs(nearest.at - hover.at) ? point : nearest, undefined);
+  const tipWidth = 178;
   const activeEvent = events.find(e => e.id === selected);
   const milestones = (activeEvent?.stages ?? []).filter(s => /恢复|评估|进程已启动/.test(s.name));
   if (finite(data.jct.completed_at)) milestones.push({ name: '任务完成', at: data.jct.completed_at });
@@ -122,11 +124,18 @@ export function TrendPlot({ data, events, selected, onSelect, start, end }: Tren
       <g clipPath="url(#plot)">{events.filter(e => finite(e.interruption_start) && finite(e.interruption_end) && overlaps(e.interruption_start, e.interruption_end)).map(e => <g key={e.id}><rect x={x(Math.max(start,e.interruption_start!))} y="30" width={Math.max(0,x(Math.min(end,e.interruption_end!))-x(Math.max(start,e.interruption_start!)))} height="216" fill="#fff2d8" opacity=".85"/><text x={x(Math.max(start,e.interruption_start!))+4} y="42" fill="#ad6900">{e.interruption_basis==='control_estimate'?'控制阶段估算':'中断'} {fmt(e.interruption_seconds,'s')}</text></g>)}
       <path d={area('gpus')} fill="#8554ef" fillOpacity=".10"/><path d={area('throughput')} fill="#1769ff" fillOpacity=".10"/>
       <path d={path('gpus')} fill="none" stroke="#8554ef" strokeWidth="2.5"/><path d={path('throughput')} fill="none" stroke="#1769ff" strokeWidth="2.5"/>
-      {points.map((p,i) => <rect key={p.at} x={Math.max(90,x(p.at)-344/points.length)} y="45" width={688/points.length} height="200" fill="transparent" onMouseEnter={()=>setHover(i)} onMouseLeave={()=>setHover(null)}><title>{`${clock(p.at)} · GPU ${fmt(p.gpus)} · ${fmt(p.throughput)} ${data.series.work_unit}/s`}</title></rect>)}
+      <g style={{cursor:'crosshair'}} onPointerMove={event => {
+        const svg = event.currentTarget.ownerSVGElement;
+        const matrix = svg?.getScreenCTM();
+        if (!matrix) return;
+        const cursor = new DOMPoint(event.clientX, event.clientY).matrixTransform(matrix.inverse());
+        setHover({at: start + (cursor.x - 90) / 688 * (end - start), x: cursor.x, y: cursor.y});
+      }} onPointerLeave={() => setHover(null)} onPointerCancel={() => setHover(null)}>
+      <rect x="90" y="30" width="688" height="216" fill="transparent"/>
       {windows.map((w,i) => <g key={i}>
         {overlaps(w.start,w.end) && <line x1={x(Math.max(start,w.start))} x2={x(Math.min(end,w.end))} y1={y(w.throughput,false)} y2={y(w.throughput,false)} stroke="#1769ff" strokeWidth="4"><title>{`${w.source} · SwanLab 窗口吞吐 ${fmt(w.throughput)} · ${clock(w.start)}–${clock(w.end)}`}</title></line>}
         {finite(w.candidate) && visible(w.evaluated_at) && <circle cx={x(w.evaluated_at)} cy={y(w.candidate,false)} r="4" stroke="#ad6900" fill="white"><title>{`评估时候选吞吐（预测） ${fmt(w.candidate)}`}</title></circle>}
-      </g>)}</g>
+      </g>)}</g></g>
       {Array.from({length:6},(_,i) => start+(end-start)*i/5).map(t => <text key={t} x={x(t)} y="265" textAnchor="middle">{end-start >= 86400 ? new Date(t*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}) : clock(t)}</text>)}
       <g className="event-track" aria-label="事件轨迹">
         <rect x="0" y="280" width="810" height={height-283} rx="6" fill="#f7f9fd"/>
@@ -135,9 +144,18 @@ export function TrendPlot({ data, events, selected, onSelect, start, end }: Tren
       </g>
       {markers}
       {!points.some(p => finite(p.gpus) || finite(p.throughput)) && !windows.length && <text x="434" y="143" textAnchor="middle">所选时段暂无采样数据</text>}
-      {current && <line x1={x(current.at)} x2={x(current.at)} y1="45" y2="246" stroke="#8190aa" strokeDasharray="4 4"/>}
-
+      {hover && current && <g pointerEvents="none">
+        <line x1={x(current.at)} x2={x(current.at)} y1="30" y2="246" stroke="#71849d" strokeDasharray="4 3"/>
+        {finite(current.gpus) && <circle cx={x(current.at)} cy={y(current.gpus,true)} r="3.5" fill="#8554ef" stroke="white"/>}
+        {finite(current.throughput) && <circle cx={x(current.at)} cy={y(current.throughput,false)} r="3.5" fill="#1769ff" stroke="white"/>}
+        <g transform={`translate(${hover.x + tipWidth + 10 <= 810 ? hover.x + 10 : hover.x - tipWidth - 10},${Math.max(2, Math.min(178, hover.y - 22))})`}>
+          <rect width={tipWidth} height="66" rx="6" fill="white" stroke="#ccd8e7"/>
+          <text x="10" y="17" fontWeight="600">{clock(current.at)}</text>
+          <text x="10" y="38" style={{fill:'#8554ef'}}>运行 Worker GPU 数　{fmt(current.gpus)}</text>
+          <text x="10" y="55" style={{fill:'#1769ff'}}>吞吐　{fmt(current.throughput, `${data.series.work_unit}/s`)}</text>
+        </g>
+      </g>}
     </svg></div>
-    <div className="chart-caption">{current ? `${clock(current.at)} · GPU ${fmt(current.gpus)} · 吞吐 ${fmt(current.throughput, `${data.series.work_unit}/s`)}` : windows.length ? `蓝线：SwanLab 观测窗口（${[...new Set(windows.map(w=>w.source))].join(' / ')}） · 空心点：候选吞吐预测 · 单位 ${data.series.work_unit}/s` : '运行 Worker 分配 GPU 数 · 非 GPU 忙碌数量 · 缺失采样保留断点'}</div>
+    <div className="chart-caption">{windows.length ? `蓝线：SwanLab 观测窗口（${[...new Set(windows.map(w=>w.source))].join(' / ')}） · 空心点：候选吞吐预测 · 单位 ${data.series.work_unit}/s` : '运行 Worker 分配 GPU 数 · 非 GPU 忙碌数量 · 缺失采样保留断点'}</div>
   </>;
 }

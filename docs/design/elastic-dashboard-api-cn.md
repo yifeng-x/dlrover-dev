@@ -356,3 +356,16 @@ Kubernetes 同步从 Master 容器启动命令读取同一配置；无法获取�
 或对仍存在的 CR 运行 reconcile。相同生命周期时间戳的相同快照允许补齐分类。
 已经删除的历史 CR 无法从 Kubernetes 恢复配置，需根据原始任务配置按 UID 补录快照。
 任务明细展示当前集群全部已登记任务，即使分类未知或不在窗口内，也展示排除说明。
+
+### 手动创建资源池对比基线
+
+已有 MySQL jobs 表的部署在升级 API 前执行一次
+`dlrover/dashboard/elastic/migrate_baselines.sql`。新安装使用 schema.sql。
+平台任务快照可通过 `resource_pool` 上报所属资源池，未标注的任务仅参加全部资源池查询。
+
+真实 API 模式下，进入集群总览的「资源池基线」，选择集群、资源池和周期，
+点击「创建基线」。POST /api/v1/elastic/baselines/preview 返回预览；
+保存时 POST /api/v1/elastic/baselines 携带 preview_id 和 preview_cutoff。
+服务器复核快照，指标变动时返回 409。GET /api/v1/elastic/baselines?cluster=...
+读取已保存记录。同一浏览器记忆当前资源范围选中的快照。部署时由同源网关
+为这两个用户写操作配置授权，Master 采集写接口继续使用内部路由。

@@ -95,7 +95,7 @@ def lifecycle_values(job):
 
 def job_metadata(job):
     result = {}
-    for key in ("job_type", "platform_type", "platform_task_id"):
+    for key in ("resource_pool", "job_type", "platform_type", "platform_task_id"):
         if key in job:
             result[key] = text(job[key], key) if job[key] is not None else None
     if "elasticity_enabled" in job:
@@ -112,6 +112,7 @@ class EventStore:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript("""
+                CREATE TABLE IF NOT EXISTS cluster_baselines (id VARCHAR(64) PRIMARY KEY, cluster VARCHAR(512) NOT NULL, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS jobs (
                     uid TEXT PRIMARY KEY, name TEXT NOT NULL,
                     cluster TEXT NOT NULL, namespace TEXT NOT NULL,
@@ -130,7 +131,7 @@ class EventStore:
             """)
 
             columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
-            for key in ("job_type", "platform_type", "platform_task_id", "elasticity_enabled"):
+            for key in ("resource_pool", "job_type", "platform_type", "platform_task_id", "elasticity_enabled"):
                 if key not in columns:
                     db.execute(f"ALTER TABLE jobs ADD COLUMN {key} " +
                                ("INTEGER" if key == "elasticity_enabled" else "TEXT"))
@@ -238,6 +239,25 @@ class EventStore:
                     "Job exceeds 10000 events; pagination is required"
                 )
             return dict(job), [json.loads(row[0]) for row in rows]
+
+    def save_baseline(self, snapshot):
+        with self.connect() as db:
+            db.execute("INSERT OR IGNORE INTO cluster_baselines VALUES(?,?,?)",
+                       (snapshot["id"], snapshot["cluster"], json.dumps(snapshot)))
+            return json.loads(db.execute("SELECT payload FROM cluster_baselines WHERE id=?",
+                                         (snapshot["id"],)).fetchone()[0])
+
+    def baselines(self, cluster, kind=None, resource_pool=None):
+        sql = "SELECT payload FROM cluster_baselines WHERE cluster=?"
+        params = [cluster]
+        if kind is not None:
+            sql += " AND json_extract(payload, '$.kind')=?"
+            params.append(kind)
+        if resource_pool is not None:
+            sql += " AND json_extract(payload, '$.resource_pool')=?"
+            params.append(resource_pool)
+        with self.connect() as db:
+            return [json.loads(row[0]) for row in db.execute(sql, params)]
 
     def health(self):
         with self.connect() as db:

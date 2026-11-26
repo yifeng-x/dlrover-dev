@@ -2,8 +2,8 @@ import { Dashboard, Evaluation } from './model';
 const at = (time: string) => Date.parse(`2026-11-06T${time}+08:00`) / 1000;
 const evaluation: Evaluation = { stage: 'exploration', objective: 'time', work_unit: 'steps', data_source: 'mock', valid: true, observed_at: at('14:36:00'), max_age_seconds: 60, time_gain_seconds: 1440, gpu_seconds_saved: 1320, gain_ratio: .75, min_gain_ratio: .05, baseline_throughput: 2, candidate_throughput: 9.85, windows: 2, state: 'accepted', reported: true };
 export const demoJobs = [
-  { uid: 'demo-train-001', name: 'train-001', cluster: 'demo-cluster', namespace: 'elastic-training', status: 'completed' as const },
-  { uid: 'demo-train-002', name: 'train-002', cluster: 'demo-cluster', namespace: 'elastic-training', status: 'running' as const },
+  { uid: 'demo-train-001', name: 'train-001', cluster: 'demo-cluster', namespace: 'elastic-training', resource_pool:'A100 训练池', elasticity_enabled:true, submitted_at:at('13:04:00'), completed_at:at('14:40:00'), actual_seconds:5760, status: 'completed' as const },
+  { uid: 'demo-train-002', name: 'train-002', cluster: 'demo-cluster', namespace: 'elastic-training', resource_pool:'A100 训练池', elasticity_enabled:false, submitted_at:at('13:04:00'), completed_at:null, actual_seconds:null, status: 'running' as const },
 ];
 export function demoDashboard(uid: string): Dashboard {
   const job = demoJobs.find(j => j.uid === uid) ?? demoJobs[0];

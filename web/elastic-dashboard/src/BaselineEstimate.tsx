@@ -37,8 +37,8 @@ export default function BaselineEstimate({jct}: {jct: Dashboard['jct']}) {
       aria-controls={open ? id : undefined} onClick={() => setOpen(!open)}>
       {open ? '收起估算依据' : '查看估算依据'}<ChevronDown size={14} aria-hidden="true"/>
     </button>
-    {open && <span id={id} role="region" aria-label="不调整基线的估算依据" className="estimate-popover">
-      <span className="estimate-heading">不调整基线的估算依据
+    {open && <span id={id} role="region" aria-label="基线 JCT 估算依据" className="estimate-popover">
+      <span className="estimate-heading">基线 JCT 估算依据
         <button type="button" aria-label="关闭估算依据" onClick={() => {setOpen(false); trigger.current?.focus();}}><X size={16}/></button>
       </span>
       {basis ? <>

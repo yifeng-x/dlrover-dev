@@ -41,7 +41,7 @@ def choice(value, allowed, default="unknown"):
 def public_job(job):
     return {
         key: (bool(job[key]) if key == "elasticity_enabled" and job.get(key) is not None else job.get(key))
-        for key in ("uid", "name", "cluster", "namespace", "status", "job_type", "platform_type", "platform_task_id", "elasticity_enabled", "submitted_at", "completed_at")
+        for key in ("uid", "name", "cluster", "namespace", "status", "resource_pool", "job_type", "platform_type", "platform_task_id", "elasticity_enabled", "submitted_at", "completed_at")
     }
 
 

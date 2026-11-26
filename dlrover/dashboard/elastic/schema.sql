@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     status VARCHAR(16) NOT NULL DEFAULT 'unknown',
     submitted_at DOUBLE NULL,
     completed_at DOUBLE NULL,
+    resource_pool VARCHAR(512) NULL,
     job_type VARCHAR(512) NULL,
     platform_type VARCHAR(512) NULL,
     platform_task_id VARCHAR(512) NULL,
@@ -25,3 +26,5 @@ CREATE TABLE IF NOT EXISTS elastic_events (
     KEY ix_elastic_event_job_time (job_uid, occurred_at, seq),
     CONSTRAINT fk_elastic_event_job FOREIGN KEY (job_uid) REFERENCES jobs(uid)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS cluster_baselines (id VARCHAR(64) PRIMARY KEY, cluster VARCHAR(512) NOT NULL, payload TEXT NOT NULL);
